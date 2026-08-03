@@ -1,7 +1,21 @@
 """
-Global configuration for the Gearbox RUL pipeline.
-Single source of truth for paths, feature engineering params, and model hyperparameters.
-Nothing in this project should hardcode a value that lives here.
+Global configuration for the spindle condition-monitoring pipeline.
+
+Architecture (see README.md for the full walkthrough of why):
+
+    Sensors -> Feature Engineering -> Isolation Forest -> Anomaly Score
+        -> Kalman Filter -> Estimated Health State -> Trend Forecasting
+        -> Remaining Useful Life -> Failure Probability
+        -> Maintenance Recommendation
+
+This is fully UNSUPERVISED. The raw CSV has a `health_status` column
+(normal/warning/critical) but it is intentionally never loaded, read, or
+referenced anywhere in this codebase — preprocessing.py selects columns
+by name at read time specifically to exclude it structurally, not just by
+convention. It exists only for the person running this pipeline to
+manually spot-check results against, entirely outside this code. Do not
+reintroduce it into any module — that would silently turn this back into
+the label-dependent pipeline this one replaced.
 """
 
 import os
@@ -15,53 +29,28 @@ RAW_DATA_DIR = os.path.join(ROOT_DIR, "data", "raw")
 PROCESSED_DATA_DIR = os.path.join(ROOT_DIR, "data", "processed")
 ARTIFACTS_DIR = os.path.join(ROOT_DIR, "artifacts")
 
-RAW_DATA_PATH = os.path.join(RAW_DATA_DIR, "raw.csv")
+RAW_DATA_PATH = os.path.join(RAW_DATA_DIR, "spindle.csv")
 PROCESSED_DATA_PATH = os.path.join(PROCESSED_DATA_DIR, "processed.csv")
 FEATURES_DATA_PATH = os.path.join(PROCESSED_DATA_DIR, "features.csv")
 
 # ---------------------------------------------------------------------------
-# Raw column names — adjust to match your actual CSV headers
+# Raw column names
 # ---------------------------------------------------------------------------
-COL_UNIT_ID = "unit_id"        # which gearbox this row belongs to
 COL_TIMESTAMP = "timestamp"
-COL_VIBRATION = "vibration"
-COL_CURRENT = "current"
-COL_TEMPERATURE = "temperature"
-COL_RUL = "RUL"
+COL_VIBRATION = "vibration_mps2"
+COL_CURRENT = "current_ampere"
+COL_TEMPERATURE = "temperature_c"
 
 RAW_SENSOR_COLS = [COL_VIBRATION, COL_CURRENT, COL_TEMPERATURE]
+# NOTE: deliberately no COL_STATUS here — see module docstring.
 
 # ---------------------------------------------------------------------------
 # Feature engineering
 # ---------------------------------------------------------------------------
-# Rolling window size, in ROWS (not seconds) — convert from your actual
-# sampling rate before setting this. E.g. 30 rows at 1 Hz = 30 seconds.
-WINDOW_SIZE = 30
-SAMPLING_RATE_HZ = 1  # informational — stored in metadata, used for docs/plots only
-
-# Minimum number of valid rows required before a window produces a feature
-# value instead of NaN. Setting this equal to WINDOW_SIZE means "no partial
-# windows allowed" — the safest default; loosen deliberately, not by accident.
+WINDOW_SIZE = 10          # rolling window, in rows (1 row = 1 minute in this data)
+SAMPLING_RATE_HZ = 1 / 60
 MIN_PERIODS = WINDOW_SIZE
 
-# RUL labeling
-RUL_CAP = 125  # piecewise-linear cap: RUL flat at this value until degradation onset
-# If your CSV already contains a ground-truth RUL column, PIECEWISE_LABELING=False
-# and this cap is ignored — set it only if you need to derive RUL from failure timestamps.
-PIECEWISE_LABELING = True
-
-# ---------------------------------------------------------------------------
-# Train/test split
-# ---------------------------------------------------------------------------
-N_SPLITS = 5          # GroupKFold folds, grouped by unit_id
-TEST_UNIT_FRACTION = 0.2  # used only by the simple holdout split in preprocessing.py
-RANDOM_STATE = 42
-
-# ---------------------------------------------------------------------------
-# Feature engineering config dict — hashed and stored in metadata.json so
-# predict.py can detect drift between the config used at train time vs.
-# whatever config.py contains at inference time.
-# ---------------------------------------------------------------------------
 FEATURE_CONFIG = {
     "window_size": WINDOW_SIZE,
     "min_periods": MIN_PERIODS,
@@ -70,37 +59,78 @@ FEATURE_CONFIG = {
 }
 
 # ---------------------------------------------------------------------------
-# Model hyperparameters — kept per-model so each models/*.py stays thin
+# Reference / commissioning baseline window
 # ---------------------------------------------------------------------------
-LINEAR_REGRESSION_PARAMS = {}
+# Isolation Forest is unsupervised but still needs SOMETHING to define
+# "normal" relative to. Standard industrial practice: use an early
+# commissioning/burn-in period as the reference baseline, on the
+# engineering assumption that a freshly commissioned or recently serviced
+# asset starts in good condition. This is an operational assumption, NOT
+# derived from any label in the data — if the assumption is wrong (the
+# asset was already degrading during this window), the whole pipeline's
+# calibration is off. That's a real limitation of unsupervised monitoring
+# in general, not specific to this dataset — flag it, don't hide it.
+REFERENCE_WINDOW_MINUTES = 2 * 24 * 60  # first 2 days
 
-RANDOM_FOREST_PARAMS = {
-    "n_estimators": 300,
-    "max_depth": 12,
-    "min_samples_leaf": 5,
-    "n_jobs": -1,
-    "random_state": RANDOM_STATE,
-}
-
-SVR_PARAMS = {
-    "kernel": "rbf",
-    "C": 10.0,
-    "epsilon": 0.5,
-}
-
-LIGHTGBM_PARAMS = {
-    "n_estimators": 500,
-    "learning_rate": 0.03,
-    "num_leaves": 31,
-    "max_depth": -1,
-    "min_child_samples": 20,
-    "subsample": 0.8,
-    "colsample_bytree": 0.8,
-    "random_state": RANDOM_STATE,
+# ---------------------------------------------------------------------------
+# Isolation Forest
+# ---------------------------------------------------------------------------
+ISOLATION_FOREST_PARAMS = {
+    "n_estimators": 200,
+    "max_samples": "auto",
+    "contamination": "auto",
+    "random_state": 42,
 }
 
 # ---------------------------------------------------------------------------
-# PHM08 asymmetric scoring function parameters
+# Anomaly score -> health percentage mapping
 # ---------------------------------------------------------------------------
-PHM08_ALPHA_EARLY = 13   # penalty denominator when prediction is early (pred < true)
-PHM08_ALPHA_LATE = 10    # penalty denominator when prediction is late (pred > true) — steeper
+# health = 100 when score is at or above the reference window's mean
+# (as normal as the baseline), degrading linearly to 0 at
+# HEALTH_SENSITIVITY_STD standard deviations below the baseline mean.
+# Tune this if health hits 0% too early/late relative to visible wear.
+HEALTH_SENSITIVITY_STD = 4.0
+
+# ---------------------------------------------------------------------------
+# Kalman filter — denoises the raw health-percentage signal into a
+# smoothed "estimated health state". Deliberately a simple constant-level
+# (random-walk) filter with NO velocity/trend state — trend estimation is
+# a separate, swappable stage (trend_forecast.py), not folded into the
+# Kalman filter. Keeping these responsibilities separate is the whole
+# point of this architecture (see README).
+# ---------------------------------------------------------------------------
+KALMAN_PARAMS = {
+    "process_var": 0.01,     # how much true health can drift per tick
+    "measurement_var": 9.0,  # noise in the raw health-percentage estimate
+}
+
+# ---------------------------------------------------------------------------
+# Trend forecasting
+# ---------------------------------------------------------------------------
+# Linear regression over the last TREND_LOOKBACK_MINUTES of Kalman-smoothed
+# health values. Long enough to average out noise, short enough to react
+# if the degradation rate changes.
+TREND_LOOKBACK_MINUTES = 720  # 12 hours — 4 hours was noisy enough to cause
+                                # false URGENT flags during flat, healthy periods;
+                                # see README for the specific example found
+TREND_MIN_POINTS = 60
+
+FAILURE_HEALTH_THRESHOLD = 20  # health % at which the asset is considered failed
+REMAINING_DAYS_CAP = 90
+
+# ---------------------------------------------------------------------------
+# Failure probability
+# ---------------------------------------------------------------------------
+# Degradation modeled as a random walk with drift (standard assumption in
+# RUL literature): forecast uncertainty grows with sqrt(horizon), using
+# the trend fit's residual std as the per-step noise estimate.
+FAILURE_PROB_HORIZONS_DAYS = [7, 14, 21, 28, 35]
+
+# ---------------------------------------------------------------------------
+# Maintenance recommendation rules
+# ---------------------------------------------------------------------------
+MAINTENANCE_HORIZON_DAYS = 14        # "how soon" horizon the rules check against
+MAINTENANCE_PROB_URGENT = 0.70       # failure probability within horizon -> urgent
+MAINTENANCE_PROB_PLAN = 0.30         # -> plan maintenance
+MAINTENANCE_REMAINING_DAYS_URGENT = 7
+MAINTENANCE_HEALTH_INSPECT = 40      # health % below this -> inspect regardless

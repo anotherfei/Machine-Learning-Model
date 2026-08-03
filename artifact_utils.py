@@ -1,9 +1,10 @@
 """
-Save/load helpers for model artifacts. Everything predict.py needs at
-inference time gets persisted here: model, scaler, feature column order,
-and a hash of the feature-engineering config so silent drift (someone
-changes WINDOW_SIZE and forgets predict.py is still using an old model)
-fails loudly instead of producing quietly wrong predictions.
+Save/load helpers for pipeline artifacts: the fitted Isolation Forest,
+its baseline calibration (mean/std from the reference window — see
+isolation_forest.py), the feature column order, and a hash of the
+feature-engineering config so silent drift (someone changes WINDOW_SIZE
+and forgets predict_realtime.py is still using an old model) fails
+loudly instead of producing quietly wrong predictions.
 """
 
 import os
@@ -21,64 +22,59 @@ def config_hash(feature_config: dict = None) -> str:
     return hashlib.md5(payload).hexdigest()
 
 
-def save_model_artifacts(model_name: str, model, feature_columns: list, scaler=None):
+def save_artifacts(scorer, feature_columns: list):
+    """scorer: a fitted isolation_forest.AnomalyScorer."""
     os.makedirs(config.ARTIFACTS_DIR, exist_ok=True)
 
-    model_path = os.path.join(config.ARTIFACTS_DIR, f"{model_name}.pkl")
-    joblib.dump(model, model_path)
+    joblib.dump(scorer.model, os.path.join(config.ARTIFACTS_DIR, "isolation_forest.pkl"))
 
     with open(os.path.join(config.ARTIFACTS_DIR, "feature_columns.json"), "w") as f:
         json.dump(feature_columns, f, indent=2)
 
-    if scaler is not None:
-        joblib.dump(scaler, os.path.join(config.ARTIFACTS_DIR, "scaler.pkl"))
+    with open(os.path.join(config.ARTIFACTS_DIR, "calibration.json"), "w") as f:
+        json.dump(scorer.calibration(), f, indent=2)
 
-    metadata_path = os.path.join(config.ARTIFACTS_DIR, "metadata.json")
-    metadata = {}
-    if os.path.exists(metadata_path):
-        with open(metadata_path) as f:
-            metadata = json.load(f)
-
-    metadata[model_name] = {
+    metadata = {
         "trained_at": datetime.datetime.utcnow().isoformat(),
         "n_features": len(feature_columns),
         "feature_config_hash": config_hash(),
-        "uses_scaler": scaler is not None,
+        "reference_window_minutes": config.REFERENCE_WINDOW_MINUTES,
     }
-    with open(metadata_path, "w") as f:
+    with open(os.path.join(config.ARTIFACTS_DIR, "metadata.json"), "w") as f:
         json.dump(metadata, f, indent=2)
 
-    print(f"[save_model_artifacts] Saved {model_name} -> {model_path}")
+    print(f"[save_artifacts] Saved isolation_forest.pkl, calibration.json, "
+          f"feature_columns.json, metadata.json -> {config.ARTIFACTS_DIR}")
 
 
-def load_model_artifacts(model_name: str):
-    model_path = os.path.join(config.ARTIFACTS_DIR, f"{model_name}.pkl")
+def load_artifacts():
+    from isolation_forest import AnomalyScorer  # local import avoids a circular import
+
+    model_path = os.path.join(config.ARTIFACTS_DIR, "isolation_forest.pkl")
     if not os.path.exists(model_path):
-        raise FileNotFoundError(f"No trained model found at {model_path}. Run train.py first.")
+        raise FileNotFoundError(f"No trained model found at {model_path}. Run train_isolation_forest.py first.")
 
     model = joblib.load(model_path)
 
     with open(os.path.join(config.ARTIFACTS_DIR, "feature_columns.json")) as f:
         feature_columns = json.load(f)
 
-    scaler_path = os.path.join(config.ARTIFACTS_DIR, "scaler.pkl")
-    scaler = joblib.load(scaler_path) if os.path.exists(scaler_path) else None
+    with open(os.path.join(config.ARTIFACTS_DIR, "calibration.json")) as f:
+        calibration = json.load(f)
 
     with open(os.path.join(config.ARTIFACTS_DIR, "metadata.json")) as f:
         metadata = json.load(f)
 
-    if model_name not in metadata:
-        raise ValueError(f"No metadata entry for '{model_name}' — artifacts may be corrupted or mismatched.")
-
-    stored_hash = metadata[model_name]["feature_config_hash"]
+    stored_hash = metadata["feature_config_hash"]
     current_hash = config_hash()
     if stored_hash != current_hash:
         raise ValueError(
-            f"Feature config drift detected for '{model_name}'.\n"
+            f"Feature config drift detected.\n"
             f"Model was trained with config hash {stored_hash}, "
             f"but config.py currently hashes to {current_hash}.\n"
             f"Someone changed FEATURE_CONFIG (e.g. WINDOW_SIZE) since this model was trained. "
             f"Retrain the model or revert the config change before predicting."
         )
 
-    return model, feature_columns, scaler, metadata[model_name]
+    scorer = AnomalyScorer.from_calibration(model, calibration)
+    return scorer, feature_columns, metadata
