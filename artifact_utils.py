@@ -2,9 +2,21 @@
 Save/load helpers for pipeline artifacts: the fitted Isolation Forest,
 its baseline calibration (mean/std from the reference window — see
 isolation_forest.py), the feature column order, and a hash of the
-feature-engineering config so silent drift (someone changes WINDOW_SIZE
-and forgets predict_realtime.py is still using an old model) fails
-loudly instead of producing quietly wrong predictions.
+feature-engineering pipeline so silent drift fails loudly instead of
+producing quietly wrong predictions.
+
+That hash covers two things that both need to match between training and
+predicting:
+  - FEATURE_CONFIG (WINDOW_SIZE, MIN_PERIODS, ...) — a config value change.
+  - feature_engineering.py's own source — a code change to create_features()
+    itself (added/removed/renamed/redefined a feature), which a config-only
+    hash would miss entirely: FEATURE_CONFIG can stay identical while the
+    actual columns produced change underneath it. Hashing the source is a
+    blunt instrument (a comment-only edit also trips it), but a false-
+    positive "please retrain" is a far cheaper mistake than predict_realtime.py
+    silently selecting a stale subset of columns (or throwing a confusing
+    KeyError) out of a feature set that no longer matches what the model
+    was trained on.
 """
 
 import os
@@ -16,11 +28,19 @@ import pandas as pd
 
 import config
 
+FEATURE_ENGINEERING_SOURCE_PATH = os.path.join(config.ROOT_DIR, "feature_engineering.py")
+
+
+def _feature_engineering_source_hash() -> str:
+    with open(FEATURE_ENGINEERING_SOURCE_PATH, "rb") as f:
+        return hashlib.md5(f.read()).hexdigest()
+
 
 def config_hash(feature_config: dict = None) -> str:
     feature_config = feature_config or config.FEATURE_CONFIG
     payload = json.dumps(feature_config, sort_keys=True).encode()
-    return hashlib.md5(payload).hexdigest()
+    combined = hashlib.md5(payload).hexdigest() + _feature_engineering_source_hash()
+    return hashlib.md5(combined.encode()).hexdigest()
 
 
 def save_artifacts(scorer, feature_columns: list, reference_timestamps=None):
@@ -51,7 +71,7 @@ def save_artifacts(scorer, feature_columns: list, reference_timestamps=None):
     metadata = {
         "trained_at": datetime.datetime.utcnow().isoformat(),
         "n_features": len(feature_columns),
-        "feature_config_hash": config_hash(),
+        "pipeline_hash": config_hash(),
         "reference_window_minutes": config.REFERENCE_WINDOW_MINUTES,
         "n_reference_rows": len(reference_timestamps) if reference_timestamps is not None else None,
         "has_reference_timestamps": reference_timestamps is not None,
@@ -82,15 +102,17 @@ def load_artifacts():
     with open(os.path.join(config.ARTIFACTS_DIR, "metadata.json")) as f:
         metadata = json.load(f)
 
-    stored_hash = metadata["feature_config_hash"]
+    stored_hash = metadata.get("pipeline_hash", metadata.get("feature_config_hash"))
     current_hash = config_hash()
     if stored_hash != current_hash:
         raise ValueError(
-            f"Feature config drift detected.\n"
-            f"Model was trained with config hash {stored_hash}, "
-            f"but config.py currently hashes to {current_hash}.\n"
-            f"Someone changed FEATURE_CONFIG (e.g. WINDOW_SIZE) since this model was trained. "
-            f"Retrain the model or revert the config change before predicting."
+            f"Feature pipeline drift detected.\n"
+            f"Model was trained with pipeline hash {stored_hash}, "
+            f"but the current FEATURE_CONFIG + feature_engineering.py source "
+            f"hashes to {current_hash}.\n"
+            f"Either FEATURE_CONFIG changed (e.g. WINDOW_SIZE) or "
+            f"feature_engineering.py's create_features() was edited since this "
+            f"model was trained. Retrain the model or revert the change before predicting."
         )
 
     scorer = AnomalyScorer.from_calibration(model, calibration)
