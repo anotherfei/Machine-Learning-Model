@@ -78,6 +78,54 @@ def split_reference_window(df: pd.DataFrame):
     return reference_df, rest_df
 
 
+def select_spec_normal_rows(raw_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Row-wise "normal operation" filter, checked against fixed rated
+    bounds (config.SPEC_*) instead of a contiguous burn-in time window.
+    Alternative to split_reference_window() for defining what the
+    Isolation Forest gets fit on.
+
+    Applied to raw sensor readings (config.RAW_SENSOR_COLS) row-by-row —
+    NOT to rolling features. A spec bound is a claim about a single
+    instantaneous reading ("vibration above 3.0 is outside rated
+    operation"); checking it against a rolling mean would average out
+    exactly the transient excursions this filter exists to catch, and
+    would silently let a spiking-but-averaged-out row through.
+
+    Unlike a time-window burn-in period, this doesn't require an early
+    "clean" stretch to exist in the data at all — every row is judged on
+    its own, independent of when it occurred. That also means it's not
+    anchored to trajectory shape (works the same on a single ramp-to-
+    failure or a cyclic pattern). The dependency it trades in instead:
+    correctness now rests entirely on config.SPEC_* being the genuine
+    rated range, not a guess — see that docstring.
+
+    No labels used, consistent with the rest of this module.
+    """
+    mask = (
+        (raw_df[config.COL_VIBRATION] <= config.SPEC_VIBRATION_MAX)
+        & (raw_df[config.COL_TEMPERATURE] <= config.SPEC_TEMPERATURE_MAX)
+        & (raw_df[config.COL_CURRENT] <= config.SPEC_CURRENT_MAX)
+    )
+    normal_df = raw_df[mask].reset_index(drop=True)
+
+    frac = len(normal_df) / len(raw_df) if len(raw_df) else 0.0
+    print(
+        f"[select_spec_normal_rows] {len(normal_df)}/{len(raw_df)} rows "
+        f"({frac:.1%}) within spec bounds "
+        f"(vibration<={config.SPEC_VIBRATION_MAX}, "
+        f"temperature<={config.SPEC_TEMPERATURE_MAX}, "
+        f"current<={config.SPEC_CURRENT_MAX})."
+    )
+    if normal_df.empty:
+        print(
+            "[select_spec_normal_rows] WARNING: zero rows passed the spec "
+            "filter. Check config.SPEC_* bounds against actual sensor units "
+            "and ranges before proceeding — fit() will fail on an empty set."
+        )
+    return normal_df
+
+
 def run_preprocessing(save: bool = True) -> pd.DataFrame:
     df = load_data()
     df = clean_data(df)

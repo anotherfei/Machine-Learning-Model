@@ -42,6 +42,21 @@ COL_CURRENT = "current_ampere"
 COL_TEMPERATURE = "temperature_c"
 
 RAW_SENSOR_COLS = [COL_VIBRATION, COL_CURRENT, COL_TEMPERATURE]
+
+# ---------------------------------------------------------------------------
+# Spec-based "normal operation" bounds (alternative to a time-window-based
+# reference period — see preprocessing.select_spec_normal_rows()).
+# PLACEHOLDER VALUES: these are Predictive_Maintenance.zip's spec-shaped
+# filter (vibration<=3.0, temp<=50, current<=6.0), carried over because
+# they were the only bounds available at the time this was written. This
+# only produces a correct reference set if these are genuinely the
+# manufacturer's rated normal range for this spindle. If they're a rough
+# guess, that error is silent — select_spec_normal_rows() has no way to
+# detect a wrong bound, only a missing one. Confirm against the actual
+# spec sheet before relying on this in production.
+SPEC_VIBRATION_MAX = 3.0
+SPEC_TEMPERATURE_MAX = 50.0
+SPEC_CURRENT_MAX = 6.0
 # NOTE: deliberately no COL_STATUS here — see module docstring.
 
 # ---------------------------------------------------------------------------
@@ -124,12 +139,22 @@ REMAINING_DAYS_CAP = 90
 # Degradation modeled as a random walk with drift (standard assumption in
 # RUL literature): forecast uncertainty grows with sqrt(horizon), using
 # the trend fit's residual std as the per-step noise estimate.
-FAILURE_PROB_HORIZONS_DAYS = [7, 14, 21, 28, 35]
+#
+# Horizons restricted to <=1 day. validate.py's calibration check measured
+# actual Brier scores against health_status: 0.5d=0.164, 1d=0.215 (both
+# beat the uninformative baseline of 0.25) but 2d=0.311, 3d=0.325 (WORSE
+# than guessing 50/50 — not just unproven, actively misleading). An
+# earlier version of this list went out to 35 days, copied from an
+# illustrative example without checking it against this dataset's own
+# ~6.9-day span or measured calibration — don't extend this list past 1
+# day without rerunning validate.py and confirming the Brier score still
+# beats 0.25 at whatever horizon you add.
+FAILURE_PROB_HORIZONS_DAYS = [0.25, 0.5, 0.75, 1]
 
 # ---------------------------------------------------------------------------
 # Maintenance recommendation rules
 # ---------------------------------------------------------------------------
-MAINTENANCE_HORIZON_DAYS = 14        # "how soon" horizon the rules check against
+MAINTENANCE_HORIZON_DAYS = 1          # "how soon" horizon the rules check against — kept within the <=1 day range validated above
 MAINTENANCE_PROB_URGENT = 0.70       # failure probability within horizon -> urgent
 MAINTENANCE_PROB_PLAN = 0.30         # -> plan maintenance
 MAINTENANCE_REMAINING_DAYS_URGENT = 7

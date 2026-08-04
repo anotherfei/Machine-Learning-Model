@@ -1,4 +1,4 @@
-artifacts/
-!artifacts/.gitkeep
-
 data/processed/*.csv
+*.csv
+
+.venv

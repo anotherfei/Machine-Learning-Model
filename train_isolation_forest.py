@@ -30,8 +30,16 @@ def main():
     df = get_or_build_features()
     feature_cols = feature_engineering.get_feature_columns(df)
 
-    reference_df, rest_df = preprocessing.split_reference_window(df)
-    print(f"[train] Reference window: {len(reference_df)} rows, "
+    # Spec-based row selection needs the raw sensor values, which don't
+    # survive feature_engineering.create_features() — so reload/re-clean
+    # the raw CSV here rather than reading them off the feature table.
+    # Cheap: just load_data() + clean_data(), no feature engineering rerun.
+    raw_df = preprocessing.clean_data(preprocessing.load_data())
+    normal_raw = preprocessing.select_spec_normal_rows(raw_df)
+
+    is_reference = df[config.COL_TIMESTAMP].isin(normal_raw[config.COL_TIMESTAMP])
+    reference_df, rest_df = df[is_reference].reset_index(drop=True), df[~is_reference].reset_index(drop=True)
+    print(f"[train] Spec-based reference set: {len(reference_df)} rows, "
           f"rest of trajectory: {len(rest_df)} rows.")
 
     scorer = AnomalyScorer()
@@ -48,7 +56,7 @@ def main():
           f"min: {all_health.min():.1f}, max: {all_health.max():.1f}, "
           f"mean: {all_health.mean():.1f}")
 
-    artifact_utils.save_artifacts(scorer, feature_cols)
+    artifact_utils.save_artifacts(scorer, feature_cols, reference_timestamps=reference_df[config.COL_TIMESTAMP])
 
 
 if __name__ == "__main__":
