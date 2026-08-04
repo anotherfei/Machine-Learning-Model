@@ -1,6 +1,8 @@
 {
-  "trained_at": "2026-08-04T01:56:41.931871",
+  "trained_at": "2026-08-04T06:56:27.862548",
   "n_features": 28,
   "feature_config_hash": "6638f1a536d2feadc356d7e8f188d5d4",
-  "reference_window_minutes": 2880
+  "reference_window_minutes": 2880,
+  "n_reference_rows": 3053,
+  "has_reference_timestamps": true
 }

@@ -63,8 +63,21 @@ def create_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
         "temperature_trend_slope": _trend_slope(df[config.COL_TEMPERATURE], w, mp)
     }))
 
-    corr = df[config.COL_VIBRATION].rolling(window=w, min_periods=mp).corr(df[config.COL_CURRENT])
-    feat_frames.append(pd.DataFrame({"vibration_current_corr": corr}))
+    # Cross-sensor rolling correlations. vibration_current_corr was the
+    # only one of these until now — temperature never appeared in a
+    # cross-term, even though thermal expansion coupling into the
+    # vibration signature (and into current draw, via bearing friction)
+    # is a known precursor pattern for spindles. Isolation Forest can
+    # still pick up joint structure across separate columns without an
+    # explicit term, but not as directly as giving it one.
+    feat_frames.append(pd.DataFrame({
+        "vibration_current_corr":
+            df[config.COL_VIBRATION].rolling(window=w, min_periods=mp).corr(df[config.COL_CURRENT]),
+        "vibration_temperature_corr":
+            df[config.COL_VIBRATION].rolling(window=w, min_periods=mp).corr(df[config.COL_TEMPERATURE]),
+        "current_temperature_corr":
+            df[config.COL_CURRENT].rolling(window=w, min_periods=mp).corr(df[config.COL_TEMPERATURE]),
+    }))
 
     result = pd.concat(feat_frames, axis=1)
 

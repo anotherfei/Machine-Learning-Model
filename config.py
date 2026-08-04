@@ -119,6 +119,29 @@ KALMAN_PARAMS = {
     "measurement_var": 9.0,  # noise in the raw health-percentage estimate
 }
 
+# Cold-start seeding: initializing the filter's level from a single raw
+# health measurement lets one noisy first tick set the starting point,
+# then makes the filter spend hours dragging that level to where the
+# signal actually sits (measurement_var=9.0 means each update only closes
+# a fraction of the gap). Seeding from the mean of the first
+# KALMAN_INIT_SAMPLES raw ticks instead removes most of that single-point
+# noise up front, so the filter starts near the true level rather than
+# converging to it over hours. No output (health/status) is emitted until
+# this warm-up buffer fills — see SpindleMonitor.update() — so the
+# few-tick delay never surfaces as a false reading.
+#
+# 15, not 5: measured against data/raw/spindle.csv, the mean of the first
+# 5 raw health readings is still ~11% (below FAILURE_HEALTH_THRESHOLD=20)
+# because the earliest rolling-window features are inherently noisier —
+# small-sample statistics on a window that has just reached WINDOW_SIZE —
+# so a handful of ticks can still land on a genuinely bad run. The mean
+# over 15 lands at ~24%, clear of the CRITICAL cutoff. This is a
+# empirically-tuned default from one dataset, not a guarantee for every
+# deployment — if a real feed still opens on a false CRITICAL/WARN,
+# raise this further; the cost is only a longer (still sub-hour, given
+# 1 row/minute) delay before the first reading, not a wrong one.
+KALMAN_INIT_SAMPLES = 15
+
 # ---------------------------------------------------------------------------
 # Trend forecasting
 # ---------------------------------------------------------------------------

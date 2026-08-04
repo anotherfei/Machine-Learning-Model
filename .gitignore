@@ -1,4 +1,4 @@
 data/processed/*.csv
-*.csv
 
 .venv
+__pycache__

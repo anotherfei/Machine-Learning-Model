@@ -421,6 +421,116 @@ def plot_report(train_scores, holdout_scores, merged, y_true,
 
 
 # ===========================================================================
+# THRESHOLD SANITY CHECK — health-based vs sensor-based severity onset
+# ===========================================================================
+
+def check_threshold_calibration(merged: pd.DataFrame):
+    """
+    Sanity-checks config.FAILURE_HEALTH_THRESHOLD (20) and
+    config.MAINTENANCE_HEALTH_INSPECT (40) — currently, per README.md,
+    "starting points... tuned by inspecting behavior, not fit to ground
+    truth" — against when raw sensor readings actually start looking like
+    warning/critical rows in the labeled data.
+
+    IMPORTANT: there is no manufacturer warning/critical spec for this
+    machine anywhere in this repo or in Predictive_Maintenance.zip (that
+    codebase's WARNING/CRITICAL labels come from KMeans clustering of
+    autoencoder reconstruction error, not fixed sensor bounds — checked
+    directly, no such thresholds exist there to borrow). The "onset"
+    values below are instead derived empirically from health_status itself:
+    the midpoint between each class's IQR edges, per sensor. This is a
+    genuinely different, weaker kind of evidence than a real spec bound —
+    it's "where the labels already say severity changes," not an
+    independent physical reference — but it's still an out-of-band check
+    against the health-percentage thresholds, since maintenance.py never
+    sees health_status.
+
+    This function only reads health_status (already validate.py's one
+    allowed exception) and is purely diagnostic — it does not feed back
+    into config.py or maintenance.py automatically.
+    """
+    print("=" * 70)
+    print("8. THRESHOLD SANITY CHECK — health% thresholds vs. sensor onset")
+    print("=" * 70)
+
+    raw = pd.read_csv(config.RAW_DATA_PATH)
+    raw[config.COL_TIMESTAMP] = pd.to_datetime(raw[config.COL_TIMESTAMP])
+    raw = raw.sort_values(config.COL_TIMESTAMP).reset_index(drop=True)
+
+    iqr = raw.groupby("health_status")[config.RAW_SENSOR_COLS].quantile([0.25, 0.75]).unstack()
+    missing = [s for s in ("normal", "warning", "critical") if s not in iqr.index]
+    if missing:
+        print(f"  Skipped: health_status is missing classes {missing} in this dataset.\n")
+        return None
+
+    warn_onset = {c: (iqr.loc["normal", (c, 0.75)] + iqr.loc["warning", (c, 0.25)]) / 2
+                  for c in config.RAW_SENSOR_COLS}
+    crit_onset = {c: (iqr.loc["warning", (c, 0.75)] + iqr.loc["critical", (c, 0.25)]) / 2
+                  for c in config.RAW_SENSOR_COLS}
+    print(f"  Empirical warning onset (any sensor >=): "
+          f"{ {k: round(v, 2) for k, v in warn_onset.items()} }")
+    print(f"  Empirical critical onset (any sensor >=): "
+          f"{ {k: round(v, 2) for k, v in crit_onset.items()} }")
+    print(f"  (excluding first {config.TREND_LOOKBACK_MINUTES} min of trajectory from crossing "
+          f"search — health_state has a Kalman warm-up transient there, confirmed separately, "
+          f"that isn't a real early detection.)")
+
+    def first_crossing_time(df, cond, warmup_minutes=config.TREND_LOOKBACK_MINUTES):
+        """
+        Excludes the first `warmup_minutes` of the trajectory. health_state
+        starts at the Kalman filter's initial_level (= the very first raw
+        score) and needs time to converge — confirmed separately that
+        health_state can start near ~19% and climb to its stable ~90s over
+        roughly the first few hundred minutes, regardless of true condition.
+        Without this cutoff, that transient gets mistaken for an early
+        critical crossing on every run, making the lead/lag number below
+        meaningless. TREND_LOOKBACK_MINUTES is reused here only as a
+        reasonable existing "the pipeline considers this its warm-up scale"
+        constant, not because it's derived for this purpose specifically.
+        """
+        warm_cutoff = df[config.COL_TIMESTAMP].min() + pd.Timedelta(minutes=warmup_minutes)
+        hits = df[cond & (df[config.COL_TIMESTAMP] >= warm_cutoff)]
+        return hits[config.COL_TIMESTAMP].min() if len(hits) else None
+
+    sensor_warn_t = first_crossing_time(
+        raw, (raw[config.COL_VIBRATION] >= warn_onset[config.COL_VIBRATION])
+        | (raw[config.COL_TEMPERATURE] >= warn_onset[config.COL_TEMPERATURE])
+        | (raw[config.COL_CURRENT] >= warn_onset[config.COL_CURRENT])
+    )
+    sensor_crit_t = first_crossing_time(
+        raw, (raw[config.COL_VIBRATION] >= crit_onset[config.COL_VIBRATION])
+        | (raw[config.COL_TEMPERATURE] >= crit_onset[config.COL_TEMPERATURE])
+        | (raw[config.COL_CURRENT] >= crit_onset[config.COL_CURRENT])
+    )
+    health_warn_t = first_crossing_time(merged, merged["health_state"] <= config.MAINTENANCE_HEALTH_INSPECT)
+    health_crit_t = first_crossing_time(merged, merged["health_state"] <= config.FAILURE_HEALTH_THRESHOLD)
+
+    def report(label, sensor_t, health_t):
+        if sensor_t is None or health_t is None:
+            print(f"  {label}: could not evaluate (no crossing found in one or both signals)")
+            return
+        lag = (health_t - sensor_t).total_seconds() / 60
+        direction = "health lags sensor by" if lag > 0 else "health leads sensor by"
+        print(f"  {label}: sensor onset {sensor_t}, health-threshold crossing {health_t} "
+              f"-> {direction} {abs(lag):.0f} min")
+
+    report(f"Warning (MAINTENANCE_HEALTH_INSPECT={config.MAINTENANCE_HEALTH_INSPECT})",
+           sensor_warn_t, health_warn_t)
+    report(f"Critical (FAILURE_HEALTH_THRESHOLD={config.FAILURE_HEALTH_THRESHOLD})",
+           sensor_crit_t, health_crit_t)
+    print(
+        "\n  Read this as a rough cross-check, not a verdict: a large lag means the\n"
+        "  health-based threshold fires later than sensor readings alone already\n"
+        "  suggest trouble, and could be tightened (raised); a large lead means\n"
+        "  the opposite. Small lags are expected — health_state is Kalman-smoothed\n"
+        "  by design and shouldn't react to a single instantaneous reading.\n"
+    )
+    return {"warn_onset": warn_onset, "crit_onset": crit_onset,
+            "sensor_warn_t": sensor_warn_t, "sensor_crit_t": sensor_crit_t,
+            "health_warn_t": health_warn_t, "health_crit_t": health_crit_t}
+
+
+# ===========================================================================
 # MAIN
 # ===========================================================================
 
@@ -470,6 +580,7 @@ def main():
 
     auc_raw, auc_state, ap_state, conf_threshold, conf_maint = check_discrimination(merged, y_true)
     calibration_results = check_calibration(merged, is_bad_array)
+    check_threshold_calibration(merged)
 
     print("Generating graphical report...")
     plot_report(train_scores, holdout_scores, merged, y_true, auc_raw, auc_state, calibration_results)
