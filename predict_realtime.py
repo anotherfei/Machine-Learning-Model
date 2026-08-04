@@ -194,14 +194,14 @@ if __name__ == "__main__":
 
             tick += 1
             print("\n" + "=" * 60)
-            print(f"data ke :{tick}")
+            print(f"data ke : {tick}")
             print("Vibration :", result["vibration"])
             print("Temperature :", result["temperature"])
             print("Current :", result["current"])
             print("Anomaly Score :", result["anomaly_score"])
             print("Health (raw) :", result["health_raw"], "%")
             print("Health (Kalman-smoothed) :", result["health_state"], "%")
-            print("Trend :", result["trend_slope_per_day"], "%/day")
+            print("Trend :", result["trend_slope_per_day"], "% / day")
             print("Remaining Days :", result["remaining_days"])
             print("Failure Probability :", result["failure_probability"])
             print("Maintenance :", result["maintenance"]["level"], "-", result["maintenance"]["reason"])
