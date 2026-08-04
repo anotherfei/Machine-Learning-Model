@@ -28,10 +28,16 @@ ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 RAW_DATA_DIR = os.path.join(ROOT_DIR, "data", "raw")
 PROCESSED_DATA_DIR = os.path.join(ROOT_DIR, "data", "processed")
 ARTIFACTS_DIR = os.path.join(ROOT_DIR, "artifacts")
+# Generated outputs for a human to look at (realtime prediction log,
+# validation report) — distinct from ARTIFACTS_DIR, which is what the
+# model needs to run, not what running it produced.
+RESULTS_DIR = os.path.join(ROOT_DIR, "results")
 
 RAW_DATA_PATH = os.path.join(RAW_DATA_DIR, "spindle.csv")
 PROCESSED_DATA_PATH = os.path.join(PROCESSED_DATA_DIR, "processed.csv")
 FEATURES_DATA_PATH = os.path.join(PROCESSED_DATA_DIR, "features.csv")
+REALTIME_PREDICTIONS_PATH = os.path.join(RESULTS_DIR, "realtime_predictions.csv")
+VALIDATION_REPORT_PATH = os.path.join(RESULTS_DIR, "validation_report.png")
 
 # ---------------------------------------------------------------------------
 # Raw column names

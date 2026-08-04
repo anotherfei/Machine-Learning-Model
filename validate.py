@@ -31,6 +31,8 @@ Tests included, grouped the way they're usually grouped in practice:
   All of this is also rendered to validation_report.png.
 """
 
+import os
+
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -48,7 +50,7 @@ import trend_forecast
 import failure_probability
 import maintenance
 
-REPORT_PATH = "validation_report.png"
+REPORT_PATH = config.VALIDATION_REPORT_PATH
 
 # Short horizons actually testable against this dataset's ~6.9-day span —
 # kept in sync with config.FAILURE_PROB_HORIZONS_DAYS so every horizon the
@@ -416,6 +418,7 @@ def plot_report(train_scores, holdout_scores, merged, y_true,
         ax.set_title("Brier score by horizon")
 
     plt.tight_layout()
+    os.makedirs(config.RESULTS_DIR, exist_ok=True)
     plt.savefig(REPORT_PATH, dpi=120)
     print(f"Saved graphical report -> {REPORT_PATH}")
 

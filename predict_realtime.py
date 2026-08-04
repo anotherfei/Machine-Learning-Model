@@ -23,6 +23,7 @@ Usage:
 import time
 from collections import deque
 
+import os
 import numpy as np
 import pandas as pd
 
@@ -155,10 +156,11 @@ def read_sensor():
         }
 
 
-LOG_PATH = "realtime_log.csv"
+LOG_PATH = config.REALTIME_PREDICTIONS_PATH
 
 
 def save_result(result: dict):
+    os.makedirs(config.RESULTS_DIR, exist_ok=True)
     flat = {k: v for k, v in result.items()
             if k not in ("failure_probability", "maintenance", "top_contributors")}
     flat["maintenance_level"] = result["maintenance"]["level"]
