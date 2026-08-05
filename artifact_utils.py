@@ -72,7 +72,11 @@ def save_artifacts(scorer, feature_columns: list, reference_timestamps=None):
         "trained_at": datetime.datetime.utcnow().isoformat(),
         "n_features": len(feature_columns),
         "pipeline_hash": config_hash(),
-        "reference_window_minutes": config.REFERENCE_WINDOW_MINUTES,
+        # NOT necessarily what was used to build the reference set (e.g. the
+        # spec-based filter ignores this entirely) — this is only meaningful
+        # for validate.py's no-reference_timestamps fallback path. Trust
+        # n_reference_rows/has_reference_timestamps for what actually happened.
+        "reference_window_minutes_config_value": config.REFERENCE_WINDOW_MINUTES,
         "n_reference_rows": len(reference_timestamps) if reference_timestamps is not None else None,
         "has_reference_timestamps": reference_timestamps is not None,
     }

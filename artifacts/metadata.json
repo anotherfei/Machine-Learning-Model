@@ -1,8 +1,8 @@
 {
-  "trained_at": "2026-08-04T08:07:58.602316",
+  "trained_at": "2026-08-05T07:26:45.792948",
   "n_features": 28,
   "pipeline_hash": "9f884b3ab973723290737f30a31283b5",
-  "reference_window_minutes": 2880,
-  "n_reference_rows": 3053,
+  "reference_window_minutes_config_value": 2880,
+  "n_reference_rows": 9990,
   "has_reference_timestamps": true
 }

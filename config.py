@@ -33,11 +33,13 @@ ARTIFACTS_DIR = os.path.join(ROOT_DIR, "artifacts")
 # model needs to run, not what running it produced.
 RESULTS_DIR = os.path.join(ROOT_DIR, "results")
 
-RAW_DATA_PATH = os.path.join(RAW_DATA_DIR, "spindle.csv")
+RAW_DATA_PATH = os.path.join(RAW_DATA_DIR, "spindle_train.csv")
 PROCESSED_DATA_PATH = os.path.join(PROCESSED_DATA_DIR, "processed.csv")
 FEATURES_DATA_PATH = os.path.join(PROCESSED_DATA_DIR, "features.csv")
 REALTIME_PREDICTIONS_PATH = os.path.join(RESULTS_DIR, "realtime_predictions.csv")
 VALIDATION_REPORT_PATH = os.path.join(RESULTS_DIR, "validation_report.png")
+
+PREDICT_DATA_PATH = os.path.join(RAW_DATA_DIR, "spindle.csv")
 
 # ---------------------------------------------------------------------------
 # Raw column names
@@ -158,6 +160,48 @@ TREND_LOOKBACK_MINUTES = 720  # 12 hours — 4 hours was noisy enough to cause
                                 # false URGENT flags during flat, healthy periods;
                                 # see README for the specific example found
 TREND_MIN_POINTS = 60
+
+# How many ticks after the trend fit first starts producing a value (i.e.
+# after TREND_MIN_POINTS is reached) before remaining_days/failure_probability
+# are trusted enough to drive a WARN/CRITICAL escalation on their own.
+# health_percent-based checks (FAILURE_HEALTH_THRESHOLD, MAINTENANCE_HEALTH_
+# INSPECT) are NOT gated by this — only the trend-derived triggers are.
+#
+# Why this exists: the first trend fit's window still partly overlaps the
+# tail of the Kalman warm-up's recovery climb (see KALMAN_INIT_SAMPLES). A
+# plain least-squares line over a decelerating rise reads as a slightly
+# negative slope, and remaining_days() floors at 1 day — so on this
+# dataset, that alone was enough to falsely trip MAINTENANCE_REMAINING_
+# DAYS_URGENT for 27 consecutive ticks right after warm-up, on a machine
+# that was demonstrably healthy and improving (confirmed: health_state
+# climbing through the 50s-60s throughout). This was invisible before the
+# Kalman warm-up fix, because those same ticks were already CRITICAL from
+# the raw health threshold for a different reason — fixing that exposed
+# this.
+#
+# 60, not something closer to the observed 27: same reasoning as
+# KALMAN_INIT_SAMPLES — this is measured on one dataset's one recovery
+# curve, not a guaranteed bound for every deployment. Tying it to
+# TREND_MIN_POINTS's own value (rather than a number derived purely from
+# this dataset) gives comfortable margin without inventing a second
+# unrelated magic number. If a real feed still shows a false trend-based
+# escalation shortly after warm-up, raise this — the cost is only a
+# longer delay before trend-based (not health-based) alerts are trusted.
+TREND_SETTLE_TICKS = 60
+
+# Statistical significance threshold for trend_forecast.slope_is_significant()
+# — see that function's docstring for the empirical validation. z=2.0 is the
+# standard two-tailed ~95% convention, not something fit to this dataset.
+# This and TREND_SETTLE_TICKS are complementary, not redundant: significance
+# alone doesn't catch the post-warm-up window (that fit is often smooth
+# enough to look "significant" while still measuring the tail of an
+# artificial recovery, not real degradation — confirmed: significance
+# alone left 12 of the original 27 false post-warm-up CRITICALs in place).
+# Settling alone doesn't catch noise-driven false triggers later in the
+# trajectory, since those aren't a warm-up phenomenon. Both are required
+# (see predict_realtime.py / validate.py) because each covers what the
+# other misses.
+TREND_SLOPE_Z_THRESHOLD = 2.0
 
 FAILURE_HEALTH_THRESHOLD = 20  # health % at which the asset is considered failed
 REMAINING_DAYS_CAP = 90

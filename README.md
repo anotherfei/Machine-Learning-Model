@@ -59,18 +59,24 @@ python validate.py                 # external accuracy/reliability check — see
 
 ## Design decisions (read before changing config.py)
 
-- **The Isolation Forest is fit only on a "reference baseline window"**
-  (`config.REFERENCE_WINDOW_MINUTES`, default: first 2 days) — a standard
-  industrial-monitoring practice: use an early commissioning/burn-in
-  period as the definition of "normal," on the engineering assumption
-  that a freshly commissioned asset starts in good condition. **This is
-  an assumption, not something derived from data or labels.** If it's
-  wrong — the asset was already degrading during that window — every
-  downstream health/RUL number is calibrated against a bad reference.
-  That's a real, general limitation of unsupervised condition monitoring,
-  not something specific to this codebase.
+- **The Isolation Forest is fit on rows passing a fixed spec-bound filter**
+  (`preprocessing.select_spec_normal_rows()`, `config.SPEC_VIBRATION_MAX/
+  TEMPERATURE_MAX/CURRENT_MAX`), not a burn-in time window. This replaced
+  an earlier "first N days = normal" assumption after that assumption was
+  shown to fail on non-ramp (e.g. cyclic) trajectories — a fixed window
+  can't tell a healthy burn-in period from a burn-in period that's
+  already 50%+ degraded, but a spec bound doesn't need one to exist.
+  **The trade-off:** correctness now depends entirely on `SPEC_*` being
+  the genuine rated range for this hardware. These values are currently
+  carried over from an internal reference implementation, not confirmed
+  against a manufacturer spec sheet — get that wrong and, unlike a bad
+  time window, nothing in this pipeline will detect it. Confirm before
+  relying on this in production. `preprocessing.split_reference_window()`
+  (the old naive-window approach) still exists as `validate.py`'s
+  fallback for artifacts trained before this switch — it's not the
+  default path anymore.
 - **The anomaly-score-to-health mapping is calibrated once, at fit time,
-  from the baseline window's own score distribution** (mean/std), then
+  from the reference set's own score distribution** (mean/std), then
   held fixed (`isolation_forest.py`'s `health_from_score`). It does not
   renormalize as more (possibly degraded) data streams in — a health
   score of 20% should keep meaning "far from the reference condition,"
@@ -83,18 +89,35 @@ python validate.py                 # external accuracy/reliability check — see
   Splitting denoising (Kalman) from extrapolation (a separate regression
   module) avoids that entirely and matches the modularity this
   architecture is built around.
-- **Trend forecasting uses a 12-hour lookback, not 4.** A 4-hour window
-  was tried first and produced a real problem: during a clearly healthy
-  stretch (vibration ~1.0–1.9, nowhere near any threshold), the
-  maintenance recommendation flip-flopped between `OK` and `CRITICAL`
-  tick to tick, because ordinary noise in the smoothed health signal was
-  enough to swing a short-window linear fit's slope wildly (350%/day one
-  moment, −149%/day a few minutes later). Widening the lookback to 12
-  hours fixed this — the escalation through the actual degradation event
-  is now smooth and monotonic (`OK → WARN → CRITICAL` as vibration climbs)
-  instead of noisy. If you shorten `TREND_LOOKBACK_MINUTES`, re-check for
-  this exact failure mode during a known-healthy stretch before trusting
-  it.
+- **The Kalman filter seeds from the mean of the first `KALMAN_INIT_SAMPLES`
+  (15) raw readings, not a single tick.** Seeding from tick 0 alone let
+  one noisy measurement set the entire starting point — confirmed
+  directly to cause a multi-hour false CRITICAL/WARN stretch at the start
+  of every run, on data later confirmed genuinely healthy throughout. No
+  reading is emitted while the buffer fills (`predict_realtime.py`'s
+  `SpindleMonitor.update()` returns `None`; `validate.py`'s `run_backtest()`
+  drops those rows the same way), so this trades a few minutes of silence
+  at startup for not reporting a false emergency during it. Both call
+  sites must seed identically — if you touch one, touch the other, or
+  `validate.py` stops measuring what actually ships.
+- **Trend-based escalation (`remaining_days`, failure probability) is
+  gated behind two independent checks, both required
+  (`maintenance.recommend(..., trend_trusted=...)`):**
+  1. `TREND_SETTLE_TICKS` (60) — ticks since the trend fit first had
+     enough points (`TREND_MIN_POINTS`). The first fit's window still
+     partly overlaps the tail of the Kalman warm-up's recovery climb, and
+     a plain line over a decelerating rise reads as a false negative
+     slope.
+  2. `trend_forecast.slope_is_significant()` — a standard OLS
+     significance test (`TREND_SLOPE_Z_THRESHOLD`, z=2.0) on the fitted
+     slope vs. its own standard error, so a noisy/shallow fit doesn't
+     drive an escalation just because `remaining_days()` floors at 1 day.
+  Neither alone is sufficient — confirmed directly: significance alone
+  still left 12 of 27 originally-observed false post-warm-up CRITICALs
+  in place, because that specific window is smooth enough to look
+  statistically real while still being unrepresentative. `health_percent`-
+  based checks (`FAILURE_HEALTH_THRESHOLD`, `MAINTENANCE_HEALTH_INSPECT`)
+  are never gated by this — only the trend-derived triggers are.
 - **Failure probability uses a random-walk-with-drift model**
   (uncertainty grows with √horizon), a standard assumption in RUL
   literature — not an arbitrary confidence band. `config.FAILURE_PROB_HORIZONS_DAYS`
@@ -117,7 +140,11 @@ python validate.py                 # external accuracy/reliability check — see
   dropped, never imputed.**
 - **`artifacts/metadata.json` stores a hash of the feature-engineering
   config**; `artifact_utils.load_artifacts()` refuses to load if
-  `config.py` has drifted since training.
+  `config.py` has drifted since training. It also stores the exact
+  reference-set timestamps used to fit the model
+  (`reference_timestamps.json`), so `validate.py` tests the model that
+  was actually trained instead of re-deriving its own guess at what the
+  reference set should have been.
 
 ## Validation & reliability
 
@@ -185,17 +212,38 @@ considered and rejected for exactly this reason:
   above. An earlier version of this README claimed no accuracy could be
   reported at all; that was true before `validate.py` existed and is no
   longer accurate.
-- **There's a startup transient**: health readings during the first ~50
-  ticks (before the rolling window and Kalman filter both have enough
-  history) are less reliable than later readings — expected, not a bug,
-  but worth knowing if you see health swing during the first minute of a
-  cold start.
-- **`REFERENCE_WINDOW_MINUTES`, `HEALTH_SENSITIVITY_STD`,
-  `TREND_LOOKBACK_MINUTES`, `KALMAN_PARAMS`, and `FAILURE_HEALTH_THRESHOLD`
-  are all starting points**, not calibrated against real failure data —
-  there is none in this dataset (see the fully unsupervised framing
-  above; that's the whole point, but it also means these knobs were
-  tuned by inspecting behavior, not fit to ground truth).
+- **There's a brief, intentional startup silence, not a startup transient
+  anymore**: `predict_realtime.py` emits nothing for the first
+  `KALMAN_INIT_SAMPLES` (15) ticks while the Kalman filter's seed value
+  is computed from their mean, and trend-based (not health-based)
+  escalation stays untrusted for a further `TREND_SETTLE_TICKS` (60)
+  ticks after the trend fit first has enough points, gated additionally
+  by a statistical significance check on the fitted slope
+  (`trend_forecast.slope_is_significant()`). This replaced an earlier
+  version that seeded from a single noisy tick and trusted every trend
+  fit immediately — confirmed directly to produce a multi-hour false
+  CRITICAL/WARN stretch at the start of every run on data that was
+  genuinely healthy throughout. If you see a real false alarm shortly
+  after startup despite this, that's a signal these two constants need
+  raising for your specific deployment, not that the mechanism is wrong.
+- **`SPEC_VIBRATION_MAX/TEMPERATURE_MAX/CURRENT_MAX` (the values that now
+  define "normal" for training) are carried over from an internal
+  reference implementation, not confirmed against this hardware's actual
+  spec sheet.** Everything downstream — the reference set, the health
+  calibration, all of it — is only as correct as these three numbers.
+  This is a bigger single point of failure than the old time-window
+  assumption was, precisely because nothing in this pipeline can detect
+  if they're wrong the way `assess_reference_window`-style plausibility
+  checks could catch a bad time window.
+- **`REFERENCE_WINDOW_MINUTES` (now fallback-only — see `SPEC_*` above for
+  the active reference-selection knobs), `HEALTH_SENSITIVITY_STD`,
+  `TREND_LOOKBACK_MINUTES`, `KALMAN_PARAMS`, `KALMAN_INIT_SAMPLES`,
+  `TREND_SETTLE_TICKS`, `TREND_SLOPE_Z_THRESHOLD`, and
+  `FAILURE_HEALTH_THRESHOLD` are all starting points**, not calibrated
+  against real failure data — there is none in this dataset (see the
+  fully unsupervised framing above; that's the whole point, but it also
+  means these knobs were tuned by inspecting behavior on one trajectory,
+  not fit to ground truth or validated against a second one).
 - **Per-tick recomputation is not fast enough for rapid offline
   backtesting** — a full replay of this dataset's ~10,000 rows takes a
   few minutes, since `predict_realtime.py` recomputes rolling features

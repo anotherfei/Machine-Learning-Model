@@ -1,11 +1,16 @@
 """
-Isolation Forest anomaly scorer. Unsupervised — fit only on the reference
-baseline window (see config.REFERENCE_WINDOW_MINUTES / preprocessing.
-split_reference_window), scored continuously on everything.
+Isolation Forest anomaly scorer. Unsupervised — fit only on a reference
+set of "normal" rows (currently preprocessing.select_spec_normal_rows(),
+a spec-bound row filter; preprocessing.split_reference_window()'s naive
+first-N-rows window still exists as a fallback path — see
+train_isolation_forest.py / validate.py for which is actually wired up),
+scored continuously on everything. Doesn't care whether that reference
+set is a contiguous time window or scattered rows — fit()/score_samples()
+treat it as an unordered set of feature vectors either way.
 
 Outputs a raw anomaly score (sklearn's score_samples: higher = more
 normal, lower = more anomalous) plus a normalized health percentage
-calibrated against the reference window's own score distribution — see
+calibrated against the reference set's own score distribution — see
 health_from_score() and config.HEALTH_SENSITIVITY_STD.
 """
 

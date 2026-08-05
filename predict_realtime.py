@@ -69,6 +69,7 @@ class SpindleMonitor:
         self.trend_minutes = deque(maxlen=config.TREND_LOOKBACK_MINUTES)
         self.trend_health = deque(maxlen=config.TREND_LOOKBACK_MINUTES)
         self.tick = 0
+        self.trend_fit_ticks = 0  # counts ticks where fit_trend() actually returned a fit
 
     def update(self, reading: dict) -> dict:
         self.window.append(reading)
@@ -113,12 +114,18 @@ class SpindleMonitor:
             remaining = config.REMAINING_DAYS_CAP
             prob_table = {h: 0.0 for h in config.FAILURE_PROB_HORIZONS_DAYS}
             slope, residual_std = 0.0, 0.0
+            trend_trusted = True  # nothing to distrust — these are inert placeholders
         else:
+            self.trend_fit_ticks += 1
+            settled = self.trend_fit_ticks >= config.TREND_SETTLE_TICKS
             slope, intercept, residual_std = fit
+            significant = trend_forecast.slope_is_significant(
+                np.array(self.trend_minutes), slope, residual_std)
+            trend_trusted = settled and significant
             remaining = trend_forecast.remaining_days(self.tick, health_state, slope)
             prob_table = failure_probability.failure_probability_table(health_state, slope, residual_std)
 
-        rec = maintenance.recommend(health_state, remaining, prob_table)
+        rec = maintenance.recommend(health_state, remaining, prob_table, trend_trusted=trend_trusted)
 
         # ---- Diagnosis-only: which sensor(s) drove this reading ----
         # Computed every tick (cheap — a handful of subtractions over the
@@ -147,7 +154,7 @@ class SpindleMonitor:
 
 
 def read_sensor():
-    df = pd.read_csv(config.RAW_DATA_PATH, usecols=[config.COL_TIMESTAMP] + config.RAW_SENSOR_COLS)
+    df = pd.read_csv(config.PREDICT_DATA_PATH, usecols=[config.COL_TIMESTAMP] + config.RAW_SENSOR_COLS)
     for _, row in df.iterrows():
         yield {
             config.COL_VIBRATION: float(row[config.COL_VIBRATION]),

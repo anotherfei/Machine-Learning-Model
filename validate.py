@@ -45,6 +45,7 @@ from sklearn.metrics import (
 
 import config
 import artifact_utils
+import preprocessing
 from kalman import HealthKalmanFilter
 import trend_forecast
 import failure_probability
@@ -123,12 +124,31 @@ def run_backtest(df: pd.DataFrame, feature_cols: list, scorer):
     raw_scores = scorer.score(df[feature_cols])
     health_raw = scorer.health_from_score(raw_scores)
 
-    kalman = HealthKalmanFilter(initial_level=health_raw[0])
+    # Seed the Kalman filter the same way predict_realtime.py's
+    # SpindleMonitor does: from the mean of the first KALMAN_INIT_SAMPLES
+    # raw health readings, not a single tick (see config.KALMAN_INIT_SAMPLES
+    # for why). No row is emitted for that warm-up stretch, mirroring
+    # SpindleMonitor.update() returning None while its buffer fills — so
+    # this backtest measures the same signal the real-time path actually
+    # produces, instead of silently re-introducing via a different code
+    # path the exact cold-start transient this fix exists to remove.
+    n_init = config.KALMAN_INIT_SAMPLES
+    if len(health_raw) <= n_init:
+        raise ValueError(
+            f"Need more than KALMAN_INIT_SAMPLES ({n_init}) rows to run a backtest."
+        )
+    initial_level = float(np.mean(health_raw[:n_init]))
+    kalman = HealthKalmanFilter(initial_level=initial_level)
+
     health_states, maint_levels = [], []
     slopes, residuals = [], []
     trend_minutes, trend_health = [], []
+    trend_fit_ticks = 0  # counts ticks where fit_trend() actually returned a fit — see config.TREND_SETTLE_TICKS
 
     for i, h in enumerate(health_raw):
+        if i < n_init:
+            continue  # warm-up — no reading emitted, same as SpindleMonitor.update()
+
         hs = kalman.update(h)
         health_states.append(hs)
         trend_minutes.append(i)
@@ -144,16 +164,21 @@ def run_backtest(df: pd.DataFrame, feature_cols: list, scorer):
             residuals.append(np.nan)
             continue
 
+        trend_fit_ticks += 1
+        settled = trend_fit_ticks >= config.TREND_SETTLE_TICKS
         slope, intercept, resid = fit
+        significant = trend_forecast.slope_is_significant(np.array(trend_minutes), slope, resid)
+        trend_trusted = settled and significant
+
         slopes.append(slope)
         residuals.append(resid)
         remaining = trend_forecast.remaining_days(i, hs, slope)
         prob_table = failure_probability.failure_probability_table(hs, slope, resid)
-        rec = maintenance.recommend(hs, remaining, prob_table)
+        rec = maintenance.recommend(hs, remaining, prob_table, trend_trusted=trend_trusted)
         maint_levels.append(rec["level"])
 
-    out = df[[config.COL_TIMESTAMP]].copy()
-    out["health_raw"] = health_raw
+    out = df.iloc[n_init:][[config.COL_TIMESTAMP]].copy()
+    out["health_raw"] = health_raw[n_init:]
     out["health_state"] = health_states
     out["maintenance_level"] = maint_levels
     out["slope_per_minute"] = slopes
@@ -552,8 +577,7 @@ def main():
             "  which is only correct if that's genuinely how this model was trained.\n"
             "  Retrain with the current train_isolation_forest.py to fix this properly.\n"
         )
-        ref_cutoff = min(config.REFERENCE_WINDOW_MINUTES, len(df))
-        reference_df = df.iloc[:ref_cutoff].reset_index(drop=True)
+        reference_df, _ = preprocessing.split_reference_window(df)
     else:
         reference_df = df[df[config.COL_TIMESTAMP].isin(reference_timestamps)].reset_index(drop=True)
         if len(reference_df) != len(reference_timestamps):
