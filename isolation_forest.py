@@ -47,7 +47,33 @@ class AnomalyScorer:
         return self
 
     def score(self, X) -> np.ndarray:
-        """Raw anomaly score — higher = more normal."""
+        """
+        Raw anomaly score — higher = more normal.
+
+        Raises ValueError on any NaN/Inf in X rather than letting
+        IsolationForest score through it. Confirmed directly (via
+        reliability_suite.py's fault-injection check) that the
+        underlying sklearn estimator does NOT reliably error on a NaN
+        feature — it can silently route it through a tree split and
+        return a plausible-looking, meaningless score. For a monitoring
+        system, that's the dangerous failure mode: a real sensor dropout
+        should fail loudly here, not produce a number nothing downstream
+        knows to distrust.
+        """
+        X_arr = X.values if hasattr(X, "values") else np.asarray(X)
+        finite_mask = np.isfinite(X_arr.astype(float))
+        if not finite_mask.all():
+            if hasattr(X, "columns"):
+                bad_cols = [c for i, c in enumerate(X.columns) if not finite_mask[:, i].all()]
+            else:
+                bad_cols = "input array (no column names available)"
+            raise ValueError(
+                f"AnomalyScorer.score() received non-finite (NaN/Inf) values in "
+                f"{bad_cols} — refusing to score. This means a sensor dropout or "
+                f"an upstream feature-engineering bug reached the model; it should "
+                f"be handled (or the reading skipped) before scoring, not scored "
+                f"through silently."
+            )
         return self.model.score_samples(X)
 
     def feature_z_scores(self, X) -> "pd.Series":

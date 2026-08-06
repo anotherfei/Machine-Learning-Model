@@ -39,7 +39,7 @@ FEATURES_DATA_PATH = os.path.join(PROCESSED_DATA_DIR, "features.csv")
 REALTIME_PREDICTIONS_PATH = os.path.join(RESULTS_DIR, "realtime_predictions.csv")
 VALIDATION_REPORT_PATH = os.path.join(RESULTS_DIR, "validation_report.png")
 
-PREDICT_DATA_PATH = os.path.join(RAW_DATA_DIR, "spindle.csv")
+PREDICT_DATA_PATH = os.path.join(RAW_DATA_DIR, "spindle_given.csv")
 
 # ---------------------------------------------------------------------------
 # Raw column names
