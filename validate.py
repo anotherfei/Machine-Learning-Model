@@ -89,6 +89,7 @@ from sklearn.metrics import (
 import config
 import artifact_utils
 import preprocessing
+import feature_engineering
 from kalman import HealthKalmanFilter
 import trend_forecast
 import failure_probability
@@ -322,6 +323,7 @@ def run_backtest(df: pd.DataFrame, feature_cols: list, scorer):
         )
     initial_level = float(np.mean(health_raw[:n_init]))
     kalman = HealthKalmanFilter(initial_level=initial_level)
+    maintenance_debouncer = maintenance.MaintenanceDebouncer()
 
     health_states, maint_levels = [], []
     slopes, residuals = [], []
@@ -357,7 +359,7 @@ def run_backtest(df: pd.DataFrame, feature_cols: list, scorer):
         residuals.append(resid)
         remaining = trend_forecast.remaining_days(i, hs, slope)
         prob_table = failure_probability.failure_probability_table(hs, slope, resid)
-        rec = maintenance.recommend(hs, remaining, prob_table, trend_trusted=trend_trusted)
+        rec = maintenance_debouncer.evaluate(hs, remaining, prob_table, trend_trusted=trend_trusted)
         maint_levels.append(rec["level"])
 
     out = df.iloc[n_init:][[config.COL_TIMESTAMP]].copy()
@@ -367,6 +369,41 @@ def run_backtest(df: pd.DataFrame, feature_cols: list, scorer):
     out["slope_per_minute"] = slopes
     out["residual_std"] = residuals
     return out
+
+
+def build_holdout_merged(scorer, feature_cols: list):
+    """
+    Replays config.PREDICT_DATA_PATH — a file the reference set was never
+    drawn from — through the same run_backtest() used on the training
+    file, and merges the result with ITS OWN health_status labels.
+    Returns (merged, y_true, is_bad_array, backtest_df) in the exact
+    shape check_discrimination()/check_calibration()/
+    check_threshold_calibration() already expect, so main() can hand
+    them this instead of the training-file version with no changes to
+    those functions — same statistics, different (and, right now, the
+    only usable) data source. Returns None if PREDICT_DATA_PATH has no
+    health_status column.
+    """
+    holdout_raw = pd.read_csv(config.PREDICT_DATA_PATH)
+    if "health_status" not in holdout_raw.columns:
+        return None
+
+    holdout_clean = preprocessing.clean_data(
+        holdout_raw[[config.COL_TIMESTAMP] + config.RAW_SENSOR_COLS].copy())
+    holdout_features = feature_engineering.create_features(holdout_clean, verbose=False)
+    holdout_backtest = run_backtest(holdout_features, feature_cols, scorer)
+
+    labels = holdout_raw[[config.COL_TIMESTAMP, "health_status"]].copy()
+    labels[config.COL_TIMESTAMP] = pd.to_datetime(labels[config.COL_TIMESTAMP])
+    labels = labels.sort_values(config.COL_TIMESTAMP).reset_index(drop=True)
+    labels["pos"] = np.arange(len(labels))
+    labels["is_bad"] = (labels["health_status"] != "normal").astype(int)
+
+    merged = holdout_backtest.merge(labels[[config.COL_TIMESTAMP, "health_status", "pos"]],
+                                     on=config.COL_TIMESTAMP, how="left")
+    y_true = (merged["health_status"] != "normal").astype(int).values
+    is_bad_array = labels["is_bad"].values
+    return merged, y_true, is_bad_array, holdout_backtest
 
 
 def confusion(pred: np.ndarray, y_true: np.ndarray, label: str):
@@ -969,7 +1006,7 @@ def check_golden_snapshot(backtest_df: pd.DataFrame, findings: Findings, n_rows:
 # can't be a hard PASS/FAIL the way the checks above are)
 # ===========================================================================
 
-def check_threshold_calibration(merged: pd.DataFrame, findings: Findings):
+def check_threshold_calibration(merged: pd.DataFrame, findings: Findings, raw_data_path: str = None):
     """
     Sanity-checks config.FAILURE_HEALTH_THRESHOLD (20) and
     config.MAINTENANCE_HEALTH_INSPECT (40) against an empirically-derived
@@ -987,7 +1024,7 @@ def check_threshold_calibration(merged: pd.DataFrame, findings: Findings):
     print("12. THRESHOLD SANITY CHECK (informational) — health% thresholds vs. sensor onset")
     print("=" * 70)
 
-    raw = pd.read_csv(config.RAW_DATA_PATH)
+    raw = pd.read_csv(raw_data_path or config.RAW_DATA_PATH)
     raw[config.COL_TIMESTAMP] = pd.to_datetime(raw[config.COL_TIMESTAMP])
     raw = raw.sort_values(config.COL_TIMESTAMP).reset_index(drop=True)
 
@@ -1359,6 +1396,52 @@ def main():
                                 on=config.COL_TIMESTAMP, how="left")
     y_true = (merged["health_status"] != "normal").astype(int).values
 
+    # config.RAW_DATA_PATH may legitimately have only one health_status
+    # class (it does right now: spindle_train.csv is 100% 'normal', by
+    # design — see config.py). AUC/confusion matrices need both classes
+    # to mean anything; when the training file can't provide that, fall
+    # back to config.PREDICT_DATA_PATH (a separate trajectory, never seen
+    # by the reference set) for every label-dependent check below. This
+    # keeps check_discrimination()/check_calibration()/
+    # check_threshold_calibration() completely unchanged — they just
+    # receive different (merged, y_true, is_bad_array) depending on which
+    # source actually has something to measure against.
+    train_labels_usable = 0 < y_true.sum() < len(y_true)
+    if train_labels_usable:
+        print(f"Label source for accuracy/calibration checks: {config.RAW_DATA_PATH} "
+              f"(both classes present: {y_true.sum()} bad / {(y_true == 0).sum()} normal).\n")
+    else:
+        only_class = "normal" if y_true.sum() == 0 else "bad"
+        print(
+            f"NOTE: {config.RAW_DATA_PATH} is entirely '{only_class}' "
+            f"({len(y_true)} rows, 0 of the other class) — AUC and confusion matrices\n"
+            f"against it would be undefined/meaningless, not just weak. Falling back to\n"
+            f"{config.PREDICT_DATA_PATH} (a separate trajectory the reference set never saw)\n"
+            f"for every check below that needs both classes.\n"
+        )
+        holdout = build_holdout_merged(scorer, feature_cols)
+        if holdout is None:
+            raise RuntimeError(
+                f"{config.RAW_DATA_PATH} has only '{only_class}' rows AND "
+                f"{config.PREDICT_DATA_PATH} has no health_status column — no data source "
+                f"available for any accuracy/calibration check. Provide a labeled, "
+                f"mixed-class file for at least one of these paths."
+            )
+        # NOTE: deliberately NOT reassigning backtest_df/df here — those
+        # stay the training-file versions for the label-independent
+        # STABILITY/CONSISTENCY checks below (perturbation robustness,
+        # fault injection, reference-window sensitivity, reproducibility,
+        # batch-vs-realtime, golden snapshot), which pair df+backtest_df
+        # together and don't use labels at all. Only the label-dependent
+        # (merged, y_true, is_bad_array) swap to the held-out file.
+        merged, y_true, is_bad_array, _holdout_backtest_df = holdout
+        findings.note(
+            "ACCURACY", "Evaluation data source",
+            f"{config.RAW_DATA_PATH} has no '{only_class == 'normal' and 'bad' or 'normal'}' rows to "
+            f"validate against — every check below ran on {config.PREDICT_DATA_PATH} instead "
+            f"({y_true.sum()} bad / {(y_true == 0).sum()} normal, n={len(y_true)})."
+        )
+
     auc_raw, auc_state, ap_state, conf_threshold, conf_maint, ci_raw, ci_state = check_discrimination(
         merged, y_true, findings)
 
@@ -1376,7 +1459,8 @@ def main():
     repro_result = check_reproducibility(reference_df, feature_cols, findings)
     batch_rt_result = check_batch_vs_realtime(feature_cols, findings)
     check_golden_snapshot(backtest_df, findings)
-    check_threshold_calibration(merged, findings)
+    check_threshold_calibration(merged, findings,
+                                 raw_data_path=None if train_labels_usable else config.PREDICT_DATA_PATH)
 
     # ---- REPORT ---------------------------------------------------------------
     print()

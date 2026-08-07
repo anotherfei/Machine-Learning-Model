@@ -148,6 +148,23 @@ python validate.py                 # external accuracy/reliability check — see
 
 ## Validation & reliability
 
+**When to retrain** — three triggers, only one of which needs code:
+1. On a schedule (operational policy, not something this repo enforces).
+2. On evidence of drift — `validate.py`'s overfitting check (reference-
+   set train/holdout split) is the built-in signal for this.
+3. **After a known repair.** If a repair happens with your knowledge —
+   you're the one servicing the spindle, or there's a maintenance log —
+   you don't need the pipeline to detect a new lifecycle automatically;
+   you just need the habit of retraining right after, using data from
+   after the repair. A repaired component's "normal" baseline can shift
+   even when it's genuinely healthy (e.g. a new bearing's vibration
+   signature differs from the worn one it replaced) — the same concern
+   `select_spec_normal_rows()`/`assess_reference_window`-style checks
+   exist for elsewhere in this repo, just triggered by a fact only a
+   human knows, not something in the sensor stream. This is a process
+   change, not an engineering one — nothing to build, just don't forget
+   to run `train_isolation_forest.py` again after a repair.
+
 `validate.py` is the accuracy/reliability test suite — the **only** file
 in this repo that reads `health_status`, kept structurally separate from
 the pipeline (see the top of this README). Run it after every retrain:

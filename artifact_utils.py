@@ -88,7 +88,49 @@ def save_artifacts(scorer, feature_columns: list, reference_timestamps=None):
           f"feature_columns.json, metadata.json{extra} -> {config.ARTIFACTS_DIR}")
 
 
-def load_artifacts():
+def save_local_calibration(scorer, deployment_name: str = None):
+    """
+    Saves ONLY the health%-anchor calibration (baseline_mean/std, per-
+    feature diagnostics) — not the tree, not feature_columns, not
+    metadata — to a separate file from the pooled-training default. See
+    isolation_forest.AnomalyScorer.calibrate()'s docstring for why this
+    needs to exist: the tree (fit once on a broad pooled corpus) and the
+    health% anchor (recalibrated per deployment, from that deployment's
+    own short known-healthy window) can legitimately need to come from
+    different data.
+
+    deployment_name lets multiple units share one trained tree with
+    separate calibration files (calibration_local_<name>.json); omit it
+    for a single default override (calibration_local.json).
+    """
+    os.makedirs(config.ARTIFACTS_DIR, exist_ok=True)
+    fname = f"calibration_local_{deployment_name}.json" if deployment_name else "calibration_local.json"
+    path = os.path.join(config.ARTIFACTS_DIR, fname)
+    with open(path, "w") as f:
+        json.dump(scorer.calibration(), f, indent=2)
+    print(f"[save_local_calibration] Saved -> {path}")
+    return path
+
+
+def load_local_calibration(deployment_name: str = None):
+    """Returns the local calibration dict, or None if no override has been saved."""
+    fname = f"calibration_local_{deployment_name}.json" if deployment_name else "calibration_local.json"
+    path = os.path.join(config.ARTIFACTS_DIR, fname)
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
+def load_artifacts(deployment_name: str = None, use_local_calibration: bool = None):
+    """
+    use_local_calibration: explicit opt-in/opt-out. None (default) means
+    "use a local override if calibration_local(_<name>).json exists, else
+    fall back to the pooled default" — and PRINTS which one it picked
+    either way, so this is never a silent choice. Pass True to require a
+    local override (raises if missing) or False to force the pooled
+    default even if a local override exists.
+    """
     from isolation_forest import AnomalyScorer  # local import avoids a circular import
 
     model_path = os.path.join(config.ARTIFACTS_DIR, "isolation_forest.pkl")
@@ -99,9 +141,6 @@ def load_artifacts():
 
     with open(os.path.join(config.ARTIFACTS_DIR, "feature_columns.json")) as f:
         feature_columns = json.load(f)
-
-    with open(os.path.join(config.ARTIFACTS_DIR, "calibration.json")) as f:
-        calibration = json.load(f)
 
     with open(os.path.join(config.ARTIFACTS_DIR, "metadata.json")) as f:
         metadata = json.load(f)
@@ -118,6 +157,25 @@ def load_artifacts():
             f"feature_engineering.py's create_features() was edited since this "
             f"model was trained. Retrain the model or revert the change before predicting."
         )
+
+    local_calibration = load_local_calibration(deployment_name)
+    if use_local_calibration is True and local_calibration is None:
+        raise FileNotFoundError(
+            f"use_local_calibration=True but no calibration_local"
+            f"{'_' + deployment_name if deployment_name else ''}.json found in "
+            f"{config.ARTIFACTS_DIR}. Run recalibrate.py for this deployment first."
+        )
+    if use_local_calibration is False:
+        calibration_source, calibration = "pooled default (forced)", None
+    elif local_calibration is not None:
+        calibration_source, calibration = "LOCAL override", local_calibration
+    else:
+        calibration_source, calibration = "pooled default (no local override found)", None
+
+    if calibration is None:
+        with open(os.path.join(config.ARTIFACTS_DIR, "calibration.json")) as f:
+            calibration = json.load(f)
+    print(f"[load_artifacts] Calibration source: {calibration_source}")
 
     scorer = AnomalyScorer.from_calibration(model, calibration)
     return scorer, feature_columns, metadata

@@ -6,8 +6,6 @@ Usage:
     python train_isolation_forest.py
 """
 
-import os
-
 import config
 import preprocessing
 import feature_engineering
@@ -16,8 +14,9 @@ from isolation_forest import AnomalyScorer
 
 
 def get_or_build_features():
-    if not os.path.exists(config.FEATURES_DATA_PATH):
-        print("[train] No cached features found — running full preprocessing pipeline.")
+    if preprocessing.cached_features_are_stale():
+        print(f"[train] Cached features missing or stale for {config.RAW_DATA_PATH} — "
+              f"rebuilding from raw data (see preprocessing.cached_features_are_stale()).")
         preprocessing.run_preprocessing()
         return feature_engineering.run_feature_engineering()
 

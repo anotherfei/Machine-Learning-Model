@@ -33,7 +33,7 @@ ARTIFACTS_DIR = os.path.join(ROOT_DIR, "artifacts")
 # model needs to run, not what running it produced.
 RESULTS_DIR = os.path.join(ROOT_DIR, "results")
 
-RAW_DATA_PATH = os.path.join(RAW_DATA_DIR, "spindle_given.csv")
+RAW_DATA_PATH = os.path.join(RAW_DATA_DIR, "spindle_train.csv")
 PROCESSED_DATA_PATH = os.path.join(PROCESSED_DATA_DIR, "processed.csv")
 FEATURES_DATA_PATH = os.path.join(PROCESSED_DATA_DIR, "features.csv")
 REALTIME_PREDICTIONS_PATH = os.path.join(RESULTS_DIR, "realtime_predictions.csv")
@@ -203,7 +203,7 @@ TREND_SETTLE_TICKS = 60
 # other misses.
 TREND_SLOPE_Z_THRESHOLD = 2.0
 
-FAILURE_HEALTH_THRESHOLD = 20  # health % at which the asset is considered failed
+FAILURE_HEALTH_THRESHOLD = 75  # health % at which the asset is considered failed
 REMAINING_DAYS_CAP = 90
 
 # ---------------------------------------------------------------------------
@@ -230,5 +230,31 @@ FAILURE_PROB_HORIZONS_DAYS = [0.25, 0.5, 0.75, 1]
 MAINTENANCE_HORIZON_DAYS = 1          # "how soon" horizon the rules check against — kept within the <=1 day range validated above
 MAINTENANCE_PROB_URGENT = 0.70       # failure probability within horizon -> urgent
 MAINTENANCE_PROB_PLAN = 0.30         # -> plan maintenance
-MAINTENANCE_REMAINING_DAYS_URGENT = 7
+# MAINTENANCE_REMAINING_DAYS_URGENT removed as an independent CRITICAL
+# trigger (see maintenance.py) — remaining_days is a bare point-estimate
+# extrapolation with no uncertainty accounting, while MAINTENANCE_PROB_URGENT
+# uses the same slope estimate PLUS residual_std through a proper
+# random-walk model (failure_probability.py). Confirmed directly: on
+# data/raw/spindle_train.csv (43,176 rows, 100% health_status=='normal' —
+# should never report CRITICAL), the two-trigger version fired CRITICAL on
+# 13,880 rows (~32%) — a noisy per-tick slope estimate could floor
+# remaining_days at 1 day (always <= the urgent cutoff) even when
+# failure_probability correctly stayed low because it accounted for that
+# same noise as uncertainty. remaining_days is still computed and reported
+# for human context — it's just no longer allowed to escalate on its own.
 MAINTENANCE_HEALTH_INSPECT = 40      # health % below this -> inspect regardless
+
+# Hysteresis on the trend/failure-probability trigger only — NOT on
+# health_percent-based triggers (FAILURE_HEALTH_THRESHOLD,
+# MAINTENANCE_HEALTH_INSPECT), which stay instant because they're already
+# the Kalman-smoothed signal and don't need a second smoothing pass (see
+# maintenance.MaintenanceDebouncer). Escalation needs
+# MAINTENANCE_TREND_DEBOUNCE_TICKS consecutive confirming ticks;
+# de-escalation needs the longer MAINTENANCE_TREND_RECOVERY_TICKS —
+# standard fast-to-alarm, slow-to-clear alarm-management practice, so a
+# genuine escalation isn't reported late but a momentary dip doesn't
+# report "all clear" prematurely. Starting points, not fit to data beyond
+# the spindle_train.csv sanity check above — same caveat as every other
+# *_TICKS constant in this file.
+MAINTENANCE_TREND_DEBOUNCE_TICKS = 5
+MAINTENANCE_TREND_RECOVERY_TICKS = 15

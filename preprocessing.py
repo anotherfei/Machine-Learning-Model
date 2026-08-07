@@ -9,9 +9,56 @@ Using `usecols` means even a future column-selection bug elsewhere can't
 accidentally pull it in; it's dropped before anything else runs.
 """
 
+import os
+import hashlib
+import json
+
 import pandas as pd
 
 import config
+
+
+def raw_data_signature(path: str = None) -> str:
+    """
+    Fingerprint of a raw data file (path + size + mtime), used to detect
+    when config.RAW_DATA_PATH has been repointed at a different file (or
+    the same file edited in place) since data/processed/*.csv was last
+    built. Content isn't hashed — path+size+mtime is enough to catch a
+    changed source and is far cheaper on a file this size, checked on
+    every run.
+    """
+    path = path or config.RAW_DATA_PATH
+    stat = os.stat(path)
+    fingerprint = f"{os.path.abspath(path)}:{stat.st_size}:{stat.st_mtime}"
+    return hashlib.md5(fingerprint.encode()).hexdigest()
+
+
+def save_source_signature(path: str = None):
+    sig = raw_data_signature(path)
+    os.makedirs(config.PROCESSED_DATA_DIR, exist_ok=True)
+    with open(os.path.join(config.PROCESSED_DATA_DIR, "source_signature.json"), "w") as f:
+        json.dump({"source_path": path or config.RAW_DATA_PATH, "signature": sig}, f, indent=2)
+
+
+def cached_features_are_stale(path: str = None) -> bool:
+    """
+    True if data/processed/features.csv either doesn't exist, has no
+    recorded source signature, or was built from a different raw file
+    than config.RAW_DATA_PATH currently points to. See
+    train_isolation_forest.py's get_or_build_features() — this is what
+    stops it from silently training on stale cached features after
+    RAW_DATA_PATH changes, which happened for real: switching to
+    spindle_train.csv left features.csv (9,992 rows, the old ~10k-row
+    file) untouched and get_or_build_features() had no way to notice.
+    """
+    if not os.path.exists(config.FEATURES_DATA_PATH):
+        return True
+    sig_path = os.path.join(config.PROCESSED_DATA_DIR, "source_signature.json")
+    if not os.path.exists(sig_path):
+        return True
+    with open(sig_path) as f:
+        saved = json.load(f)
+    return saved.get("signature") != raw_data_signature(path)
 
 
 def load_data(path: str = config.RAW_DATA_PATH) -> pd.DataFrame:
@@ -132,6 +179,7 @@ def run_preprocessing(save: bool = True) -> pd.DataFrame:
 
     if save:
         df.to_csv(config.PROCESSED_DATA_PATH, index=False)
+        save_source_signature()
         print(f"[run_preprocessing] Saved cleaned data to {config.PROCESSED_DATA_PATH}")
 
     return df

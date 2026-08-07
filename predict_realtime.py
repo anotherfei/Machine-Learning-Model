@@ -12,9 +12,11 @@ Fully unsupervised — health_status is never loaded, read, or referenced
 anywhere in this script or anything it imports (see config.py docstring).
 
 As with the earlier version: no live hardware exists in this environment,
-so read_sensor() replays config.RAW_DATA_PATH row by row instead of
-generating random numbers. Point this at a live feed by replacing
-read_sensor()'s body — everything downstream is unchanged.
+so read_sensor() replays config.PREDICT_DATA_PATH (the held-out file —
+deliberately NOT config.RAW_DATA_PATH, which is training data; see
+config.py) row by row instead of generating random numbers. Point this
+at a live feed by replacing read_sensor()'s body — everything downstream
+is unchanged.
 
 Usage:
     python predict_realtime.py
@@ -70,6 +72,7 @@ class SpindleMonitor:
         self.trend_health = deque(maxlen=config.TREND_LOOKBACK_MINUTES)
         self.tick = 0
         self.trend_fit_ticks = 0  # counts ticks where fit_trend() actually returned a fit
+        self.maintenance = maintenance.MaintenanceDebouncer()
 
     def update(self, reading: dict) -> dict:
         self.window.append(reading)
@@ -125,7 +128,7 @@ class SpindleMonitor:
             remaining = trend_forecast.remaining_days(self.tick, health_state, slope)
             prob_table = failure_probability.failure_probability_table(health_state, slope, residual_std)
 
-        rec = maintenance.recommend(health_state, remaining, prob_table, trend_trusted=trend_trusted)
+        rec = self.maintenance.evaluate(health_state, remaining, prob_table, trend_trusted=trend_trusted)
 
         # ---- Diagnosis-only: which sensor(s) drove this reading ----
         # Computed every tick (cheap — a handful of subtractions over the
@@ -166,7 +169,20 @@ def read_sensor():
 LOG_PATH = config.REALTIME_PREDICTIONS_PATH
 
 
-def save_result(result: dict):
+def save_result(result: dict, reset: bool = False):
+    """
+    reset=True truncates LOG_PATH before writing — used once at the start
+    of a run so each run's log corresponds to exactly one replay of
+    config.PREDICT_DATA_PATH. Without this, every run appended onto
+    whatever was already there (confirmed: results/realtime_predictions.csv
+    had grown to 11,842 rows despite PREDICT_DATA_PATH having only 10,000 —
+    leftover rows from a previous run/dataset silently mixed in with no way
+    to tell which prediction came from which run).
+
+    Appends directly rather than re-reading the whole file every tick
+    (the previous approach was O(n^2) over a run) — writes the header
+    only on the first row of a run.
+    """
     os.makedirs(config.RESULTS_DIR, exist_ok=True)
     flat = {k: v for k, v in result.items()
             if k not in ("failure_probability", "maintenance", "top_contributors")}
@@ -181,17 +197,16 @@ def save_result(result: dict):
     flat["timestamp"] = pd.Timestamp.now()
 
     row = pd.DataFrame([flat])
-    try:
-        old = pd.read_csv(LOG_PATH)
-        pd.concat([old, row], ignore_index=True).to_csv(LOG_PATH, index=False)
-    except FileNotFoundError:
-        row.to_csv(LOG_PATH, index=False)
+    write_header = reset or not os.path.exists(LOG_PATH)
+    row.to_csv(LOG_PATH, mode="w" if reset else "a", header=write_header, index=False)
 
 
 if __name__ == "__main__":
     monitor = SpindleMonitor()
     print("Realtime Spindle Monitoring Started (replaying logged data)")
+    print(f"Source: {config.PREDICT_DATA_PATH}")
     tick = 0
+    log_reset_done = False
 
     for reading in read_sensor():
         try:
@@ -216,7 +231,8 @@ if __name__ == "__main__":
                 names = ", ".join(f"{name} (z={z:+.1f})" for name, z, _ in result["top_contributors"])
                 print("Top contributors :", names)
 
-            save_result(result)
+            save_result(result, reset=not log_reset_done)
+            log_reset_done = True
             time.sleep(0.01)  # replaying logged data — not throttled to real time
 
         except Exception as e:

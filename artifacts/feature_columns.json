@@ -26,5 +26,7 @@
   "temperature_skew",
   "temperature_crest_factor",
   "temperature_trend_slope",
-  "vibration_current_corr"
+  "vibration_current_corr",
+  "vibration_temperature_corr",
+  "current_temperature_corr"
 ]

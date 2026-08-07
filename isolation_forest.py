@@ -32,11 +32,53 @@ class AnomalyScorer:
     def fit(self, X_reference):
         """Fit on the reference/baseline window only, then calibrate the
         health-percentage mapping against that same window's own score
-        distribution."""
+        distribution. Convenience wrapper — equivalent to fit_model(X)
+        followed by calibrate(X, same reference). Most callers want this;
+        use fit_model()+calibrate() separately only when the tree and the
+        health% anchor should come from different data (see calibrate()'s
+        docstring for why that's sometimes necessary)."""
+        self.fit_model(X_reference)
+        self.calibrate(X_reference)
+        return self
+
+    def fit_model(self, X_reference):
+        """
+        Fits ONLY the Isolation Forest tree structure — what counts as an
+        unusual combination of features. Does not touch baseline_mean/std.
+        Split out from fit() so the tree (learned once, ideally from a
+        large pooled "normal" corpus so it generalizes) and the health%
+        anchor (see calibrate()) can come from different data.
+        """
         self.model.fit(X_reference)
-        reference_scores = self.model.score_samples(X_reference)
-        self.baseline_mean = float(np.mean(reference_scores))
-        self.baseline_std = float(np.std(reference_scores)) or 1e-6  # avoid div-by-zero
+        return self
+
+    def calibrate(self, X_reference):
+        """
+        Sets baseline_mean/baseline_std (and the per-feature diagnostics)
+        from X_reference's own score distribution — this is what
+        health_from_score() anchors "100%" and "0%" to. Callable
+        separately from fit_model() and re-callable later.
+
+        Why this needs to be separable, confirmed not theorized: fitting
+        the tree on a large pooled training file (config.RAW_DATA_PATH)
+        and ALSO calibrating from that same pooled file transfers well for
+        RELATIVE ranking (held-out AUC=0.997 across a genuinely different
+        trajectory) but not for the ABSOLUTE percentage scale — measured
+        directly: genuinely-normal rows in a different held-out trajectory
+        had a z-score distribution (relative to the pooled file's
+        baseline_mean/std) that OVERLAPPED with that same held-out
+        trajectory's own genuinely-bad rows (normal 75th-99th percentile
+        z=4.9-6.0 sits inside bad rows' min-50th percentile z=4.3-5.2). No
+        single HEALTH_SENSITIVITY_STD value can be correct for both
+        populations simultaneously when the anchor itself doesn't match
+        the deployment. Recalibrating baseline_mean/std from THIS
+        deployment's own short known-healthy window (while keeping the
+        tree fit on the broad pooled corpus) fixes the anchor without
+        losing what the pooled training bought.
+        """
+        scores = self.model.score_samples(X_reference)
+        self.baseline_mean = float(np.mean(scores))
+        self.baseline_std = float(np.std(scores)) or 1e-6
 
         # Per-feature baseline, used only for diagnosis (which raw
         # feature(s) drove a given anomalous reading), never for the
