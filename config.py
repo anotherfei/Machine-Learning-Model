@@ -203,7 +203,7 @@ TREND_SETTLE_TICKS = 60
 # other misses.
 TREND_SLOPE_Z_THRESHOLD = 2.0
 
-FAILURE_HEALTH_THRESHOLD = 75  # health % at which the asset is considered failed
+FAILURE_HEALTH_THRESHOLD = 20  # health % at which the asset is considered failed
 REMAINING_DAYS_CAP = 90
 
 # ---------------------------------------------------------------------------
