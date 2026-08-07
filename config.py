@@ -33,7 +33,7 @@ ARTIFACTS_DIR = os.path.join(ROOT_DIR, "artifacts")
 # model needs to run, not what running it produced.
 RESULTS_DIR = os.path.join(ROOT_DIR, "results")
 
-RAW_DATA_PATH = os.path.join(RAW_DATA_DIR, "spindle_train.csv")
+RAW_DATA_PATH = os.path.join(RAW_DATA_DIR, "spindle_given.csv")
 PROCESSED_DATA_PATH = os.path.join(PROCESSED_DATA_DIR, "processed.csv")
 FEATURES_DATA_PATH = os.path.join(PROCESSED_DATA_DIR, "features.csv")
 REALTIME_PREDICTIONS_PATH = os.path.join(RESULTS_DIR, "realtime_predictions.csv")
