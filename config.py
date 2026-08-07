@@ -203,7 +203,7 @@ TREND_SETTLE_TICKS = 60
 # other misses.
 TREND_SLOPE_Z_THRESHOLD = 2.0
 
-FAILURE_HEALTH_THRESHOLD = 20  # health % at which the asset is considered failed
+FAILURE_HEALTH_THRESHOLD = 40  # health % at which the asset is considered failed
 REMAINING_DAYS_CAP = 90
 
 # ---------------------------------------------------------------------------
@@ -242,7 +242,7 @@ MAINTENANCE_PROB_PLAN = 0.30         # -> plan maintenance
 # failure_probability correctly stayed low because it accounted for that
 # same noise as uncertainty. remaining_days is still computed and reported
 # for human context — it's just no longer allowed to escalate on its own.
-MAINTENANCE_HEALTH_INSPECT = 40      # health % below this -> inspect regardless
+MAINTENANCE_HEALTH_INSPECT = 75      # health % below this -> inspect regardless
 
 # Hysteresis on the trend/failure-probability trigger only — NOT on
 # health_percent-based triggers (FAILURE_HEALTH_THRESHOLD,
