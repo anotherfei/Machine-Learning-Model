@@ -29,10 +29,9 @@ def raw_data_signature(path: str = None) -> str:
     Covers:
       - the raw CSV's content (catches RAW_DATA_PATH pointing elsewhere,
         or the same file edited in place)
-      - COL_TIMESTAMP / RAW_SENSOR_COLS / COL_VIBRATION / COL_CURRENT /
-        COL_TEMPERATURE — change any of these and load_data()/
-        clean_data()'s behavior changes, even though load_data() itself
-        wasn't touched
+      - COL_TIMESTAMP / RAW_SENSOR_COLS — change any of these and
+        load_data()/clean_data()'s behavior changes, even though
+        load_data() itself wasn't touched
       - artifact_utils.config_hash() — FEATURE_CONFIG (WINDOW_SIZE,
         MIN_PERIODS, ...) plus feature_engineering.py's own source; reused
         rather than reimplemented so this and the model's own drift check
@@ -54,9 +53,6 @@ def raw_data_signature(path: str = None) -> str:
     relevant_config = {
         "COL_TIMESTAMP": config.COL_TIMESTAMP,
         "RAW_SENSOR_COLS": config.RAW_SENSOR_COLS,
-        "COL_VIBRATION": config.COL_VIBRATION,
-        "COL_CURRENT": config.COL_CURRENT,
-        "COL_TEMPERATURE": config.COL_TEMPERATURE,
     }
     hasher.update(json.dumps(relevant_config, sort_keys=True).encode())
     hasher.update(artifact_utils.config_hash().encode())
@@ -152,12 +148,19 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
     if dropped:
         print(f"[clean_data] Dropped {dropped} rows with missing sensor values.")
 
-    # Remove physically impossible readings — adjust bounds to your sensor specs
+    # Remove physically impossible readings, per the VVB001 datasheet's
+    # own measuring ranges (not a guess — see product-spec conversation):
+    #   a-RMS / a-Peak: 0-490.3 m/s^2 (0-50 g)
+    #   v-RMS:          0-45 mm/s
+    #   crest factor:   1-50 (also mathematically >=1 always: peak>=rms
+    #                   for any real signal, by definition of RMS)
+    #   temperature:    -30 to 80 C (sensor's rated measuring range)
     df = df[
-        (df[config.COL_VIBRATION] >= 0)
-        & (df[config.COL_CURRENT] >= 0)
-        & (df[config.COL_TEMPERATURE] > -50)
-        & (df[config.COL_TEMPERATURE] < 300)
+        (df[config.COL_A_RMS] >= 0) & (df[config.COL_A_RMS] <= 490.3)
+        & (df[config.COL_A_PEAK] >= 0) & (df[config.COL_A_PEAK] <= 490.3)
+        & (df[config.COL_V_RMS] >= 0) & (df[config.COL_V_RMS] <= 45)
+        & (df[config.COL_CREST_FACTOR] >= 1) & (df[config.COL_CREST_FACTOR] <= 50)
+        & (df[config.COL_TEMPERATURE] >= -30) & (df[config.COL_TEMPERATURE] <= 80)
     ]
 
     df = df.reset_index(drop=True)
@@ -209,21 +212,28 @@ def select_spec_normal_rows(raw_df: pd.DataFrame) -> pd.DataFrame:
 
     No labels used, consistent with the rest of this module.
     """
-    mask = (
-        (raw_df[config.COL_VIBRATION] <= config.SPEC_VIBRATION_MAX)
-        & (raw_df[config.COL_TEMPERATURE] <= config.SPEC_TEMPERATURE_MAX)
-        & (raw_df[config.COL_CURRENT] <= config.SPEC_CURRENT_MAX)
-    )
+    active_bounds = {col: bound for col, bound in config.SPEC_MAX.items() if bound is not None}
+    if not active_bounds:
+        raise ValueError(
+            "select_spec_normal_rows(): every config.SPEC_MAX bound is None — "
+            "nothing to filter on. Set at least one SPEC_*_MAX in config.py, "
+            "or use split_reference_window() instead."
+        )
+
+    mask = pd.Series(True, index=raw_df.index)
+    for col, bound in active_bounds.items():
+        mask &= raw_df[col] <= bound
     normal_df = raw_df[mask].reset_index(drop=True)
 
     frac = len(normal_df) / len(raw_df) if len(raw_df) else 0.0
+    bounds_str = ", ".join(f"{col}<={bound}" for col, bound in active_bounds.items())
+    skipped = [col for col, bound in config.SPEC_MAX.items() if bound is None]
     print(
         f"[select_spec_normal_rows] {len(normal_df)}/{len(raw_df)} rows "
-        f"({frac:.1%}) within spec bounds "
-        f"(vibration<={config.SPEC_VIBRATION_MAX}, "
-        f"temperature<={config.SPEC_TEMPERATURE_MAX}, "
-        f"current<={config.SPEC_CURRENT_MAX})."
+        f"({frac:.1%}) within spec bounds ({bounds_str})."
     )
+    if skipped:
+        print(f"[select_spec_normal_rows] No bound set (skipped) for: {', '.join(skipped)}.")
     if normal_df.empty:
         print(
             "[select_spec_normal_rows] WARNING: zero rows passed the spec "

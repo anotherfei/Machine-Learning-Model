@@ -153,11 +153,7 @@ def replay_production(raw: pd.DataFrame) -> pd.DataFrame:
 
     for row in raw.itertuples(index=False):
         processed_rows += 1
-        reading = {
-            config.COL_VIBRATION: float(getattr(row, config.COL_VIBRATION)),
-            config.COL_TEMPERATURE: float(getattr(row, config.COL_TEMPERATURE)),
-            config.COL_CURRENT: float(getattr(row, config.COL_CURRENT)),
-        }
+        reading = {col: float(getattr(row, col)) for col in config.RAW_SENSOR_COLS}
         result = monitor.update(reading)
         if result is None:
             continue
@@ -194,8 +190,8 @@ def _next_critical_time(raw: pd.DataFrame) -> pd.Series:
     """For each raw row, return the next timestamp labeled critical, including the current row."""
     labels = _normalize_labels(raw[LABEL_COLUMN]).to_numpy()
     timestamps = pd.to_datetime(raw[config.COL_TIMESTAMP]).to_numpy(dtype="datetime64[ns]")
-    out = np.full(len(raw), np.datetime64("NaT", "ns"), dtype="datetime64[ns]")
-    next_critical = np.datetime64("NaT", "ns")
+    out = np.full(len(raw), np.datetime64("NaT"), dtype="datetime64[ns]")
+    next_critical = np.datetime64("NaT")
     for i in range(len(raw) - 1, -1, -1):
         if labels[i] == "critical":
             next_critical = timestamps[i]
@@ -385,18 +381,6 @@ FONT_MONO = _pick_font(
     ["Liberation Mono", "Consolas", "Menlo", "Courier New", "DejaVu Sans Mono"],
     "monospace")
 
-# For text below ~7pt only. Several of the FONT_HEAD/FONT_BODY candidates
-# above (Calibri, Segoe UI, and other Microsoft ClearType-hinted fonts) embed
-# bytecode "dropout control" hinting: at small enough pixel sizes the hinter
-# decides a stem would render as an isolated/fuzzy pixel and omits it
-# entirely, so the glyph draws as nothing rather than something illegible.
-# It's silent -- no warning, no exception, matplotlib just does what the
-# font's hinting program tells it to. DejaVu Sans is bundled inside
-# matplotlib itself (always present, no lookup needed) and doesn't hit this,
-# so it's the safe choice specifically for small text, even though FONT_HEAD/
-# FONT_BODY are fine at normal reading sizes.
-FONT_SMALL = "DejaVu Sans"
-
 # Only "normal"/"bold" — not numeric weights like 600. A numeric weight with
 # no matching font file (common on fallback fonts, which usually only ship
 # regular + bold) triggers the same kind of silent substitution + warning.
@@ -574,22 +558,14 @@ class _Layout:
                 # was actually available on this machine) measure different
                 # widths for the same string, so a fixed fontsize that fit one
                 # font can overflow into the next cell under another.
-                #
-                # Use FONT_SMALL here, not FONT_HEAD/FONT_BODY. This is the
-                # only text in the whole report drawn below ~7pt, and several
-                # system display fonts (Calibri, Segoe UI, etc.) silently
-                # render nothing at very small sizes due to their own
-                # hinting instructions — confirmed empirically, not a
-                # theory: FONT_HEAD/Calibri rendered blank at 5.4pt while
-                # FONT_SMALL/DejaVu Sans rendered fine at the same size.
                 label_fs = fontsize_label
                 avail_w = cw_in - 0.03
-                lw, _ = _text_size_in(label, label_fs, "bold", FONT_SMALL)
+                lw, _ = _text_size_in(label, label_fs, "bold", FONT_BODY)
                 while lw > avail_w and label_fs > 5.0:
                     label_fs -= 0.3
-                    lw, _ = _text_size_in(label, label_fs, "bold", FONT_SMALL)
+                    lw, _ = _text_size_in(label, label_fs, "bold", FONT_BODY)
                 ax.text(x_center, cell_mid - cell_h_in * 0.24, label, fontsize=label_fs,
-                        ha="center", va="center", fontfamily=FONT_SMALL, fontweight="bold",
+                        ha="center", va="center", fontfamily=FONT_BODY, fontweight="bold",
                         color=MUTED)
         self.y_in += block_h
         self.gap(0.16)
@@ -685,7 +661,7 @@ def _metric_cards(fig, rect, items, ncols=None):
         ax.text(x0 + cw / 2, 0.63, value, ha="center", va="center", fontsize=14.5,
                 fontfamily=FONT_HEAD, fontweight="bold", color=ACCENT)
         ax.text(x0 + cw / 2, 0.23, label, ha="center", va="center", fontsize=7.4,
-                fontfamily=FONT_SMALL, color=SUBINK)
+                fontfamily=FONT_BODY, color=SUBINK)
 
 
 def _confusion_heatmap(ax, m: BinaryMetrics, row_pos: str, col_pos: str, title: str) -> None:
@@ -705,8 +681,8 @@ def _confusion_heatmap(ax, m: BinaryMetrics, row_pos: str, col_pos: str, title: 
                     fontfamily=FONT_HEAD, fontweight="bold")
     ax.set_xticks([0, 1])
     ax.set_yticks([0, 1])
-    ax.set_xticklabels(["Normal", col_pos], fontsize=7.4, fontfamily=FONT_SMALL)
-    ax.set_yticklabels(["Normal", row_pos], fontsize=7.4, fontfamily=FONT_SMALL)
+    ax.set_xticklabels(["Normal", col_pos], fontsize=7.4, fontfamily=FONT_BODY)
+    ax.set_yticklabels(["Normal", row_pos], fontsize=7.4, fontfamily=FONT_BODY)
     ax.set_title(title, fontsize=9.8, fontfamily=FONT_HEAD, fontweight="bold", color=INK, pad=7)
     ax.tick_params(length=0)
     for spine in ax.spines.values():
@@ -845,7 +821,7 @@ def _build_dashboard(L, raw, predictions, metrics, report_id, generated_at,
     L.line("EVALUATION COMPLETED", 10.5, family=FONT_HEAD, weight="bold", color=ACCENT)
     if L.draw:
         L.fig.text(L._fx(L.RIGHT_IN), L._fy(L.y_in - 0.20), "Page 1 of 1", fontsize=7.6,
-                   color=MUTED, ha="right", va="top", fontfamily=FONT_SMALL)
+                   color=MUTED, ha="right", va="top", fontfamily=FONT_BODY)
     L.gap(0.05)
     L.wrapped("No PASS/FAIL threshold is defined by this evaluator, so none is invented. "
               "All metrics above come from SpindleMonitor's production output for the "

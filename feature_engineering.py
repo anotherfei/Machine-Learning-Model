@@ -9,6 +9,8 @@ corrupt the exact early-precursor signal the Isolation Forest is meant to
 pick up on.
 """
 
+import itertools
+
 import pandas as pd
 import numpy as np
 from scipy.stats import kurtosis, skew
@@ -45,39 +47,31 @@ def _trend_slope(series: pd.Series, window: int, min_periods: int) -> pd.Series:
 def create_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
     df = df.sort_values(config.COL_TIMESTAMP).reset_index(drop=True)
     w, mp = config.WINDOW_SIZE, config.MIN_PERIODS
+    sensor_cols = config.RAW_SENSOR_COLS
 
     feat_frames = [df[[config.COL_TIMESTAMP]]]
 
-    feat_frames.append(_rolling_stats(df[config.COL_VIBRATION], w, mp, "vibration"))
-    feat_frames.append(pd.DataFrame({
-        "vibration_trend_slope": _trend_slope(df[config.COL_VIBRATION], w, mp)
-    }))
+    # Rolling stats + trend slope, generic over whatever raw sensor
+    # columns config.py currently defines (previously hardcoded to
+    # vibration/current/temperature specifically — genericized so a
+    # sensor swap only requires updating config.RAW_SENSOR_COLS, not
+    # this function).
+    for col in sensor_cols:
+        feat_frames.append(_rolling_stats(df[col], w, mp, col))
+        feat_frames.append(pd.DataFrame({
+            f"{col}_trend_slope": _trend_slope(df[col], w, mp)
+        }))
 
-    feat_frames.append(_rolling_stats(df[config.COL_CURRENT], w, mp, "current"))
-    feat_frames.append(pd.DataFrame({
-        "current_trend_slope": _trend_slope(df[config.COL_CURRENT], w, mp)
-    }))
-
-    feat_frames.append(_rolling_stats(df[config.COL_TEMPERATURE], w, mp, "temperature"))
-    feat_frames.append(pd.DataFrame({
-        "temperature_trend_slope": _trend_slope(df[config.COL_TEMPERATURE], w, mp)
-    }))
-
-    # Cross-sensor rolling correlations. vibration_current_corr was the
-    # only one of these until now — temperature never appeared in a
-    # cross-term, even though thermal expansion coupling into the
-    # vibration signature (and into current draw, via bearing friction)
-    # is a known precursor pattern for spindles. Isolation Forest can
-    # still pick up joint structure across separate columns without an
-    # explicit term, but not as directly as giving it one.
-    feat_frames.append(pd.DataFrame({
-        "vibration_current_corr":
-            df[config.COL_VIBRATION].rolling(window=w, min_periods=mp).corr(df[config.COL_CURRENT]),
-        "vibration_temperature_corr":
-            df[config.COL_VIBRATION].rolling(window=w, min_periods=mp).corr(df[config.COL_TEMPERATURE]),
-        "current_temperature_corr":
-            df[config.COL_CURRENT].rolling(window=w, min_periods=mp).corr(df[config.COL_TEMPERATURE]),
-    }))
+    # Cross-sensor rolling correlations, every pair — was hardcoded to
+    # the 3 pairs available under the old 3-column schema (vibration x
+    # current, vibration x temperature, current x temperature); with 5
+    # raw columns now that's all 10 pairs instead of 3.
+    corr_frame = {}
+    for col_a, col_b in itertools.combinations(sensor_cols, 2):
+        corr_frame[f"{col_a}_{col_b}_corr"] = (
+            df[col_a].rolling(window=w, min_periods=mp).corr(df[col_b])
+        )
+    feat_frames.append(pd.DataFrame(corr_frame))
 
     result = pd.concat(feat_frames, axis=1)
 

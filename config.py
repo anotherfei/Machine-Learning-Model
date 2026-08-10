@@ -37,33 +37,61 @@ RAW_DATA_PATH = os.path.join(RAW_DATA_DIR, "spindle_train.csv")
 PROCESSED_DATA_PATH = os.path.join(PROCESSED_DATA_DIR, "processed.csv")
 FEATURES_DATA_PATH = os.path.join(PROCESSED_DATA_DIR, "features.csv")
 REALTIME_PREDICTIONS_PATH = os.path.join(RESULTS_DIR, "realtime_predictions.csv")
+VALIDATION_REPORT_PATH = os.path.join(RESULTS_DIR, "validation_report.png")
 
 PREDICT_DATA_PATH = os.path.join(RAW_DATA_DIR, "spindle_given.csv")
 
 # ---------------------------------------------------------------------------
 # Raw column names
 # ---------------------------------------------------------------------------
+# Sensor: ifm VVB001 (IO-Link vibration/temperature) — no analog current
+# output, so current_ampere (previously sourced from a separate current
+# sensor) is dropped from this pipeline entirely, not just renamed.
 COL_TIMESTAMP = "timestamp"
-COL_VIBRATION = "vibration_mps2"
-COL_CURRENT = "current_ampere"
+COL_A_RMS = "a_rms_mps2"          # acceleration RMS, m/s^2 — same physical
+                                   # quantity the old vibration_mps2 held
+COL_V_RMS = "v_rms_mms"           # velocity RMS, mm/s
+COL_A_PEAK = "a_peak_mps2"        # peak acceleration, m/s^2
+COL_CREST_FACTOR = "crest_factor" # a_peak / a_rms, dimensionless
 COL_TEMPERATURE = "temperature_c"
 
-RAW_SENSOR_COLS = [COL_VIBRATION, COL_CURRENT, COL_TEMPERATURE]
+RAW_SENSOR_COLS = [COL_A_RMS, COL_V_RMS, COL_A_PEAK, COL_CREST_FACTOR, COL_TEMPERATURE]
 
 # ---------------------------------------------------------------------------
 # Spec-based "normal operation" bounds (alternative to a time-window-based
 # reference period — see preprocessing.select_spec_normal_rows()).
 # PLACEHOLDER VALUES: these are Predictive_Maintenance.zip's spec-shaped
-# filter (vibration<=3.0, temp<=50, current<=6.0), carried over because
-# they were the only bounds available at the time this was written. This
-# only produces a correct reference set if these are genuinely the
-# manufacturer's rated normal range for this spindle. If they're a rough
-# guess, that error is silent — select_spec_normal_rows() has no way to
-# detect a wrong bound, only a missing one. Confirm against the actual
-# spec sheet before relying on this in production.
-SPEC_VIBRATION_MAX = 3.0
+# filter (vibration<=3.0, temp<=50), carried over because they were the
+# only bounds available at the time this was written. This only produces
+# a correct reference set if these are genuinely the manufacturer's rated
+# normal range for this spindle. If they're a rough guess, that error is
+# silent — select_spec_normal_rows() has no way to detect a wrong bound,
+# only a missing one. Confirm against the actual spec sheet before relying
+# on this in production.
+#
+# SPEC_A_RMS_MAX carries over the old vibration threshold unchanged since
+# a-RMS in m/s^2 is the same physical quantity vibration_mps2 was. There
+# is deliberately no threshold set below for v-RMS, a-Peak, or crest
+# factor yet — no rated-normal-range values exist for them in this repo,
+# and select_spec_normal_rows() treats a None bound as "don't filter on
+# this column" rather than silently guessing one. Fill these in once
+# you've determined the right operating range for this spindle; until
+# then the reference-window approach (see below) doesn't depend on them.
+SPEC_A_RMS_MAX = 3.0
 SPEC_TEMPERATURE_MAX = 50.0
-SPEC_CURRENT_MAX = 6.0
+SPEC_V_RMS_MAX = None
+SPEC_A_PEAK_MAX = None
+SPEC_CREST_FACTOR_MAX = None
+# Maps each raw column to its spec bound above, so preprocessing.py can
+# iterate generically instead of hardcoding which columns have bounds.
+# A None value means "don't filter on this column" (see note above).
+SPEC_MAX = {
+    COL_A_RMS: SPEC_A_RMS_MAX,
+    COL_V_RMS: SPEC_V_RMS_MAX,
+    COL_A_PEAK: SPEC_A_PEAK_MAX,
+    COL_CREST_FACTOR: SPEC_CREST_FACTOR_MAX,
+    COL_TEMPERATURE: SPEC_TEMPERATURE_MAX,
+}
 # NOTE: deliberately no COL_STATUS here — see module docstring.
 
 # ---------------------------------------------------------------------------

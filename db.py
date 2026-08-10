@@ -80,20 +80,47 @@ def get_table_name(args=None):
     return table
 
 
+def get_db_columns():
+    """
+    Column names to select from the Postgres table. Defaults to
+    config.py's CSV column names for config.RAW_SENSOR_COLS (confirmed to
+    match); override any individual one via an env var named
+    PG_COL_<COLUMN_NAME_UPPERCASED> in .env if the DB table ever names a
+    column differently — e.g. config.COL_A_RMS = "a_rms_mps2" is
+    overridden by PG_COL_A_RMS_MPS2. Generic over however many/whatever
+    raw sensor columns config.py currently defines, so a future sensor
+    swap only means editing config.RAW_SENSOR_COLS, not this function.
+    """
+    timestamp = os.environ.get(f"PG_COL_{config.COL_TIMESTAMP.upper()}", config.COL_TIMESTAMP)
+    sensor_cols = [
+        os.environ.get(f"PG_COL_{col.upper()}", col) for col in config.RAW_SENSOR_COLS
+    ]
+    # Maps each config.py raw column name -> its actual Postgres column
+    # name, so callers can look up "give me whatever DB column holds
+    # config.COL_A_RMS" without knowing if it was overridden.
+    by_config_name = dict(zip(config.RAW_SENSOR_COLS, sensor_cols))
+    return {
+        "timestamp": timestamp,
+        "sensor_cols": sensor_cols,
+        "by_config_name": by_config_name,
+    }
+
+
 def fetch_new_rows(conn, table: str, since=None, limit: int = 5000):
     """
     Returns rows with timestamp > since (or all rows, if since is None),
-    ordered ascending by timestamp, as a list of dicts with keys
-    config.COL_TIMESTAMP + config.RAW_SENSOR_COLS.
+    ordered ascending by timestamp, as a list of dicts keyed by the
+    Postgres column names from get_db_columns().
 
     limit caps how many rows come back in one poll (protects against a
     huge backlog — e.g. after downtime — flooding memory in one go; the
     watermark just picks up where it left off on the next 60s poll).
     """
-    cols = [config.COL_TIMESTAMP] + config.RAW_SENSOR_COLS
+    dbcols = get_db_columns()
+    cols = [dbcols["timestamp"]] + dbcols["sensor_cols"]
     col_ident = sql.SQL(", ").join(sql.Identifier(c) for c in cols)
     table_ident = sql.Identifier(table)
-    ts_ident = sql.Identifier(config.COL_TIMESTAMP)
+    ts_ident = sql.Identifier(dbcols["timestamp"])
 
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         if since is None:

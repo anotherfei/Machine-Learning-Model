@@ -146,9 +146,7 @@ class SpindleMonitor:
             top_contributors = attribution.top_contributors(z_scores, top_k=3)
 
         return {
-            "vibration": reading[config.COL_VIBRATION],
-            "temperature": reading[config.COL_TEMPERATURE],
-            "current": reading[config.COL_CURRENT],
+            **{col: reading[col] for col in config.RAW_SENSOR_COLS},
             "anomaly_score": round(float(raw_score), 5),
             "health_raw": round(health_raw, 2),
             "health_state": round(health_state, 2),
@@ -175,17 +173,17 @@ def read_sensor():
     args = db.parse_args()
     conn = db.get_connection(args)
     table = db.get_table_name(args)
+    dbcols = db.get_db_columns()
     last_seen = None
 
     while True:
         rows = db.fetch_new_rows(conn, table, since=last_seen)
         for row in rows:
             yield {
-                config.COL_VIBRATION: float(row[config.COL_VIBRATION]),
-                config.COL_TEMPERATURE: float(row[config.COL_TEMPERATURE]),
-                config.COL_CURRENT: float(row[config.COL_CURRENT]),
+                col: float(row[dbcols["by_config_name"][col]])
+                for col in config.RAW_SENSOR_COLS
             }
-            last_seen = row[config.COL_TIMESTAMP]
+            last_seen = row[dbcols["timestamp"]]
         time.sleep(POLL_INTERVAL_SECONDS)
 
 
@@ -240,9 +238,8 @@ if __name__ == "__main__":
             tick += 1
             print("\n" + "=" * 60)
             print(f"data ke : {tick}")
-            print("Vibration :", result["vibration"])
-            print("Temperature :", result["temperature"])
-            print("Current :", result["current"])
+            for col in config.RAW_SENSOR_COLS:
+                print(f"{col} :", result[col])
             print("Anomaly Score :", result["anomaly_score"])
             print("Health (raw) :", result["health_raw"], "%")
             print("Health (Kalman-smoothed) :", result["health_state"], "%")
