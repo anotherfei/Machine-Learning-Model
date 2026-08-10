@@ -4,13 +4,29 @@ artifacts. No labels anywhere in this script.
 
 Usage:
     python train_isolation_forest.py
+    python train_isolation_forest.py --full
 """
+
+import argparse
 
 import config
 import preprocessing
 import feature_engineering
 import artifact_utils
 from isolation_forest import AnomalyScorer
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--full", action="store_true",
+        help="Treat the ENTIRE file as the reference/normal set instead of "
+             "spec-filtering it (preprocessing.select_spec_normal_rows()). "
+             "Only use this when you're sure every row in config.RAW_DATA_PATH "
+             "is genuinely normal operation — with --full, nothing checks "
+             "that for you; every row is trusted as-is."
+    )
+    return parser.parse_args()
 
 
 def get_or_build_features():
@@ -26,20 +42,30 @@ def get_or_build_features():
 
 
 def main():
+    args = parse_args()
     df = get_or_build_features()
     feature_cols = feature_engineering.get_feature_columns(df)
 
-    # Spec-based row selection needs the raw sensor values, which don't
-    # survive feature_engineering.create_features() — so reload/re-clean
-    # the raw CSV here rather than reading them off the feature table.
-    # Cheap: just load_data() + clean_data(), no feature engineering rerun.
-    raw_df = preprocessing.clean_data(preprocessing.load_data())
-    normal_raw = preprocessing.select_spec_normal_rows(raw_df)
+    if args.full:
+        # Trust the whole file as normal — no spec filter, no reference-
+        # window cutoff. Every row in config.RAW_DATA_PATH becomes the
+        # reference set the Isolation Forest is fit on.
+        reference_df = df.reset_index(drop=True)
+        rest_df = df.iloc[0:0].reset_index(drop=True)  # empty, same columns
+        print(f"[train] --full: using all {len(reference_df)} rows as the "
+              f"reference set (spec filter skipped).")
+    else:
+        # Spec-based row selection needs the raw sensor values, which don't
+        # survive feature_engineering.create_features() — so reload/re-clean
+        # the raw CSV here rather than reading them off the feature table.
+        # Cheap: just load_data() + clean_data(), no feature engineering rerun.
+        raw_df = preprocessing.clean_data(preprocessing.load_data())
+        normal_raw = preprocessing.select_spec_normal_rows(raw_df)
 
-    is_reference = df[config.COL_TIMESTAMP].isin(normal_raw[config.COL_TIMESTAMP])
-    reference_df, rest_df = df[is_reference].reset_index(drop=True), df[~is_reference].reset_index(drop=True)
-    print(f"[train] Spec-based reference set: {len(reference_df)} rows, "
-          f"rest of trajectory: {len(rest_df)} rows.")
+        is_reference = df[config.COL_TIMESTAMP].isin(normal_raw[config.COL_TIMESTAMP])
+        reference_df, rest_df = df[is_reference].reset_index(drop=True), df[~is_reference].reset_index(drop=True)
+        print(f"[train] Spec-based reference set: {len(reference_df)} rows, "
+              f"rest of trajectory: {len(rest_df)} rows.")
 
     scorer = AnomalyScorer()
     scorer.fit(reference_df[feature_cols])
