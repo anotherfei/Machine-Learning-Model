@@ -43,9 +43,15 @@ import db
 POLL_INTERVAL_SECONDS = 60
 
 
-print("Loading model...")
-scorer, feature_cols, metadata = artifact_utils.load_artifacts()
-print(f"Model loaded ({metadata['n_features']} features, trained {metadata['trained_at']}).")
+scorer = None
+feature_cols = None
+metadata = None
+
+def reload_model():
+    """Reload the active on-disk artifact bundle between ticks."""
+    global scorer, feature_cols, metadata
+    scorer, feature_cols, metadata = artifact_utils.load_artifacts()
+    return scorer, feature_cols, metadata
 
 
 class SpindleMonitor:
@@ -68,7 +74,18 @@ class SpindleMonitor:
     maintenance.recommend() as a false CRITICAL reading.
     """
 
-    def __init__(self):
+    def __init__(self, scorer_override=None, feature_cols_override=None, metadata_override=None):
+        global scorer, feature_cols, metadata
+        if scorer_override is not None:
+            self.scorer = scorer_override
+            self.feature_cols = feature_cols_override
+            self.metadata = metadata_override or {}
+        else:
+            if scorer is None:
+                reload_model()
+            self.scorer = scorer
+            self.feature_cols = feature_cols
+            self.metadata = metadata or {}
         self.window = deque(maxlen=config.WINDOW_SIZE)
         self.kalman = None
         self.kalman_init_buffer = deque(maxlen=config.KALMAN_INIT_SAMPLES)
@@ -92,10 +109,10 @@ class SpindleMonitor:
         feat_df = feature_engineering.create_features(window_df, verbose=False)
         if feat_df.empty:
             return None
-        latest_feats = feat_df.iloc[[-1]][feature_cols]
+        latest_feats = feat_df.iloc[[-1]][self.feature_cols]
 
-        raw_score = scorer.score(latest_feats)[0]
-        health_raw = float(scorer.health_from_score(np.array([raw_score]))[0])
+        raw_score = self.scorer.score(latest_feats)[0]
+        health_raw = float(self.scorer.health_from_score(np.array([raw_score]))[0])
 
         # ---- Kalman denoising ----
         if self.kalman is None:
@@ -142,7 +159,7 @@ class SpindleMonitor:
         # those are already decided above from the single combined score.
         top_contributors = None
         if rec["level"] != "OK":
-            z_scores = scorer.feature_z_scores(latest_feats)
+            z_scores = self.scorer.feature_z_scores(latest_feats)
             top_contributors = attribution.top_contributors(z_scores, top_k=3)
 
         return {
@@ -155,6 +172,8 @@ class SpindleMonitor:
             "failure_probability": prob_table,
             "maintenance": rec,
             "top_contributors": top_contributors,
+            "feature_vector": {k: float(v) for k, v in latest_feats.iloc[0].items()},
+            "model_version": self.metadata.get("version_id", self.metadata.get("trained_at", "unversioned")),
         }
 
 
@@ -180,8 +199,8 @@ def read_sensor():
         rows = db.fetch_new_rows(conn, table, since=last_seen)
         for row in rows:
             yield {
-                col: float(row[dbcols["by_config_name"][col]])
-                for col in config.RAW_SENSOR_COLS
+                **{col: float(row[dbcols["by_config_name"][col]]) for col in config.RAW_SENSOR_COLS},
+                "_timestamp": row[dbcols["timestamp"]],
             }
             last_seen = row[dbcols["timestamp"]]
         time.sleep(POLL_INTERVAL_SECONDS)
@@ -206,16 +225,17 @@ def save_result(result: dict, reset: bool = False):
     """
     os.makedirs(config.RESULTS_DIR, exist_ok=True)
     flat = {k: v for k, v in result.items()
-            if k not in ("failure_probability", "maintenance", "top_contributors")}
+            if k not in ("failure_probability", "maintenance", "top_contributors", "feature_vector")}
     flat["maintenance_level"] = result["maintenance"]["level"]
     flat["maintenance_reason"] = result["maintenance"]["reason"]
+    flat["maintenance_trigger"] = result["maintenance"].get("trigger", "none")
     for h, p in result["failure_probability"].items():
         flat[f"fail_prob_{h}d"] = p
     flat["top_contributors"] = (
         "; ".join(f"{name} (z={z:+.1f})" for name, z, _ in result["top_contributors"])
         if result["top_contributors"] else ""
     )
-    flat["timestamp"] = pd.Timestamp.now()
+    flat["timestamp"] = result.get("_timestamp", pd.Timestamp.now())
 
     row = pd.DataFrame([flat])
     write_header = reset or not os.path.exists(LOG_PATH)

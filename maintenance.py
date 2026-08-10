@@ -12,6 +12,7 @@ into WARN.
 """
 
 import config
+import runtime_config
 
 _SEVERITY = {"OK": 0, "WARN": 1, "CRITICAL": 2}
 
@@ -53,24 +54,24 @@ def recommend(health_percent: float, remaining_days: int, failure_prob_table: di
         closest = min(failure_prob_table, key=lambda h: abs(h - config.MAINTENANCE_HORIZON_DAYS))
         prob_at_horizon = failure_prob_table[closest]
 
-    if health_percent <= config.FAILURE_HEALTH_THRESHOLD:
+    if health_percent <= runtime_config.get("FAILURE_HEALTH_THRESHOLD", config.FAILURE_HEALTH_THRESHOLD):
         return {"level": "CRITICAL", "reason": "Health at or below failure threshold now.",
                 "trigger": "health_threshold"}
 
-    if trend_trusted and prob_at_horizon >= config.MAINTENANCE_PROB_URGENT:
+    if trend_trusted and prob_at_horizon >= runtime_config.get("MAINTENANCE_PROB_URGENT", config.MAINTENANCE_PROB_URGENT):
         return {"level": "CRITICAL", "reason": (
             f"Failure probability within {config.MAINTENANCE_HORIZON_DAYS}d is "
             f"{prob_at_horizon:.0%} (est. {remaining_days}d remaining at current trend)."
         ), "trigger": "trend_probability"}
 
-    if trend_trusted and prob_at_horizon >= config.MAINTENANCE_PROB_PLAN:
+    if trend_trusted and prob_at_horizon >= runtime_config.get("MAINTENANCE_PROB_PLAN", config.MAINTENANCE_PROB_PLAN):
         return {"level": "WARN", "reason": (
             f"Failure probability within {config.MAINTENANCE_HORIZON_DAYS}d is "
             f"{prob_at_horizon:.0%} (est. {remaining_days}d remaining at current trend) — "
             f"schedule maintenance."
         ), "trigger": "trend_probability"}
 
-    if health_percent <= config.MAINTENANCE_HEALTH_INSPECT:
+    if health_percent <= runtime_config.get("MAINTENANCE_HEALTH_INSPECT", config.MAINTENANCE_HEALTH_INSPECT):
         return {"level": "WARN", "reason": f"Health ({health_percent:.1f}%) below inspection threshold.",
                 "trigger": "health_inspect"}
 

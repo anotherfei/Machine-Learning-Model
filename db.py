@@ -26,7 +26,7 @@ import config
 
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    load_dotenv(override=True)
 except ImportError:
     # python-dotenv not installed — fine if the env vars are already set
     # some other way (shell export, systemd EnvironmentFile, etc).
@@ -50,8 +50,20 @@ def parse_args():
     return args
 
 
+def _env_only_args():
+    """Return empty DB CLI overrides for library/server callers.
+
+    Uvicorn and other host processes have their own --port/--host flags.
+    Parsing sys.argv here would accidentally treat those as PostgreSQL
+    settings (for example uvicorn --port 8000 becoming PG_PORT=8000).
+    Only predict_realtime.py explicitly calls parse_args() and passes the
+    result into get_connection/get_table_name.
+    """
+    return argparse.Namespace(host=None, port=None, database=None, user=None, password=None, table=None)
+
+
 def get_connection(args=None):
-    args = args or parse_args()
+    args = args if args is not None else _env_only_args()
 
     host = args.host or os.environ.get("PG_HOST")
     port = args.port or os.environ.get("PG_PORT", "5432")
@@ -73,7 +85,7 @@ def get_connection(args=None):
 
 
 def get_table_name(args=None):
-    args = args or parse_args()
+    args = args if args is not None else _env_only_args()
     table = args.table or os.environ.get("PG_TABLE")
     if not table:
         raise ValueError("Missing table name. Set PG_TABLE in .env, or pass --table.")

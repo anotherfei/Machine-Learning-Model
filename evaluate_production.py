@@ -1,5 +1,5 @@
 """
-Production evaluation for Project F.
+Production evaluation for Spindle Condition Monitoring.
 
 This evaluator deliberately contains NO inference implementation of its own.
 Every prediction is produced by predict_realtime.SpindleMonitor, exactly as in
