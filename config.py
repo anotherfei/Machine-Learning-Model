@@ -37,7 +37,6 @@ RAW_DATA_PATH = os.path.join(RAW_DATA_DIR, "spindle_train.csv")
 PROCESSED_DATA_PATH = os.path.join(PROCESSED_DATA_DIR, "processed.csv")
 FEATURES_DATA_PATH = os.path.join(PROCESSED_DATA_DIR, "features.csv")
 REALTIME_PREDICTIONS_PATH = os.path.join(RESULTS_DIR, "realtime_predictions.csv")
-VALIDATION_REPORT_PATH = os.path.join(RESULTS_DIR, "validation_report.png")
 
 PREDICT_DATA_PATH = os.path.join(RAW_DATA_DIR, "spindle_given.csv")
 
@@ -202,8 +201,6 @@ TREND_SETTLE_TICKS = 60
 # (see predict_realtime.py / validate.py) because each covers what the
 # other misses.
 TREND_SLOPE_Z_THRESHOLD = 2.0
-
-FAILURE_HEALTH_THRESHOLD = 40  # health % at which the asset is considered failed
 REMAINING_DAYS_CAP = 90
 
 # ---------------------------------------------------------------------------
@@ -228,8 +225,8 @@ FAILURE_PROB_HORIZONS_DAYS = [0.25, 0.5, 0.75, 1]
 # Maintenance recommendation rules
 # ---------------------------------------------------------------------------
 MAINTENANCE_HORIZON_DAYS = 1          # "how soon" horizon the rules check against — kept within the <=1 day range validated above
-MAINTENANCE_PROB_URGENT = 0.70       # failure probability within horizon -> urgent
-MAINTENANCE_PROB_PLAN = 0.30         # -> plan maintenance
+MAINTENANCE_PROB_URGENT = 0.80       # failure probability within horizon -> urgent
+MAINTENANCE_PROB_PLAN = 0.60         # -> plan maintenance
 # MAINTENANCE_REMAINING_DAYS_URGENT removed as an independent CRITICAL
 # trigger (see maintenance.py) — remaining_days is a bare point-estimate
 # extrapolation with no uncertainty accounting, while MAINTENANCE_PROB_URGENT
@@ -242,7 +239,9 @@ MAINTENANCE_PROB_PLAN = 0.30         # -> plan maintenance
 # failure_probability correctly stayed low because it accounted for that
 # same noise as uncertainty. remaining_days is still computed and reported
 # for human context — it's just no longer allowed to escalate on its own.
-MAINTENANCE_HEALTH_INSPECT = 75      # health % below this -> inspect regardless
+
+MAINTENANCE_HEALTH_INSPECT = 30      # health % below this -> inspect regardless
+FAILURE_HEALTH_THRESHOLD = 20  # health % at which the asset is considered failed
 
 # Hysteresis on the trend/failure-probability trigger only — NOT on
 # health_percent-based triggers (FAILURE_HEALTH_THRESHOLD,

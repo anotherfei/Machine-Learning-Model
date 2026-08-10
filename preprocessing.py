@@ -16,28 +16,58 @@ import json
 import pandas as pd
 
 import config
+import artifact_utils
 
 
 def raw_data_signature(path: str = None) -> str:
     """
-    Fingerprint of a raw data file (path + size + mtime), used to detect
-    when config.RAW_DATA_PATH has been repointed at a different file (or
-    the same file edited in place) since data/processed/*.csv was last
-    built. Content isn't hashed — path+size+mtime is enough to catch a
-    changed source and is far cheaper on a file this size, checked on
-    every run.
+    Fingerprint of everything that determines what data/processed/*.csv
+    should contain: the raw file's own content, PLUS every config value
+    that changes how it gets processed. A cache built before any of
+    these changed is stale even if the raw file itself is untouched.
+
+    Covers:
+      - the raw CSV's content (catches RAW_DATA_PATH pointing elsewhere,
+        or the same file edited in place)
+      - COL_TIMESTAMP / RAW_SENSOR_COLS / COL_VIBRATION / COL_CURRENT /
+        COL_TEMPERATURE — change any of these and load_data()/
+        clean_data()'s behavior changes, even though load_data() itself
+        wasn't touched
+      - artifact_utils.config_hash() — FEATURE_CONFIG (WINDOW_SIZE,
+        MIN_PERIODS, ...) plus feature_engineering.py's own source; reused
+        rather than reimplemented so this and the model's own drift check
+        can never disagree about what counts as a config change
+
+    Content-hashed, not path+size+mtime (an earlier version of this
+    function used that) — mtime is not reliable enough to gate a silent
+    skip-vs-rebuild decision on: cloud-synced folders (OneDrive, Dropbox —
+    common under Windows' Documents/) can leave mtime stale after a sync
+    even when content changed, and some filesystems have coarser mtime
+    granularity than a fast edit-save-rerun loop needs.
     """
     path = path or config.RAW_DATA_PATH
-    stat = os.stat(path)
-    fingerprint = f"{os.path.abspath(path)}:{stat.st_size}:{stat.st_mtime}"
-    return hashlib.md5(fingerprint.encode()).hexdigest()
+    hasher = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            hasher.update(chunk)
+
+    relevant_config = {
+        "COL_TIMESTAMP": config.COL_TIMESTAMP,
+        "RAW_SENSOR_COLS": config.RAW_SENSOR_COLS,
+        "COL_VIBRATION": config.COL_VIBRATION,
+        "COL_CURRENT": config.COL_CURRENT,
+        "COL_TEMPERATURE": config.COL_TEMPERATURE,
+    }
+    hasher.update(json.dumps(relevant_config, sort_keys=True).encode())
+    hasher.update(artifact_utils.config_hash().encode())
+    return hasher.hexdigest()
 
 
 def save_source_signature(path: str = None):
     sig = raw_data_signature(path)
     os.makedirs(config.PROCESSED_DATA_DIR, exist_ok=True)
     with open(os.path.join(config.PROCESSED_DATA_DIR, "source_signature.json"), "w") as f:
-        json.dump({"source_path": path or config.RAW_DATA_PATH, "signature": sig}, f, indent=2)
+        json.dump({"source_path": os.path.abspath(path or config.RAW_DATA_PATH), "signature": sig}, f, indent=2)
 
 
 def cached_features_are_stale(path: str = None) -> bool:
@@ -50,18 +80,48 @@ def cached_features_are_stale(path: str = None) -> bool:
     RAW_DATA_PATH changes, which happened for real: switching to
     spindle_train.csv left features.csv (9,992 rows, the old ~10k-row
     file) untouched and get_or_build_features() had no way to notice.
+
+    Always prints its decision and both signatures/paths compared, so a
+    skip-vs-rebuild call is never a silent black box — if this looks
+    wrong on your machine, the printed paths/hashes are the first thing
+    to check, not this function's logic.
     """
+    current_path = os.path.abspath(path or config.RAW_DATA_PATH)
     if not os.path.exists(config.FEATURES_DATA_PATH):
+        print(f"[cached_features_are_stale] {config.FEATURES_DATA_PATH} does not exist -> STALE (will rebuild).")
         return True
     sig_path = os.path.join(config.PROCESSED_DATA_DIR, "source_signature.json")
     if not os.path.exists(sig_path):
+        print(f"[cached_features_are_stale] No {sig_path} found -> STALE (will rebuild).")
         return True
+
     with open(sig_path) as f:
         saved = json.load(f)
-    return saved.get("signature") != raw_data_signature(path)
+    current_sig = raw_data_signature(current_path)
+    is_stale = saved.get("signature") != current_sig
+
+    print(f"[cached_features_are_stale] Cached source: {saved.get('source_path')} "
+          f"(hash {str(saved.get('signature'))[:12]}...)")
+    print(f"[cached_features_are_stale] Current RAW_DATA_PATH: {current_path} (hash {current_sig[:12]}...)")
+    print(f"[cached_features_are_stale] -> {'STALE (will rebuild)' if is_stale else 'up to date (using cache)'}.")
+    return is_stale
 
 
-def load_data(path: str = config.RAW_DATA_PATH) -> pd.DataFrame:
+def load_data(path: str = None) -> pd.DataFrame:
+    """
+    path defaults to config.RAW_DATA_PATH, resolved INSIDE the function
+    body (not as the parameter default) so it always reflects the
+    CURRENT value of config.RAW_DATA_PATH at call time. A parameter
+    default of `config.RAW_DATA_PATH` (an earlier version of this
+    function had that) is evaluated exactly once, when this module is
+    first imported — if config.RAW_DATA_PATH changes afterward in a
+    process that keeps this import alive (a persistent notebook kernel
+    or IDE terminal, for instance), load_data() called with no explicit
+    path would silently keep using whatever RAW_DATA_PATH was at import
+    time, not the current one. That's the kind of bug that looks like
+    "inconsistent, no clear pattern" from the outside.
+    """
+    path = path or config.RAW_DATA_PATH
     usecols = [config.COL_TIMESTAMP] + config.RAW_SENSOR_COLS
     df = pd.read_csv(path, usecols=usecols)
 

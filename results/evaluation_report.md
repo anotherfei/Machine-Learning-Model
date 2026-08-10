@@ -14,32 +14,32 @@ The evaluator contains no duplicate anomaly, Kalman, trend, probability, RUL, or
 
 ## Health Estimation
 
-Binary ground truth: `health_status != normal`. Predicted degraded: `health_state <= 75`.
+Binary ground truth: `health_status != normal`. Predicted degraded: `health_state <= 30`.
 Continuous risk score for ROC/PR: `(100 - health_state) / 100`.
 
 - ROC-AUC: 0.9956
 - PR-AUC: 0.9972
-- Accuracy: 67.35%
-- Precision: 65.52%
-- Recall: 100.00%
-- F1-score: 79.17%
+- Accuracy: 95.90%
+- Precision: 94.14%
+- Recall: 99.60%
+- F1-score: 96.79%
 
 Confusion Matrix:
 
 | Actual \ Predicted | Normal | Degraded |
 |---|---:|---:|
-| Normal | 531 | 3,257 |
-| Degraded | 0 | 6,189 |
+| Normal | 3,404 | 384 |
+| Degraded | 25 | 6,164 |
 
 ## Failure Probability
 
 Ground truth: a `critical` label occurs now or within the configured 1-day maintenance horizon.
 Production probability field: `failure_probability_1d`.
 
-- ROC-AUC: 0.9508
-- PR-AUC: 0.9259
-- Brier Score: 0.1629
-- Calibration Error (10-bin ECE): 0.3310
+- ROC-AUC: 0.9052
+- PR-AUC: 0.8824
+- Brier Score: 0.2004
+- Calibration Error (10-bin ECE): 0.3313
 
 ## Remaining Useful Life
 
@@ -49,13 +49,13 @@ SKIPPED — the configured evaluation dataset does not contain an independent tr
 
 Predicted positive: production maintenance level is `WARN` or `CRITICAL`. Actual positive: a ground-truth `critical` state occurs now or within 1 day(s).
 
-- True Positives: 6,451
-- False Positives: 3,297
-- True Negatives: 229
-- False Negatives: 0
-- Precision: 66.18%
+- True Positives (TP): 6,451
+- True Negatives (TN): 3,348
+- False Positives (FP): 178
+- False Negatives (FN): 0
+- Precision: 97.31%
 - Recall: 100.00%
-- False Alarm Rate: 93.51%
+- False Alarm Rate: 5.05%
 - Miss Rate: 0.00%
 
 ## Overall Result
