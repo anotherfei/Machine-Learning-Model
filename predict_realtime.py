@@ -11,15 +11,16 @@ LightGBM+Kalman version of this repo. Full pipeline, per README.md:
 Fully unsupervised — health_status is never loaded, read, or referenced
 anywhere in this script or anything it imports (see config.py docstring).
 
-As with the earlier version: no live hardware exists in this environment,
-so read_sensor() replays config.PREDICT_DATA_PATH (the held-out file —
-deliberately NOT config.RAW_DATA_PATH, which is training data; see
-config.py) row by row instead of generating random numbers. Point this
-at a live feed by replacing read_sensor()'s body — everything downstream
-is unchanged.
+read_sensor() polls a Postgres table (see db.py) every
+POLL_INTERVAL_SECONDS for rows newer than the last one it has already
+processed, and yields them in order. Connection info + table name come
+from env vars (PG_HOST/PG_PORT/PG_DATABASE/PG_USER/PG_PASSWORD/PG_TABLE
+— see .env.example), with optional --host/--port/--db/--user/--password/
+--table CLI overrides. Runs forever; stop with Ctrl+C.
 
 Usage:
     python predict_realtime.py
+    python predict_realtime.py --host ... --user ... --password ...
 """
 
 import time
@@ -37,6 +38,9 @@ import trend_forecast
 import failure_probability
 import maintenance
 import attribution
+import db
+
+POLL_INTERVAL_SECONDS = 60
 
 
 print("Loading model...")
@@ -157,13 +161,32 @@ class SpindleMonitor:
 
 
 def read_sensor():
-    df = pd.read_csv(config.PREDICT_DATA_PATH, usecols=[config.COL_TIMESTAMP] + config.RAW_SENSOR_COLS)
-    for _, row in df.iterrows():
-        yield {
-            config.COL_VIBRATION: float(row[config.COL_VIBRATION]),
-            config.COL_TEMPERATURE: float(row[config.COL_TEMPERATURE]),
-            config.COL_CURRENT: float(row[config.COL_CURRENT]),
-        }
+    """
+    Polls Postgres every POLL_INTERVAL_SECONDS for rows newer than the
+    last one already yielded (watermark = last row's timestamp), yielding
+    them in ascending timestamp order — same in-order, gapless contract
+    SpindleMonitor's rolling window / Kalman filter relied on when this
+    read from a CSV. Runs forever; there is no natural end to a live feed.
+
+    First poll (last_seen=None) pulls everything currently in the table,
+    same as the old full-CSV replay. After that, each poll only pulls
+    what's new since the previous one.
+    """
+    args = db.parse_args()
+    conn = db.get_connection(args)
+    table = db.get_table_name(args)
+    last_seen = None
+
+    while True:
+        rows = db.fetch_new_rows(conn, table, since=last_seen)
+        for row in rows:
+            yield {
+                config.COL_VIBRATION: float(row[config.COL_VIBRATION]),
+                config.COL_TEMPERATURE: float(row[config.COL_TEMPERATURE]),
+                config.COL_CURRENT: float(row[config.COL_CURRENT]),
+            }
+            last_seen = row[config.COL_TIMESTAMP]
+        time.sleep(POLL_INTERVAL_SECONDS)
 
 
 LOG_PATH = config.REALTIME_PREDICTIONS_PATH
@@ -203,8 +226,8 @@ def save_result(result: dict, reset: bool = False):
 
 if __name__ == "__main__":
     monitor = SpindleMonitor()
-    print("Realtime Spindle Monitoring Started (replaying logged data)")
-    print(f"Source: {config.PREDICT_DATA_PATH}")
+    print("Realtime Spindle Monitoring Started (polling Postgres)")
+    print(f"Polling every {POLL_INTERVAL_SECONDS}s")
     tick = 0
     log_reset_done = False
 
@@ -233,7 +256,6 @@ if __name__ == "__main__":
 
             save_result(result, reset=not log_reset_done)
             log_reset_done = True
-            time.sleep(0.01)  # replaying logged data — not throttled to real time
 
         except Exception as e:
             print("ERROR :", e)
