@@ -146,3 +146,38 @@ def fetch_new_rows(conn, table: str, since=None, limit: int = 5000):
             ).format(cols=col_ident, table=table_ident, ts=ts_ident)
             cur.execute(query, (since, limit))
         return cur.fetchall()
+
+
+def fetch_rows_between(conn, table: str, start, end, limit: int = 200000):
+    """
+    Returns rows with start <= timestamp < end, ordered ascending, as a
+    list of dicts keyed by the Postgres column names from
+    get_db_columns() — same row shape as fetch_new_rows().
+
+    Used by train_isolation_forest.py to pull an explicit, pinned
+    commissioning/reference window directly from the same table +
+    connection worker.py polls in production, instead of a separate
+    offline CSV (see config.REFERENCE_SOURCE). Unlike fetch_new_rows()'s
+    open-ended "everything newer than since", this always takes a closed
+    [start, end) range, so re-running training reads exactly the same
+    rows every time regardless of how much the table has grown since —
+    the range itself is what makes a live-sourced training run
+    reproducible, the same way a static CSV file's fixed content used to.
+
+    limit is high (200k, vs fetch_new_rows()'s 5k poll-sized default)
+    because this is meant to read an entire commissioning window in one
+    call, not incrementally page through it — a multi-day window at
+    1 row/minute is still well under this.
+    """
+    dbcols = get_db_columns()
+    cols = [dbcols["timestamp"]] + dbcols["sensor_cols"]
+    col_ident = sql.SQL(", ").join(sql.Identifier(c) for c in cols)
+    table_ident = sql.Identifier(table)
+    ts_ident = sql.Identifier(dbcols["timestamp"])
+
+    query = sql.SQL(
+        "SELECT {cols} FROM {table} WHERE {ts} >= %s AND {ts} < %s ORDER BY {ts} ASC LIMIT %s"
+    ).format(cols=col_ident, table=table_ident, ts=ts_ident)
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(query, (start, end, limit))
+        return cur.fetchall()

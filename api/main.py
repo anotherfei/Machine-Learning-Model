@@ -138,14 +138,14 @@ def set_thresholds(body:ThresholdBody,admin:User=Depends(require_admin)):
     c=conn(); runtime_config.save_to_db(c,values,admin.username); c.close(); return values
 
 @app.get("/api/alerts")
-def alerts(status:str="pending",trigger:str|None=None,limit:int=100,offset:int=0,user:User=Depends(current_user)):
-    limit=max(1,min(limit,500)); c=conn()
+def alerts(status:str="pending",trigger:str|None=None,limit:int=50,offset:int=0,user:User=Depends(current_user)):
+    limit=max(1,min(limit,500)); offset=max(0,offset); c=conn()
     where=["status=%s"]; args=[status]
     if trigger: where.append("trigger=%s"); args.append(trigger)
-    args += [limit,offset]
     with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute(f"SELECT * FROM alerts WHERE {' AND '.join(where)} ORDER BY tick_timestamp DESC LIMIT %s OFFSET %s",args); rows=cur.fetchall()
-    c.close(); return rows
+        cur.execute(f"SELECT count(*) AS total FROM alerts WHERE {' AND '.join(where)}",args); total=cur.fetchone()["total"]
+        cur.execute(f"SELECT * FROM alerts WHERE {' AND '.join(where)} ORDER BY tick_timestamp DESC LIMIT %s OFFSET %s",args+[limit,offset]); rows=cur.fetchall()
+    c.close(); return {"items":rows,"total":total,"limit":limit,"offset":offset}
 
 @app.post("/api/alerts/{alert_id}/review")
 def review(alert_id:int,body:ReviewBody,user:User=Depends(current_user)):
@@ -220,23 +220,80 @@ def promote(version_id:str,admin:User=Depends(require_admin)):
 def rollback(version_id:str,admin:User=Depends(require_admin)): return promote(version_id,admin)
 
 @app.get("/api/history")
-def history(limit:int=200,user:User=Depends(current_user)):
+def history(limit:int=50,offset:int=0,level:str|None=None,user:User=Depends(current_user)):
+    limit=max(1,min(limit,500)); offset=max(0,offset)
+    where=""; args:list=[]
+    if level:
+        if level not in ("OK","WARN","CRITICAL"): raise HTTPException(400,"level must be OK, WARN, or CRITICAL")
+        where="WHERE p.maintenance_level=%s"; args=[level]
     c=conn()
     with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute("SELECT * FROM spindle_predictions ORDER BY tick_timestamp DESC LIMIT %s",(max(1,min(limit,1000)),)); rows=cur.fetchall()
-    c.close(); return rows
+        cur.execute(f"SELECT count(*) AS total FROM spindle_predictions p {where}",args); total=cur.fetchone()["total"]
+        cur.execute(f"""
+          SELECT p.*,
+                 a.status AS alert_status, a.level AS alert_level, a.trigger AS alert_trigger,
+                 a.reviewed_by AS alert_reviewed_by, a.reviewed_at AS alert_reviewed_at,
+                 nmr.status AS near_miss_status, nmr.reviewed_by AS near_miss_reviewed_by, nmr.reviewed_at AS near_miss_reviewed_at
+          FROM spindle_predictions p
+          LEFT JOIN LATERAL (
+            SELECT status, level, trigger, reviewed_by, reviewed_at FROM alerts a
+            WHERE a.tick_timestamp=p.tick_timestamp AND a.model_version=p.model_version
+            ORDER BY a.id DESC LIMIT 1
+          ) a ON true
+          LEFT JOIN near_miss_reviews nmr ON nmr.prediction_id=p.id
+          {where}
+          ORDER BY p.tick_timestamp DESC LIMIT %s OFFSET %s""",args+[limit,offset]); rows=cur.fetchall()
+    c.close(); return {"items":rows,"total":total,"limit":limit,"offset":offset}
 
 @app.get("/api/near-miss")
-def near_miss(hours:int=6,limit:int=50,user:User=Depends(current_user)):
-    c=conn()
-    with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute("""WITH x AS (
-          SELECT tick_timestamp, anomaly_score, health_state, maintenance_level,
+def near_miss(hours:int=6,limit:int=50,offset:int=0,status:str="pending",user:User=Depends(current_user)):
+    if status not in ("pending","acknowledged","flagged"): raise HTTPException(400,"status must be pending, acknowledged, or flagged")
+    limit=max(1,min(limit,500)); offset=max(0,offset); window=max(2,hours*60)
+    base_cte="""WITH x AS (
+          SELECT id, tick_timestamp, model_version, anomaly_score, health_state, maintenance_level, raw_reading,
                  regr_slope(anomaly_score, extract(epoch from tick_timestamp)) OVER (ORDER BY tick_timestamp ROWS BETWEEN %s PRECEDING AND CURRENT ROW) slope
           FROM spindle_predictions)
-          SELECT * FROM x WHERE maintenance_level='OK' AND slope IS NOT NULL AND slope < 0
-          ORDER BY health_state ASC LIMIT %s""",(max(2,hours*60),max(1,min(limit,500)))); rows=cur.fetchall()
-    c.close(); return rows
+          SELECT x.*, COALESCE(nmr.status,'pending') AS review_status, nmr.reviewed_by, nmr.reviewed_at
+          FROM x LEFT JOIN near_miss_reviews nmr ON nmr.prediction_id=x.id
+          WHERE x.maintenance_level='OK' AND x.slope IS NOT NULL AND x.slope < 0
+            AND COALESCE(nmr.status,'pending')=%s"""
+    c=conn()
+    with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(f"SELECT count(*) AS total FROM ({base_cte}) t",(window,status)); total=cur.fetchone()["total"]
+        cur.execute(base_cte+" ORDER BY x.health_state ASC LIMIT %s OFFSET %s",(window,status,limit,offset)); rows=cur.fetchall()
+    c.close(); return {"items":rows,"total":total,"limit":limit,"offset":offset}
+
+@app.post("/api/near-miss/{prediction_id}/review")
+def review_near_miss(prediction_id:int,body:ReviewBody,user:User=Depends(current_user)):
+    if body.decision not in ("acknowledged","flagged"): raise HTTPException(400,"decision must be acknowledged or flagged")
+    c=conn()
+    with c.cursor() as cur:
+        cur.execute("SELECT id, tick_timestamp, anomaly_score FROM spindle_predictions WHERE id=%s",(prediction_id,)); row=cur.fetchone()
+        if not row: c.rollback(); c.close(); raise HTTPException(404,"Near-miss record not found")
+        cur.execute("""INSERT INTO near_miss_reviews(prediction_id,status,reviewed_by,reviewed_at)
+                       VALUES(%s,%s,%s,now())
+                       ON CONFLICT(prediction_id) DO UPDATE SET status=EXCLUDED.status,reviewed_by=EXCLUDED.reviewed_by,reviewed_at=now()""",
+                    (prediction_id,body.decision,user.username))
+        # A "flagged" near-miss is a human saying this OK-labeled tick looks
+        # more like a missed detection than a healthy reading — i.e. a
+        # suspected false negative. There was previously no path from that
+        # judgment into the retraining/validation loop (Alert review's
+        # "confirmed normal" already feeds reference_candidates; nothing
+        # fed the opposite case). Reuse the existing regression_tests gate
+        # (see retrain_service.run_shadow_retrain Gate 2) instead of adding
+        # a new mechanism: any shadow model must keep scoring at least this
+        # much risk in this time window, or promotion is blocked.
+        regression_test_id=None
+        if body.decision=="flagged":
+            _, tick_ts, anomaly_score=row
+            hours=float(runtime_config.get("NEAR_MISS_REGRESSION_WINDOW_HOURS",1))
+            min_risk=max(0.05,min(0.95,float(anomaly_score) if anomaly_score is not None else 0.5))
+            cur.execute("""INSERT INTO regression_tests(description,timestamp_range,minimum_anomaly_risk)
+                           VALUES(%s,tstzrange(%s-(%s||' hours')::interval,%s+(%s||' hours')::interval,'[]'),%s)
+                           RETURNING id""",
+                        (f"Near-miss flagged by {user.username} on prediction #{prediction_id}",tick_ts,hours,tick_ts,hours,min_risk))
+            regression_test_id=cur.fetchone()[0]
+    c.commit(); c.close(); return {"prediction_id":prediction_id,"status":body.decision,"regression_test_id":regression_test_id}
 
 @app.websocket("/ws/live")
 async def live(ws:WebSocket):

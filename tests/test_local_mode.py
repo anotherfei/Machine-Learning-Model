@@ -23,6 +23,34 @@ class LocalModeTests(unittest.TestCase):
         self.assertIn("return 75", worker)
         self.assertIn("RESTART_CODE = 75", supervisor)
 
+    def test_near_miss_has_own_review_workflow(self):
+        real_api = (ROOT / "api" / "main.py").read_text(encoding="utf-8")
+        mock_api = (ROOT / "api" / "mock_main.py").read_text(encoding="utf-8")
+        frontend = (ROOT / "frontend" / "src" / "main.tsx").read_text(encoding="utf-8")
+        schema = (ROOT / "db_schema.py").read_text(encoding="utf-8")
+        self.assertIn("near_miss_reviews", schema)
+        self.assertIn("CHECK (status IN ('pending','acknowledged','flagged'))", schema)
+        for api_source in (real_api, mock_api):
+            self.assertIn('"/api/near-miss/{prediction_id}/review"', api_source)
+            self.assertIn("Near-miss record not found", api_source)
+            self.assertIn("decision must be acknowledged or flagged", api_source)
+            self.assertNotIn('"/api/near-miss/{prediction_id}/promote"', api_source)
+        self.assertIn("/api/near-miss/${selected.id}/review", frontend)
+        self.assertIn("Acknowledge", frontend)
+        self.assertIn("Flag for follow-up", frontend)
+
+    def test_history_shows_downstream_review_outcome(self):
+        real_api = (ROOT / "api" / "main.py").read_text(encoding="utf-8")
+        mock_api = (ROOT / "api" / "mock_main.py").read_text(encoding="utf-8")
+        frontend = (ROOT / "frontend" / "src" / "main.tsx").read_text(encoding="utf-8")
+        self.assertIn("alert_status", real_api)
+        self.assertIn("near_miss_status", real_api)
+        self.assertIn("alert_status", mock_api)
+        self.assertIn("near_miss_status", mock_api)
+        self.assertIn("historyOutcome", frontend)
+        self.assertIn("Alert outcome", frontend)
+        self.assertIn("Near-miss outcome", frontend)
+
 
 if __name__ == "__main__":
     unittest.main()

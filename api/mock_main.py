@@ -175,6 +175,11 @@ def initialize_mock_database(reset: bool = False) -> Path:
               maintenance_level TEXT NOT NULL, maintenance_reason TEXT NOT NULL, maintenance_trigger TEXT NOT NULL,
               top_contributors TEXT, is_backfill INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS near_miss_reviews(
+              id INTEGER PRIMARY KEY AUTOINCREMENT, prediction_id INTEGER UNIQUE NOT NULL,
+              status TEXT NOT NULL DEFAULT 'pending', reviewed_by TEXT, reviewed_at TEXT,
+              created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
             """
         )
         if c.execute("SELECT count(*) FROM app_users").fetchone()[0] == 0:
@@ -330,11 +335,18 @@ def set_thresholds(body: ThresholdBody, admin: User = Depends(require_admin)):
 
 
 @app.get("/api/alerts")
-def alerts(status: str = "pending", trigger: str | None = None, limit: int = 100, offset: int = 0, user: User = Depends(current_user)):
+def alerts(status: str = "pending", trigger: str | None = None, limit: int = 50, offset: int = 0, user: User = Depends(current_user)):
+    limit = max(1, min(limit, 500)); offset = max(0, offset)
+    count_sql = "SELECT count(*) FROM alerts WHERE status=?"; count_args: list = [status]
     sql = "SELECT * FROM alerts WHERE status=?"; args: list = [status]
-    if trigger: sql += " AND trigger=?"; args.append(trigger)
-    sql += " ORDER BY tick_timestamp DESC LIMIT ? OFFSET ?"; args.extend([max(1, min(limit, 500)), max(0, offset)])
-    c = _connect(); rows = [_row_dict(r) for r in c.execute(sql, args).fetchall()]; c.close(); return rows
+    if trigger:
+        count_sql += " AND trigger=?"; count_args.append(trigger)
+        sql += " AND trigger=?"; args.append(trigger)
+    sql += " ORDER BY tick_timestamp DESC LIMIT ? OFFSET ?"; args.extend([limit, offset])
+    c = _connect()
+    total = c.execute(count_sql, count_args).fetchone()[0]
+    rows = [_row_dict(r) for r in c.execute(sql, args).fetchall()]
+    c.close(); return {"items": rows, "total": total, "limit": limit, "offset": offset}
 
 
 @app.post("/api/alerts/{alert_id}/review")
@@ -407,13 +419,85 @@ def rollback(version_id: str, admin: User = Depends(require_admin)):
 
 
 @app.get("/api/history")
-def history(limit: int = 200, user: User = Depends(current_user)):
-    c = _connect(); rows = [_row_dict(r) for r in c.execute("SELECT * FROM spindle_predictions ORDER BY tick_timestamp DESC LIMIT ?", (max(1, min(limit, 1000)),)).fetchall()]; c.close(); return rows
+def history(limit: int = 50, offset: int = 0, level: str | None = None, user: User = Depends(current_user)):
+    limit = max(1, min(limit, 500)); offset = max(0, offset)
+    where = ""; args: list = []
+    if level:
+        if level not in ("OK", "WARN", "CRITICAL"): raise HTTPException(400, "level must be OK, WARN, or CRITICAL")
+        where = " WHERE maintenance_level=?"; args = [level]
+    c = _connect()
+    total = c.execute(f"SELECT count(*) FROM spindle_predictions{where}", args).fetchone()[0]
+    rows = [_row_dict(r) for r in c.execute(f"SELECT * FROM spindle_predictions{where} ORDER BY tick_timestamp DESC LIMIT ? OFFSET ?", args + [limit, offset]).fetchall()]
+    for row in rows:
+        alert = c.execute(
+            "SELECT status, level, trigger, reviewed_by, reviewed_at FROM alerts WHERE tick_timestamp=? AND model_version=? ORDER BY id DESC LIMIT 1",
+            (row["tick_timestamp"], row["model_version"]),
+        ).fetchone()
+        row["alert_status"] = alert["status"] if alert else None
+        row["alert_level"] = alert["level"] if alert else None
+        row["alert_trigger"] = alert["trigger"] if alert else None
+        row["alert_reviewed_by"] = alert["reviewed_by"] if alert else None
+        row["alert_reviewed_at"] = alert["reviewed_at"] if alert else None
+        nmr = c.execute(
+            "SELECT status, reviewed_by, reviewed_at FROM near_miss_reviews WHERE prediction_id=?", (row["id"],)
+        ).fetchone()
+        row["near_miss_status"] = nmr["status"] if nmr else None
+        row["near_miss_reviewed_by"] = nmr["reviewed_by"] if nmr else None
+        row["near_miss_reviewed_at"] = nmr["reviewed_at"] if nmr else None
+    c.close(); return {"items": rows, "total": total, "limit": limit, "offset": offset}
 
 
 @app.get("/api/near-miss")
-def near_miss(hours: int = 6, limit: int = 50, user: User = Depends(current_user)):
-    c = _connect(); rows = [_row_dict(r) for r in c.execute("SELECT * FROM spindle_predictions WHERE maintenance_level='OK' AND anomaly_score BETWEEN 0.18 AND 0.60 ORDER BY anomaly_score DESC LIMIT ?", (max(1, min(limit, 500)),)).fetchall()]; c.close(); return rows
+def near_miss(hours: int = 6, limit: int = 50, offset: int = 0, status: str = "pending", user: User = Depends(current_user)):
+    if status not in ("pending", "acknowledged", "flagged"): raise HTTPException(400, "status must be pending, acknowledged, or flagged")
+    limit = max(1, min(limit, 500)); offset = max(0, offset)
+    c = _connect()
+    rows = [_row_dict(r) for r in c.execute("SELECT * FROM spindle_predictions WHERE maintenance_level='OK' AND anomaly_score BETWEEN 0.18 AND 0.60 ORDER BY anomaly_score DESC").fetchall()]
+    out = []
+    for row in rows:
+        review = c.execute("SELECT status, reviewed_by, reviewed_at FROM near_miss_reviews WHERE prediction_id=?", (row["id"],)).fetchone()
+        row["review_status"] = review["status"] if review else "pending"
+        row["reviewed_by"] = review["reviewed_by"] if review else None
+        row["reviewed_at"] = review["reviewed_at"] if review else None
+        if row["review_status"] == status: out.append(row)
+    c.close()
+    total = len(out)
+    return {"items": out[offset:offset + limit], "total": total, "limit": limit, "offset": offset}
+
+
+@app.post("/api/near-miss/{prediction_id}/review")
+def review_near_miss(prediction_id: int, body: ReviewBody, user: User = Depends(current_user)):
+    if body.decision not in ("acknowledged", "flagged"): raise HTTPException(400, "decision must be acknowledged or flagged")
+    with _LOCK:
+        c = _connect()
+        pred = c.execute("SELECT id, tick_timestamp, anomaly_score FROM spindle_predictions WHERE id=?", (prediction_id,)).fetchone()
+        if not pred: c.close(); raise HTTPException(404, "Near-miss record not found")
+        c.execute(
+            """INSERT INTO near_miss_reviews(prediction_id,status,reviewed_by,reviewed_at)
+               VALUES(?,?,?,datetime('now'))
+               ON CONFLICT(prediction_id) DO UPDATE SET status=excluded.status,reviewed_by=excluded.reviewed_by,reviewed_at=excluded.reviewed_at""",
+            (prediction_id, body.decision, user.username),
+        )
+        # See api/main.py review_near_miss for why: a "flagged" near-miss is
+        # a suspected false negative, so it feeds the same regression_tests
+        # gate that already guards Alert review's confirmed-normal path in
+        # the opposite direction. Mock mode has no real retraining pipeline
+        # to gate, but the record is still created so the reviewer workflow
+        # and the regression-tests list behave the same as production.
+        regression_test_id = None
+        if body.decision == "flagged":
+            hours = float(runtime_config.get("NEAR_MISS_REGRESSION_WINDOW_HOURS", 1))
+            center = datetime.fromisoformat(pred["tick_timestamp"].replace("Z", "+00:00"))
+            lo = _iso(center - timedelta(hours=hours)); hi = _iso(center + timedelta(hours=hours))
+            anomaly_score = pred["anomaly_score"]
+            min_risk = max(0.05, min(0.95, float(anomaly_score) if anomaly_score is not None else 0.5))
+            cur = c.execute(
+                "INSERT INTO regression_tests(description,start_ts,end_ts,minimum_anomaly_risk,created_at) VALUES(?,?,?,?,?)",
+                (f"Near-miss flagged by {user.username} on prediction #{prediction_id}", lo, hi, min_risk, _iso(_now())),
+            )
+            regression_test_id = cur.lastrowid
+        c.commit(); c.close()
+    return {"prediction_id": prediction_id, "status": body.decision, "regression_test_id": regression_test_id}
 
 
 @app.websocket("/ws/live")

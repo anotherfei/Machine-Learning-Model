@@ -2,7 +2,7 @@ import React, { Component, ReactNode, useEffect, useMemo, useState } from 'react
 import { createRoot } from 'react-dom/client';
 import './styles.css';
 
-type Page = 'Dashboard' | 'Alerts' | 'Models' | 'Near Miss' | 'History' | 'Environment' | 'Thresholds';
+type Page = 'Dashboard' | 'Status Review' | 'Models' | 'History' | 'Environment' | 'Thresholds';
 type User = { username: string; role: string; mock_mode?: boolean };
 type LiveTick = {
   timestamp?: string;
@@ -41,6 +41,15 @@ async function api(path: string, opts: RequestInit = {}, timeoutMs = 8000) {
   } finally { window.clearTimeout(timer); }
 }
 
+const PAGE_SIZES = [10, 25, 50, 100];
+type Paged<T> = { items: T[]; total: number; limit: number; offset: number };
+function usePagination(pageSize0 = 25) {
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSizeRaw] = useState(pageSize0);
+  const setPageSize = (n: number) => { setPageSizeRaw(n); setPage(1); };
+  const offset = (page - 1) * pageSize;
+  return { page, setPage, pageSize, setPageSize, offset };
+}
 function cn(...values: Array<string | false | null | undefined>) { return values.filter(Boolean).join(' '); }
 function fmt(value: any, digits = 2) {
   if (value === null || value === undefined || value === '') return '—';
@@ -59,6 +68,20 @@ function tone(level?: string) {
 }
 function triggerLabel(trigger?: string) {
   return ({ health_threshold:'Health threshold', health_inspect:'Inspection threshold', trend_probability:'Trend forecast', none:'No trigger' } as Record<string,string>)[trigger || ''] || (trigger || 'Unknown');
+}
+function reviewLabel(status?: string) {
+  return ({ pending:'Pending', confirmed_anomaly:'Confirmed anomaly', confirmed_normal:'Confirmed normal', acknowledged:'Acknowledged', flagged:'Flagged' } as Record<string,string>)[status || ''] || (status || 'Unknown');
+}
+function reviewTone(status?: string) {
+  if (status === 'confirmed_anomaly' || status === 'flagged') return 'warning';
+  if (status === 'confirmed_normal' || status === 'acknowledged') return 'normal';
+  if (status === 'pending') return 'neutral';
+  return 'neutral';
+}
+function historyOutcome(row: any): {text: string; tone: string} | null {
+  if (row.alert_status) return {text: `Alert · ${reviewLabel(row.alert_status)}`, tone: reviewTone(row.alert_status)};
+  if (row.near_miss_status) return {text: `Near miss · ${reviewLabel(row.near_miss_status)}`, tone: reviewTone(row.near_miss_status)};
+  return null;
 }
 
 const Icon = ({ name }: { name: string }) => {
@@ -121,7 +144,7 @@ function App(){
   if(me===undefined)return <main className="center-screen"><section className="state-panel"><div className="spinner"/><p className="eyebrow">INITIALIZING CONSOLE</p><h1>Connecting to the local API</h1><p className="muted">If this takes more than a few seconds, check <code>localhost:8000/docs</code>.</p></section></main>;
   if(!me)return <Login done={refreshMe} apiError={apiError}/>;
   const nav:Array<{page:Page;icon:string;label:string}>=[
-    {page:'Dashboard',icon:'grid',label:'Overview'},{page:'Alerts',icon:'alert',label:'Alert review'},{page:'Models',icon:'model',label:'Models'},{page:'Near Miss',icon:'trend',label:'Near miss'},{page:'History',icon:'history',label:'History'},{page:'Thresholds',icon:'sliders',label:'Thresholds'},...(me.role==='admin'?[{page:'Environment' as Page,icon:'database',label:'Environment'}]:[])
+    {page:'Dashboard',icon:'grid',label:'Overview'},{page:'Status Review',icon:'alert',label:'Status review'},{page:'Models',icon:'model',label:'Models'},{page:'History',icon:'history',label:'History'},{page:'Thresholds',icon:'sliders',label:'Thresholds'},...(me.role==='admin'?[{page:'Environment' as Page,icon:'database',label:'Environment'}]:[])
   ];
   return <div className={cn('app-shell',collapsed&&'nav-collapsed')}>
     <aside className="sidebar">
@@ -146,10 +169,9 @@ function PageHeader({ eyebrow, title, description, actions }: { eyebrow:string;t
 
 function PageView({page,role,mock}:{page:Page;role:string;mock:boolean}){
   if(page==='Dashboard')return <Dashboard mock={mock}/>;
-  if(page==='Alerts')return <Alerts/>;
+  if(page==='Status Review')return <StatusReview/>;
   if(page==='Models')return <Models admin={role==='admin'}/>;
-  if(page==='Near Miss')return <RecordsPage mode="near"/>;
-  if(page==='History')return <RecordsPage mode="history"/>;
+  if(page==='History')return <HistoryPage/>;
   if(page==='Thresholds')return <Thresholds admin={role==='admin'}/>;
   return <Environment/>;
 }
@@ -209,19 +231,72 @@ function Modal({title,onClose,children,wide=false}:{title:string;onClose:()=>voi
   return <div className="modal-backdrop" onMouseDown={e=>{if(e.target===e.currentTarget)onClose()}}><section className={cn('modal',wide&&'modal-wide')}><header><div><p className="eyebrow">DETAIL VIEW</p><h2>{title}</h2></div><button className="icon-button" onClick={onClose}><Icon name="close"/></button></header><div className="modal-body">{children}</div></section></div>
 }
 
-function Alerts(){
-  const [rows,setRows]=useState<any[]>([]),[error,setError]=useState(''),[status,setStatus]=useState('pending'),[trigger,setTrigger]=useState(''),[selected,setSelected]=useState<any|null>(null),[context,setContext]=useState<any[]>([]),[busy,setBusy]=useState(false);
-  const load=()=>api(`/api/alerts?status=${encodeURIComponent(status)}${trigger?`&trigger=${encodeURIComponent(trigger)}`:''}`).then(setRows).catch(e=>setError(String(e.message||e)));
-  useEffect(()=>{load()},[status,trigger]);
+function StatusReview(){
+  const [tab,setTab]=useState<'alert'|'near'>('alert');
+  return <>
+    <PageHeader eyebrow="HUMAN REVIEW" title="Status review" description="Confirm maintenance alerts and healthy-state near-misses that need a human decision, in one place." actions={<div className="tab-switch"><button className={cn('tab-btn',tab==='alert'&&'active')} onClick={()=>setTab('alert')}>Alert review</button><button className={cn('tab-btn',tab==='near'&&'active')} onClick={()=>setTab('near')}>Near miss</button></div>}/>
+    {tab==='alert'?<AlertPanel/>:<NearMissPanel/>}
+  </>
+}
+
+function AlertPanel(){
+  const [rows,setRows]=useState<any[]>([]),[total,setTotal]=useState(0),[error,setError]=useState(''),[status,setStatus]=useState('pending'),[trigger,setTrigger]=useState(''),[selected,setSelected]=useState<any|null>(null),[context,setContext]=useState<any[]>([]),[busy,setBusy]=useState(false);
+  const {page,setPage,pageSize,setPageSize,offset}=usePagination(25);
+  const load=()=>api(`/api/alerts?status=${encodeURIComponent(status)}${trigger?`&trigger=${encodeURIComponent(trigger)}`:''}&limit=${pageSize}&offset=${offset}`).then((r:Paged<any>)=>{setRows(r.items);setTotal(r.total)}).catch(e=>setError(String(e.message||e)));
+  useEffect(()=>{load()},[status,trigger,pageSize,offset]);
+  useEffect(()=>{setPage(1)},[status,trigger]);
   const inspect=async(a:any)=>{setSelected(a);setContext([]);try{setContext(await api(`/api/alerts/${a.id}/context?hours=3`))}catch{setContext([])}};
   const decide=async(decision:string)=>{if(!selected)return;setBusy(true);try{await api(`/api/alerts/${selected.id}/review`,{method:'POST',body:JSON.stringify({decision})});setSelected(null);load()}finally{setBusy(false)}};
-  return <><PageHeader eyebrow="HUMAN REVIEW" title="Alert review" description="Inspect maintenance events with surrounding evidence, then confirm whether the event represents a real anomaly." actions={<div className="filter-bar"><Select value={status} onChange={setStatus} options={[['pending','Pending'],['confirmed_anomaly','Confirmed anomaly'],['confirmed_normal','Confirmed normal']]}/><Select value={trigger} onChange={setTrigger} options={[['','All triggers'],['health_threshold','Health threshold'],['health_inspect','Inspection threshold'],['trend_probability','Trend forecast']]}/></div>}/>{error&&<Notice tone="critical">{error}</Notice>}
-  <section className="data-surface"><div className="surface-heading"><span>{rows.length} result{rows.length===1?'':'s'}</span><small>Click any row to inspect ±3 hour context</small></div>{rows.length===0?<Empty title="No alerts in this view" text="Try another review status or trigger filter."/>:<div className="responsive-table"><table><thead><tr><th>Time</th><th>Level</th><th>Trigger</th><th>Health</th><th>Anomaly</th><th>Review state</th><th/></tr></thead><tbody>{rows.map(a=><tr key={a.id} onClick={()=>inspect(a)}><td><strong>{shortTime(a.tick_timestamp)}</strong><small>#{a.id}</small></td><td><StatusBadge value={a.level}/></td><td>{triggerLabel(a.trigger)}</td><td>{fmt(a.health_state,1)}%</td><td>{fmt(a.anomaly_score,4)}</td><td><span className="review-state">{String(a.status).replaceAll('_',' ')}</span></td><td><Icon name="chevron"/></td></tr>)}</tbody></table></div>}</section>
+  return <>
+  <div className="filter-bar sub-filter-bar"><Select value={status} onChange={setStatus} options={[['pending','Pending'],['confirmed_anomaly','Confirmed anomaly'],['confirmed_normal','Confirmed normal']]}/><Select value={trigger} onChange={setTrigger} options={[['','All triggers'],['health_threshold','Health threshold'],['health_inspect','Inspection threshold'],['trend_probability','Trend forecast']]}/></div>
+  {error&&<Notice tone="critical">{error}</Notice>}
+  <section className="data-surface"><div className="surface-heading"><span>{total} result{total===1?'':'s'}</span><small>Click any row to inspect ±3 hour context</small></div>{rows.length===0?<Empty title="No alerts in this view" text="Try another review status or trigger filter."/>:<div className="responsive-table"><table><thead><tr><th>Time</th><th>Level</th><th>Trigger</th><th>Health</th><th>Anomaly</th><th>Review state</th><th/></tr></thead><tbody>{rows.map(a=><tr key={a.id} onClick={()=>inspect(a)}><td><strong>{shortTime(a.tick_timestamp)}</strong><small>#{a.id}</small></td><td><StatusBadge value={a.level}/></td><td>{triggerLabel(a.trigger)}</td><td>{fmt(a.health_state,1)}%</td><td>{fmt(a.anomaly_score,4)}</td><td><span className="review-state">{String(a.status).replaceAll('_',' ')}</span></td><td><Icon name="chevron"/></td></tr>)}</tbody></table></div>}
+  <Pagination page={page} pageSize={pageSize} total={total} onPage={setPage} onPageSize={setPageSize}/></section>
   {selected&&<Modal title={`Alert #${selected.id}`} wide onClose={()=>setSelected(null)}><div className="split-detail"><div><div className="detail-list"><DetailRow label="Level" value={selected.level} badge={tone(selected.level)}/><DetailRow label="Trigger" value={triggerLabel(selected.trigger)}/><DetailRow label="Health" value={`${fmt(selected.health_state,2)}%`}/><DetailRow label="Anomaly score" value={fmt(selected.anomaly_score,4)}/><DetailRow label="Timestamp" value={shortTime(selected.tick_timestamp)}/></div><Disclosure title="Raw sensor snapshot"><JsonGrid value={selected.raw_reading}/></Disclosure></div><div><p className="section-label">SURROUNDING CONTEXT</p><MiniContextChart rows={context}/><p className="muted small">Context is fetched from the backend around the alert timestamp. This view does not recalculate the maintenance decision.</p></div></div>{selected.status==='pending'&&<div className="modal-actions"><button className="secondary danger-text" disabled={busy} onClick={()=>decide('confirmed_normal')}>Confirm normal</button><button className="primary" disabled={busy} onClick={()=>decide('confirmed_anomaly')}>Confirm anomaly</button></div>}</Modal>}
   </>
 }
 
+function NearMissPanel(){
+  const [rows,setRows]=useState<any[]>([]),[total,setTotal]=useState(0),[error,setError]=useState(''),[reviewStatus,setReviewStatus]=useState('pending'),[selected,setSelected]=useState<any|null>(null),[busy,setBusy]=useState(false),[actionError,setActionError]=useState('');
+  const {page,setPage,pageSize,setPageSize,offset}=usePagination(25);
+  const load=()=>api(`/api/near-miss?status=${encodeURIComponent(reviewStatus)}&limit=${pageSize}&offset=${offset}`).then((r:Paged<any>)=>{setRows(r.items);setTotal(r.total)}).catch(e=>setError(String(e.message||e)));
+  useEffect(()=>{load()},[reviewStatus,pageSize,offset]);
+  useEffect(()=>{setPage(1)},[reviewStatus]);
+  const decide=async(decision:string)=>{
+    if(!selected)return; setBusy(true); setActionError('');
+    try{await api(`/api/near-miss/${selected.id}/review`,{method:'POST',body:JSON.stringify({decision})});setSelected(null);load()}
+    catch(e:any){setActionError(String(e.message||e))}
+    finally{setBusy(false)}
+  };
+  return <>
+  <div className="filter-bar sub-filter-bar"><Select value={reviewStatus} onChange={setReviewStatus} options={[['pending','Pending'],['acknowledged','Acknowledged'],['flagged','Flagged']]}/></div>
+  {error&&<Notice tone="critical">{error}</Notice>}
+  <section className="data-surface"><div className="surface-heading"><span>{total} record{total===1?'':'s'}</span><small>Ranked by backend near-miss query</small></div>{rows.length===0?<Empty title="No matching records" text="Try another review status."/>:<div className="responsive-table"><table><thead><tr><th>Time</th><th>State</th><th>Health</th><th>Anomaly</th><th>Model</th><th>Review state</th><th/></tr></thead><tbody>{rows.map((r,i)=><tr key={r.id||`${r.tick_timestamp}-${i}`} onClick={()=>setSelected(r)}><td><strong>{shortTime(r.tick_timestamp)}</strong></td><td><StatusBadge value={r.maintenance_level||'OK'}/></td><td>{fmt(r.health_state,1)}%</td><td>{fmt(r.anomaly_score,4)}</td><td>{r.model_version||'—'}</td><td><span className="review-state">{String(r.review_status||'pending').replaceAll('_',' ')}</span></td><td><Icon name="chevron"/></td></tr>)}</tbody></table></div>}
+  <Pagination page={page} pageSize={pageSize} total={total} onPage={setPage} onPageSize={setPageSize}/></section>
+  {selected&&<Modal title="Near-miss record" wide onClose={()=>setSelected(null)}><div className="split-detail"><div className="detail-list"><DetailRow label="Timestamp" value={shortTime(selected.tick_timestamp)}/><DetailRow label="Maintenance state" value={selected.maintenance_level||'—'} badge={tone(selected.maintenance_level)}/><DetailRow label="Health" value={`${fmt(selected.health_state,2)}%`}/><DetailRow label="Anomaly score" value={fmt(selected.anomaly_score,4)}/><DetailRow label="Review state" value={String(selected.review_status||'pending').replaceAll('_',' ')}/></div><div><p className="section-label">SENSOR SNAPSHOT</p><JsonGrid value={selected.raw_reading}/><Disclosure title="Full backend record"><pre className="code-panel compact">{JSON.stringify(selected,null,2)}</pre></Disclosure></div></div>
+  {(selected.review_status||'pending')==='pending'&&<div className="modal-actions">{actionError&&<Notice tone="critical">{actionError}</Notice>}<button className="secondary" disabled={busy} onClick={()=>decide('acknowledged')}>Acknowledge</button><button className="primary" disabled={busy} onClick={()=>decide('flagged')}>Flag for follow-up</button></div>}
+  {(selected.review_status||'pending')==='flagged'&&<p className="muted small flag-note">Flagging opens a suspected-false-negative regression check for this time window (see Models → retraining gate).</p>}
+  </Modal>}
+  </>
+}
+
 function Select({value,onChange,options}:{value:string;onChange:(v:string)=>void;options:Array<[string,string]>}){return <label className="select-wrap"><select value={value} onChange={e=>onChange(e.target.value)}>{options.map(([v,l])=><option key={v} value={v}>{l}</option>)}</select><span>⌄</span></label>}
+
+function Pagination({page,pageSize,total,onPage,onPageSize,sizes=PAGE_SIZES}:{page:number;pageSize:number;total:number;onPage:(p:number)=>void;onPageSize:(n:number)=>void;sizes?:number[]}){
+  const pages=Math.max(1,Math.ceil(total/pageSize));
+  const from=total===0?0:(page-1)*pageSize+1; const to=Math.min(total,page*pageSize);
+  return <div className="pagination">
+    <span className="pagination-info">{total===0?'No records':`${from}–${to} of ${total}`}</span>
+    <div className="pagination-controls">
+      <button className="icon-button" disabled={page<=1} onClick={()=>onPage(1)} title="First page">«</button>
+      <button className="icon-button" disabled={page<=1} onClick={()=>onPage(page-1)} title="Previous page">‹</button>
+      <span className="pagination-page">Page {page} of {pages}</span>
+      <button className="icon-button" disabled={page>=pages} onClick={()=>onPage(page+1)} title="Next page">›</button>
+      <button className="icon-button" disabled={page>=pages} onClick={()=>onPage(pages)} title="Last page">»</button>
+    </div>
+    <Select value={String(pageSize)} onChange={v=>onPageSize(Number(v))} options={sizes.map(s=>[String(s),`${s} / page`] as [string,string])}/>
+  </div>
+}
 
 function MiniContextChart({rows}:{rows:any[]}){const values=rows.map(r=>Number(r.health_state)).filter(Number.isFinite);return <div className="context-chart"><Sparkline values={values}/><div className="context-axis"><span>{rows[0]?shortTime(rows[0].tick_timestamp):'No data'}</span><span>Health trend</span><span>{rows.length?shortTime(rows[rows.length-1].tick_timestamp):''}</span></div></div>}
 function JsonGrid({value}:{value:any}){const obj=typeof value==='object'&&value?value:{};return <div className="json-grid">{Object.entries(obj).map(([k,v])=><div key={k}><span>{SENSOR_META[k]?.label||k}</span><strong>{String(v)}</strong></div>)}</div>}
@@ -237,13 +312,18 @@ function Models({admin}:{admin:boolean}){
   </>
 }
 
-function RecordsPage({mode}:{mode:'history'|'near'}){
-  const isNear=mode==='near'; const [rows,setRows]=useState<any[]>([]),[error,setError]=useState(''),[q,setQ]=useState(''),[level,setLevel]=useState(''),[selected,setSelected]=useState<any|null>(null);
-  useEffect(()=>{api(isNear?'/api/near-miss':'/api/history').then(setRows).catch(e=>setError(String(e.message||e)))},[isNear]);
-  const filtered=useMemo(()=>rows.filter(r=>(!level||r.maintenance_level===level)&&(!q||JSON.stringify(r).toLowerCase().includes(q.toLowerCase()))),[rows,q,level]);
-  return <><PageHeader eyebrow={isNear?'TREND SURVEILLANCE':'AUDIT TRAIL'} title={isNear?'Near-miss trends':'Prediction history'} description={isNear?'Healthy-state observations that approached anomaly or degradation boundaries without becoming a maintenance alert.':'Searchable record of backend prediction ticks and their maintenance outputs.'} actions={<div className="filter-bar"><label className="search-field"><Icon name="search"/><input value={q} onChange={e=>setQ(e.target.value)} placeholder="Search records"/></label><Select value={level} onChange={setLevel} options={[['','All states'],['OK','OK'],['WARN','WARN'],['CRITICAL','CRITICAL']]}/></div>}/>{error&&<Notice tone="critical">{error}</Notice>}
-  <section className="data-surface"><div className="surface-heading"><span>{filtered.length} record{filtered.length===1?'':'s'}</span><small>{isNear?'Ranked by backend near-miss query':'Most recent first'}</small></div>{filtered.length===0?<Empty title="No matching records" text="Change the search or state filter."/>:<div className="responsive-table"><table><thead><tr><th>Time</th><th>State</th><th>Health</th><th>Anomaly</th><th>Remaining</th><th>Model</th><th/></tr></thead><tbody>{filtered.map((r,i)=><tr key={r.id||`${r.tick_timestamp}-${i}`} onClick={()=>setSelected(r)}><td><strong>{shortTime(r.tick_timestamp)}</strong></td><td><StatusBadge value={r.maintenance_level||'OK'}/></td><td>{fmt(r.health_state,1)}%</td><td>{fmt(r.anomaly_score,4)}</td><td>{r.remaining_days!==undefined?`${fmt(r.remaining_days,1)} d`:'—'}</td><td>{r.model_version||'—'}</td><td><Icon name="chevron"/></td></tr>)}</tbody></table></div>}</section>
-  {selected&&<Modal title={isNear?'Near-miss record':'Prediction record'} wide onClose={()=>setSelected(null)}><div className="split-detail"><div className="detail-list"><DetailRow label="Timestamp" value={shortTime(selected.tick_timestamp)}/><DetailRow label="Maintenance state" value={selected.maintenance_level||'—'} badge={tone(selected.maintenance_level)}/><DetailRow label="Maintenance reason" value={selected.maintenance_reason||'—'}/><DetailRow label="Trigger" value={triggerLabel(selected.maintenance_trigger)}/><DetailRow label="Health" value={`${fmt(selected.health_state,2)}%`}/><DetailRow label="Anomaly score" value={fmt(selected.anomaly_score,4)}/><DetailRow label="Remaining days" value={fmt(selected.remaining_days,2)}/></div><div><p className="section-label">SENSOR SNAPSHOT</p><JsonGrid value={selected.raw_reading}/><Disclosure title="Failure probability"><JsonGrid value={selected.failure_probability}/></Disclosure><Disclosure title="Full backend record"><pre className="code-panel compact">{JSON.stringify(selected,null,2)}</pre></Disclosure></div></div></Modal>}
+function HistoryPage(){
+  const [rows,setRows]=useState<any[]>([]),[total,setTotal]=useState(0),[error,setError]=useState(''),[q,setQ]=useState(''),[level,setLevel]=useState(''),[selected,setSelected]=useState<any|null>(null);
+  const {page,setPage,pageSize,setPageSize,offset}=usePagination(25);
+  const load=()=>api(`/api/history?limit=${pageSize}&offset=${offset}${level?`&level=${encodeURIComponent(level)}`:''}`).then((r:Paged<any>)=>{setRows(r.items);setTotal(r.total)}).catch(e=>setError(String(e.message||e)));
+  useEffect(()=>{load()},[level,pageSize,offset]);
+  useEffect(()=>{setPage(1)},[level]);
+  const filtered=useMemo(()=>rows.filter(r=>!q||JSON.stringify(r).toLowerCase().includes(q.toLowerCase())),[rows,q]);
+  return <><PageHeader eyebrow="AUDIT TRAIL" title="Prediction history" description="Searchable record of backend prediction ticks and their maintenance outputs." actions={<div className="filter-bar"><label className="search-field"><Icon name="search"/><input value={q} onChange={e=>setQ(e.target.value)} placeholder="Search this page"/></label><Select value={level} onChange={setLevel} options={[['','All states'],['OK','OK'],['WARN','WARN'],['CRITICAL','CRITICAL']]}/></div>}/>{error&&<Notice tone="critical">{error}</Notice>}
+  <section className="data-surface"><div className="surface-heading"><span>{q?`${filtered.length} of ${rows.length} on this page`:`${total} record${total===1?'':'s'}`}</span><small>Most recent first</small></div>{filtered.length===0?<Empty title="No matching records" text="Change the search or state filter."/>:<div className="responsive-table"><table><thead><tr><th>Time</th><th>State</th><th>Health</th><th>Anomaly</th><th>Remaining</th><th>Model</th><th>Outcome</th><th/></tr></thead><tbody>{filtered.map((r,i)=>{const outcome=historyOutcome(r); return <tr key={r.id||`${r.tick_timestamp}-${i}`} onClick={()=>setSelected(r)}><td><strong>{shortTime(r.tick_timestamp)}</strong></td><td><StatusBadge value={r.maintenance_level||'OK'}/></td><td>{fmt(r.health_state,1)}%</td><td>{fmt(r.anomaly_score,4)}</td><td>{r.remaining_days!==undefined?`${fmt(r.remaining_days,1)} d`:'—'}</td><td>{r.model_version||'—'}</td><td>{outcome?<StatusBadge value={outcome.text} forced={outcome.tone}/>:<span className="muted">—</span>}</td><td><Icon name="chevron"/></td></tr>})}</tbody></table></div>}
+  <Pagination page={page} pageSize={pageSize} total={total} onPage={setPage} onPageSize={setPageSize}/></section>
+  {selected&&<Modal title="Prediction record" wide onClose={()=>setSelected(null)}><div className="split-detail"><div className="detail-list"><DetailRow label="Timestamp" value={shortTime(selected.tick_timestamp)}/><DetailRow label="Maintenance state" value={selected.maintenance_level||'—'} badge={tone(selected.maintenance_level)}/><DetailRow label="Maintenance reason" value={selected.maintenance_reason||'—'}/><DetailRow label="Trigger" value={triggerLabel(selected.maintenance_trigger)}/><DetailRow label="Health" value={`${fmt(selected.health_state,2)}%`}/><DetailRow label="Anomaly score" value={fmt(selected.anomaly_score,4)}/><DetailRow label="Remaining days" value={fmt(selected.remaining_days,2)}/>{selected.alert_status&&<><DetailRow label="Alert outcome" value={reviewLabel(selected.alert_status)} badge={reviewTone(selected.alert_status)}/><DetailRow label="Alert level / trigger" value={`${selected.alert_level||'—'} · ${triggerLabel(selected.alert_trigger)}`}/>{selected.alert_reviewed_by&&<DetailRow label="Reviewed by" value={`${selected.alert_reviewed_by} · ${shortTime(selected.alert_reviewed_at)}`}/>}</>}{!selected.alert_status&&selected.near_miss_status&&<><DetailRow label="Near-miss outcome" value={reviewLabel(selected.near_miss_status)} badge={reviewTone(selected.near_miss_status)}/>{selected.near_miss_reviewed_by&&<DetailRow label="Reviewed by" value={`${selected.near_miss_reviewed_by} · ${shortTime(selected.near_miss_reviewed_at)}`}/>}</>}{!selected.alert_status&&!selected.near_miss_status&&<DetailRow label="Outcome" value="Not surfaced in Alert review or Near miss"/>}</div><div><p className="section-label">SENSOR SNAPSHOT</p><JsonGrid value={selected.raw_reading}/><Disclosure title="Failure probability"><JsonGrid value={selected.failure_probability}/></Disclosure><Disclosure title="Full backend record"><pre className="code-panel compact">{JSON.stringify(selected,null,2)}</pre></Disclosure></div></div>
+  </Modal>}
   </>
 }
 

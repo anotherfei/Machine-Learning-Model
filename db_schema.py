@@ -94,6 +94,16 @@ CREATE TABLE IF NOT EXISTS spindle_predictions (
 ALTER TABLE spindle_predictions ADD COLUMN IF NOT EXISTS is_backfill BOOLEAN NOT NULL DEFAULT FALSE;
 CREATE INDEX IF NOT EXISTS spindle_predictions_ts_idx ON spindle_predictions(tick_timestamp DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS spindle_predictions_tick_model_uq ON spindle_predictions(tick_timestamp, model_version);
+
+CREATE TABLE IF NOT EXISTS near_miss_reviews (
+  id BIGSERIAL PRIMARY KEY,
+  prediction_id BIGINT UNIQUE NOT NULL REFERENCES spindle_predictions(id) ON DELETE CASCADE,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','acknowledged','flagged')),
+  reviewed_by TEXT,
+  reviewed_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS near_miss_reviews_status_idx ON near_miss_reviews(status);
 '''
 
 

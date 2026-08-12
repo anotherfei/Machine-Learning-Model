@@ -123,6 +123,44 @@ FEATURE_CONFIG = {
 REFERENCE_WINDOW_MINUTES = 2 * 24 * 60  # first 2 days
 
 # ---------------------------------------------------------------------------
+# Where train_isolation_forest.py reads the reference/commissioning
+# window FROM.
+#
+#   "live" - the exact same Postgres table + connection worker.py/db.py
+#            already use in production, restricted to
+#            [REFERENCE_WINDOW_START, REFERENCE_WINDOW_END). Training and
+#            production then share one schema and one source of truth —
+#            no separate offline file that can silently drift out of sync
+#            with what the live sensor actually emits (this pipeline has
+#            already been through one such drift: see the a_rms_mps2 /
+#            current_ampere history above). This is also just a literal
+#            reading of the commissioning-baseline assumption this file
+#            already documents above: an early live burn-in period IS the
+#            reference, not a CSV standing in for one.
+#   "csv"  - config.RAW_DATA_PATH, the original offline-file behavior.
+#            Kept for offline experimentation / CI fixtures that
+#            shouldn't depend on a reachable database.
+#
+# Only train_isolation_forest.py reads this — it has no effect on
+# predict_realtime.py or worker.py, which always score the live feed
+# regardless of where the model was originally fit.
+REFERENCE_SOURCE = "live"
+
+# Commissioning window boundaries, only used when REFERENCE_SOURCE=="live".
+# Deliberately left unset: train_isolation_forest.py refuses to guess a
+# window and fit on "whatever the table currently holds" — that would
+# make every training run pull a different, unreproducible reference set
+# (the live table keeps growing; a static CSV never did). Pin these to a
+# specific confirmed-healthy stretch once enough live data exists after
+# commissioning — e.g.:
+#   REFERENCE_WINDOW_START = "2026-01-05T00:00:00Z"
+#   REFERENCE_WINDOW_END   = "2026-01-07T00:00:00Z"
+# (--start/--end on the train_isolation_forest.py command line override
+# these for a one-off run without editing this file.)
+REFERENCE_WINDOW_START = None
+REFERENCE_WINDOW_END = None
+
+# ---------------------------------------------------------------------------
 # Isolation Forest
 # ---------------------------------------------------------------------------
 ISOLATION_FOREST_PARAMS = {

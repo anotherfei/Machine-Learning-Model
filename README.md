@@ -42,7 +42,15 @@ Then start again with `-Mock`.
 
 ## Production mode
 
-Configure `.env` with the real PostgreSQL connection and place trained model artifacts under `artifacts/`, then run:
+Configure `.env` with the real PostgreSQL connection, then train and place model artifacts under `artifacts/`:
+
+```powershell
+python train_isolation_forest.py
+```
+
+By default this fits the model on a pinned commissioning window pulled from the same PostgreSQL table `worker.py` reads in production — set `REFERENCE_WINDOW_START`/`REFERENCE_WINDOW_END` in `config.py` (or pass `--start`/`--end`) first. See `architecture-notes.md` → "Initial model training" for the full picture, including the offline-CSV fallback (`--source csv`).
+
+Then run:
 
 ```powershell
 .\start_project.ps1
