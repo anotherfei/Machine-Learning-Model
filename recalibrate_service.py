@@ -56,7 +56,7 @@ SOURCES = ("spec_bounds", "threshold")
 
 
 def run(conn, version_id: str, hours: float, min_rows: int, created_by: str | None,
-        source: str = "spec_bounds") -> dict:
+        source: str = "spec_bounds", machine_id: str = db.DEFAULT_MACHINE_ID) -> dict:
     if source not in SOURCES:
         raise ValueError(f"source must be one of {SOURCES}, got {source!r}.")
 
@@ -73,9 +73,9 @@ def run(conn, version_id: str, hours: float, min_rows: int, created_by: str | No
     end = pd.Timestamp.now(tz="UTC")
     start = end - pd.Timedelta(hours=hours)
     table = db.get_table_name()
-    rows = db.fetch_rows_between(conn, table, start.to_pydatetime(), end.to_pydatetime())
+    rows = db.fetch_rows_between(conn, table, start.to_pydatetime(), end.to_pydatetime(), machine_id=machine_id)
     if not rows:
-        raise ValueError(f"No live rows found in the last {hours:g} hour(s) to recalibrate from.")
+        raise ValueError(f"No live rows found for machine {machine_id!r} in the last {hours:g} hour(s) to recalibrate from.")
 
     dbcols = db.get_db_columns()
     rename = {dbcols["timestamp"]: config.COL_TIMESTAMP}
@@ -98,7 +98,7 @@ def run(conn, version_id: str, hours: float, min_rows: int, created_by: str | No
     featured_df = feature_engineering.create_features(raw_df, verbose=False)
 
     if source == "threshold":
-        ok_timestamps = db.fetch_ok_prediction_timestamps(conn, start.to_pydatetime(), end.to_pydatetime())
+        ok_timestamps = db.fetch_ok_prediction_timestamps(conn, start.to_pydatetime(), end.to_pydatetime(), machine_id=machine_id)
         if not ok_timestamps:
             raise ValueError(
                 f"No maintenance_level='OK' predictions found in the last {hours:g} "
@@ -126,10 +126,10 @@ def run(conn, version_id: str, hours: float, min_rows: int, created_by: str | No
 
     with conn.cursor() as cur:
         cur.execute(
-            """INSERT INTO model_calibrations(version_id,calibration,source_rows,source_description,created_by)
-               VALUES(%s,%s::jsonb,%s,%s,%s) RETURNING id,created_at""",
-            (version_id, json.dumps(calibration), len(local_features),
-             f"Live window {start.isoformat()} to {end.isoformat()} ({hours:g}h), {reason}", created_by),
+            """INSERT INTO model_calibrations(version_id,machine_id,calibration,source_rows,source_description,created_by)
+               VALUES(%s,%s,%s::jsonb,%s,%s,%s) RETURNING id,created_at""",
+            (version_id, machine_id, json.dumps(calibration), len(local_features),
+             f"Machine {machine_id}; live window {start.isoformat()} to {end.isoformat()} ({hours:g}h), {reason}", created_by),
         )
         calibration_id, created_at = cur.fetchone()
     conn.commit()
@@ -137,6 +137,7 @@ def run(conn, version_id: str, hours: float, min_rows: int, created_by: str | No
     return {
         "calibration_id": calibration_id,
         "version_id": version_id,
+        "machine_id": machine_id,
         "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else created_at,
         "rows_used": len(local_features),
         "window_hours": hours,

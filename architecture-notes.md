@@ -42,7 +42,7 @@ The production worker runs separately and owns `SpindleMonitor`, feature enginee
 
 `React/Vite -> FastAPI mock API -> SQLite mock_demo.db`.
 
-The production worker is not started. The mock API exposes the same frontend-facing endpoints and generates synthetic live VVB001 ticks so the web UI can be verified without a PostgreSQL server or trained artifacts.
+The production worker is not started. The mock API exposes the same frontend-facing endpoints and generates synthetic live ticks for multiple machine IDs so the web UI can be verified without a PostgreSQL server or trained artifacts.
 
 ## Local ports
 

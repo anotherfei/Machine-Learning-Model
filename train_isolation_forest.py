@@ -63,6 +63,11 @@ def parse_args():
         help="Override config.REFERENCE_WINDOW_END for this run "
              "(only used when the resolved source is 'live')."
     )
+    parser.add_argument(
+        "--machine-id", default=None,
+        help="Machine to use for a live commissioning window. Defaults to "
+             "DEFAULT_MACHINE_ID (VVB001 unless overridden)."
+    )
     return parser.parse_args()
 
 
@@ -108,20 +113,20 @@ def _resolve_live_window(args):
     return start, end
 
 
-def _load_live_raw(start, end):
+def _load_live_raw(start, end, machine_id):
     conn = db.get_connection()
     try:
         table = db.get_table_name()
         # .to_pydatetime(): same conversion backfill.py uses before handing
         # a pd.Timestamp to psycopg2, so tz-aware/naive comparisons against
         # the DB column behave the same way here as they do there.
-        rows = db.fetch_rows_between(conn, table, start.to_pydatetime(), end.to_pydatetime())
+        rows = db.fetch_rows_between(conn, table, start.to_pydatetime(), end.to_pydatetime(), machine_id=machine_id)
     finally:
         conn.close()
 
     if not rows:
         raise ValueError(
-            f"No rows found in table {table!r} between {start} and {end}. "
+            f"No rows found for machine {machine_id!r} in table {table!r} between {start} and {end}. "
             f"Check REFERENCE_WINDOW_START/END and the PG_* connection "
             f"settings in .env."
         )
@@ -132,14 +137,14 @@ def _load_live_raw(start, end):
 
     raw_df = pd.DataFrame(rows).rename(columns=rename)
     raw_df = preprocessing.clean_data(raw_df)
-    print(f"[train] Pulled {len(raw_df)} live rows from {table!r} "
+    print(f"[train] Pulled {len(raw_df)} live rows for machine {machine_id!r} from {table!r} "
           f"between {start} and {end} (after cleaning).")
     return raw_df
 
 
 def _train_from_live(args):
     start, end = _resolve_live_window(args)
-    raw_df = _load_live_raw(start, end)
+    raw_df = _load_live_raw(start, end, args.machine_id or db.DEFAULT_MACHINE_ID)
 
     featured_df = feature_engineering.create_features(raw_df)
     feature_cols = feature_engineering.get_feature_columns(featured_df)

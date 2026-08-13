@@ -6,6 +6,7 @@ import runtime_config
 SCHEMA_SQL = r'''
 CREATE TABLE IF NOT EXISTS alerts (
   id BIGSERIAL PRIMARY KEY,
+  machine_id TEXT NOT NULL DEFAULT 'VVB001',
   tick_timestamp TIMESTAMPTZ NOT NULL,
   model_version TEXT NOT NULL,
   trigger TEXT NOT NULL CHECK (trigger IN ('health_threshold','health_inspect','trend_probability','none')),
@@ -19,7 +20,8 @@ CREATE TABLE IF NOT EXISTS alerts (
   reviewed_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS alerts_status_idx ON alerts(status, created_at DESC);
+ALTER TABLE alerts ADD COLUMN IF NOT EXISTS machine_id TEXT NOT NULL DEFAULT 'VVB001';
+CREATE INDEX IF NOT EXISTS alerts_machine_status_idx ON alerts(machine_id, status, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS reference_candidates (
   id BIGSERIAL PRIMARY KEY,
@@ -46,32 +48,51 @@ CREATE UNIQUE INDEX IF NOT EXISTS model_versions_one_active
 -- Health%-anchor recalibration runs (see recalibrate.py / recalibrate_service.py).
 -- Each row is ONE computed baseline_mean/std anchor for a specific model
 -- version, sourced from a recent live window; computing one does not
--- change what's deployed by itself — model_versions.active_calibration_id
--- (below) is the actual on/off switch a human flips from the Models page.
+-- change what's deployed by itself. machine_model_calibrations (below) is
+-- the per-machine on/off switch a human flips from the Models page.
 CREATE TABLE IF NOT EXISTS model_calibrations (
   id BIGSERIAL PRIMARY KEY,
   version_id TEXT NOT NULL REFERENCES model_versions(version_id) ON DELETE CASCADE,
+  machine_id TEXT NOT NULL DEFAULT 'VVB001',
   calibration JSONB NOT NULL,
   source_rows INTEGER NOT NULL,
   source_description TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   created_by TEXT
 );
+ALTER TABLE model_calibrations ADD COLUMN IF NOT EXISTS machine_id TEXT NOT NULL DEFAULT 'VVB001';
 CREATE INDEX IF NOT EXISTS model_calibrations_version_idx ON model_calibrations(version_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS model_calibrations_machine_version_idx ON model_calibrations(machine_id, version_id, created_at DESC);
 
 -- NULL = use the pooled/default calibration baked into the bundle itself
 -- ("normal"). Set = use that specific recalibration run's baseline
 -- instead ("recalibrated"). See model_registry.promote()/set_calibration().
 ALTER TABLE model_versions ADD COLUMN IF NOT EXISTS active_calibration_id BIGINT REFERENCES model_calibrations(id);
 
+CREATE TABLE IF NOT EXISTS machine_model_calibrations (
+  machine_id TEXT NOT NULL,
+  version_id TEXT NOT NULL REFERENCES model_versions(version_id) ON DELETE CASCADE,
+  calibration_id BIGINT NOT NULL REFERENCES model_calibrations(id) ON DELETE CASCADE,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY(machine_id, version_id)
+);
+-- Preserve the old single-machine assignment when upgrading an existing DB.
+INSERT INTO machine_model_calibrations(machine_id,version_id,calibration_id)
+SELECT 'VVB001',version_id,active_calibration_id FROM model_versions
+WHERE active_calibration_id IS NOT NULL
+ON CONFLICT(machine_id,version_id) DO NOTHING;
+UPDATE model_versions SET active_calibration_id=NULL WHERE active_calibration_id IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS regression_tests (
   id BIGSERIAL PRIMARY KEY,
+  machine_id TEXT NOT NULL DEFAULT 'VVB001',
   description TEXT NOT NULL,
   timestamp_range TSTZRANGE NOT NULL,
   source_alert_id BIGINT REFERENCES alerts(id),
   minimum_anomaly_risk REAL NOT NULL DEFAULT 0.6,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE regression_tests ADD COLUMN IF NOT EXISTS machine_id TEXT NOT NULL DEFAULT 'VVB001';
 
 CREATE TABLE IF NOT EXISTS runtime_config (
   key TEXT PRIMARY KEY,
@@ -97,6 +118,7 @@ CREATE TABLE IF NOT EXISTS env_change_log (
 
 CREATE TABLE IF NOT EXISTS spindle_predictions (
   id BIGSERIAL PRIMARY KEY,
+  machine_id TEXT NOT NULL DEFAULT 'VVB001',
   tick_timestamp TIMESTAMPTZ NOT NULL,
   model_version TEXT NOT NULL,
   raw_reading JSONB NOT NULL,
@@ -112,9 +134,12 @@ CREATE TABLE IF NOT EXISTS spindle_predictions (
   top_contributors JSONB,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE spindle_predictions ADD COLUMN IF NOT EXISTS machine_id TEXT NOT NULL DEFAULT 'VVB001';
 ALTER TABLE spindle_predictions ADD COLUMN IF NOT EXISTS is_backfill BOOLEAN NOT NULL DEFAULT FALSE;
-CREATE INDEX IF NOT EXISTS spindle_predictions_ts_idx ON spindle_predictions(tick_timestamp DESC);
-CREATE UNIQUE INDEX IF NOT EXISTS spindle_predictions_tick_model_uq ON spindle_predictions(tick_timestamp, model_version);
+CREATE INDEX IF NOT EXISTS spindle_predictions_machine_ts_idx ON spindle_predictions(machine_id, tick_timestamp DESC);
+DROP INDEX IF EXISTS spindle_predictions_tick_model_uq;
+CREATE UNIQUE INDEX IF NOT EXISTS spindle_predictions_machine_tick_model_uq
+  ON spindle_predictions(machine_id, tick_timestamp, model_version);
 
 CREATE TABLE IF NOT EXISTS near_miss_reviews (
   id BIGSERIAL PRIMARY KEY,

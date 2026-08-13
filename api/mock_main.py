@@ -32,7 +32,8 @@ DB_PATH = ROOT / "mock_demo.db"
 _LOCK = threading.RLock()
 _RNG = random.Random(42)
 _login_attempts = defaultdict(deque)
-_live_index = 0
+MACHINE_IDS = ("VVB001", "VVB002", "VVB003")
+_live_index: dict[str, int] = {}
 
 app = FastAPI(title="Spindle Condition Monitoring API (Mock Demo)", version="1.0")
 app.add_middleware(
@@ -68,9 +69,10 @@ def _maintenance_for(health: float, anomaly: float) -> tuple[str, str, str]:
     return "OK", "No maintenance action is currently required.", "none"
 
 
-def _sensor_values(i: int) -> dict[str, float]:
+def _sensor_values(i: int, machine_id: str) -> dict[str, float]:
     # Slowly wandering, deterministic demo signal with occasional stronger vibration.
-    phase = i / 11.0
+    unit_offset = MACHINE_IDS.index(machine_id) if machine_id in MACHINE_IDS else 0
+    phase = i / 11.0 + unit_offset * 0.7
     bump = 1.3 if i % 37 in (0, 1, 2) else 0.0
     return {
         "a_rms_mps2": round(1.15 + 0.28 * math.sin(phase) + bump, 4),
@@ -81,9 +83,9 @@ def _sensor_values(i: int) -> dict[str, float]:
     }
 
 
-def _prediction(i: int, when: datetime | None = None) -> dict:
+def _prediction(i: int, machine_id: str = "VVB001", when: datetime | None = None) -> dict:
     when = when or _now()
-    raw = _sensor_values(i)
+    raw = _sensor_values(i, machine_id)
     # Keep demo values visually useful: mostly healthy, with periodic warnings/critical points.
     cycle = i % 70
     if cycle in (55, 56):
@@ -96,6 +98,7 @@ def _prediction(i: int, when: datetime | None = None) -> dict:
     anomaly = max(0.01, min(0.99, (100.0 - health) / 100.0 + 0.08 * abs(math.sin(i / 7.0))))
     level, reason, trigger = _maintenance_for(health, anomaly)
     return {
+        "machine_id": machine_id,
         "tick_timestamp": _iso(when),
         "model_version": "mock-demo-v1",
         "raw_reading": raw,
@@ -116,12 +119,12 @@ def _insert_prediction(c: sqlite3.Connection, row: dict, create_alert: bool = Fa
     raw_json = json.dumps(row["raw_reading"])
     c.execute(
         """INSERT INTO spindle_predictions(
-        tick_timestamp,model_version,raw_reading,anomaly_score,health_raw,health_state,
+        machine_id,tick_timestamp,model_version,raw_reading,anomaly_score,health_raw,health_state,
         trend_slope_per_day,remaining_days,failure_probability,maintenance_level,
         maintenance_reason,maintenance_trigger,top_contributors,is_backfill)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,0)""",
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)""",
         (
-            row["tick_timestamp"], row["model_version"], raw_json, row["anomaly_score"], row["health_raw"],
+            row["machine_id"], row["tick_timestamp"], row["model_version"], raw_json, row["anomaly_score"], row["health_raw"],
             row["health_state"], row["trend_slope_per_day"], row["remaining_days"],
             json.dumps(row["failure_probability"]), row["maintenance_level"], row["maintenance_reason"],
             row["maintenance_trigger"], json.dumps(row["top_contributors"]),
@@ -130,9 +133,9 @@ def _insert_prediction(c: sqlite3.Connection, row: dict, create_alert: bool = Fa
     pid = int(c.execute("SELECT last_insert_rowid()").fetchone()[0])
     if create_alert and row["maintenance_level"] in ("WARN", "CRITICAL"):
         c.execute(
-            """INSERT INTO alerts(tick_timestamp,model_version,trigger,level,health_state,anomaly_score,raw_reading,status)
-               VALUES(?,?,?,?,?,?,?,'pending')""",
-            (row["tick_timestamp"], row["model_version"], row["maintenance_trigger"], row["maintenance_level"],
+            """INSERT INTO alerts(machine_id,tick_timestamp,model_version,trigger,level,health_state,anomaly_score,raw_reading,status)
+               VALUES(?,?,?,?,?,?,?,?,'pending')""",
+            (row["machine_id"], row["tick_timestamp"], row["model_version"], row["maintenance_trigger"], row["maintenance_level"],
              row["health_state"], row["anomaly_score"], raw_json),
         )
     return pid
@@ -152,7 +155,7 @@ def initialize_mock_database(reset: bool = False) -> Path:
             );
             CREATE TABLE IF NOT EXISTS runtime_config(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_by TEXT);
             CREATE TABLE IF NOT EXISTS alerts(
-              id INTEGER PRIMARY KEY AUTOINCREMENT, tick_timestamp TEXT NOT NULL, model_version TEXT NOT NULL,
+              id INTEGER PRIMARY KEY AUTOINCREMENT, machine_id TEXT NOT NULL DEFAULT 'VVB001', tick_timestamp TEXT NOT NULL, model_version TEXT NOT NULL,
               trigger TEXT NOT NULL, level TEXT NOT NULL, health_state REAL NOT NULL, anomaly_score REAL NOT NULL,
               raw_reading TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', reviewed_by TEXT, reviewed_at TEXT
             );
@@ -164,16 +167,20 @@ def initialize_mock_database(reset: bool = False) -> Path:
               status TEXT NOT NULL, validation_report TEXT, created_at TEXT NOT NULL, promoted_at TEXT, promoted_by TEXT
             );
             CREATE TABLE IF NOT EXISTS model_calibrations(
-              id INTEGER PRIMARY KEY AUTOINCREMENT, version_id TEXT NOT NULL, calibration TEXT NOT NULL,
+              id INTEGER PRIMARY KEY AUTOINCREMENT, version_id TEXT NOT NULL, machine_id TEXT NOT NULL DEFAULT 'VVB001', calibration TEXT NOT NULL,
               source_rows INTEGER NOT NULL, source_description TEXT, created_at TEXT NOT NULL, created_by TEXT
             );
+            CREATE TABLE IF NOT EXISTS machine_model_calibrations(
+              machine_id TEXT NOT NULL, version_id TEXT NOT NULL, calibration_id INTEGER NOT NULL,
+              updated_at TEXT NOT NULL, PRIMARY KEY(machine_id,version_id)
+            );
             CREATE TABLE IF NOT EXISTS regression_tests(
-              id INTEGER PRIMARY KEY AUTOINCREMENT, description TEXT NOT NULL, start_ts TEXT NOT NULL, end_ts TEXT NOT NULL,
+              id INTEGER PRIMARY KEY AUTOINCREMENT, machine_id TEXT NOT NULL DEFAULT 'VVB001', description TEXT NOT NULL, start_ts TEXT NOT NULL, end_ts TEXT NOT NULL,
               minimum_anomaly_risk REAL NOT NULL, created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS mock_env(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS spindle_predictions(
-              id INTEGER PRIMARY KEY AUTOINCREMENT, tick_timestamp TEXT NOT NULL, model_version TEXT NOT NULL,
+              id INTEGER PRIMARY KEY AUTOINCREMENT, machine_id TEXT NOT NULL DEFAULT 'VVB001', tick_timestamp TEXT NOT NULL, model_version TEXT NOT NULL,
               raw_reading TEXT NOT NULL, anomaly_score REAL NOT NULL, health_raw REAL NOT NULL, health_state REAL NOT NULL,
               trend_slope_per_day REAL NOT NULL, remaining_days REAL NOT NULL, failure_probability TEXT NOT NULL,
               maintenance_level TEXT NOT NULL, maintenance_reason TEXT NOT NULL, maintenance_trigger TEXT NOT NULL,
@@ -194,6 +201,17 @@ def initialize_mock_database(reset: bool = False) -> Path:
         existing_cols = {r[1] for r in c.execute("PRAGMA table_info(model_versions)").fetchall()}
         if "active_calibration_id" not in existing_cols:
             c.execute("ALTER TABLE model_versions ADD COLUMN active_calibration_id INTEGER")
+        calibration_cols = {r[1] for r in c.execute("PRAGMA table_info(model_calibrations)").fetchall()}
+        if "machine_id" not in calibration_cols:
+            c.execute("ALTER TABLE model_calibrations ADD COLUMN machine_id TEXT NOT NULL DEFAULT 'VVB001'")
+        for table_name in ("alerts", "regression_tests", "spindle_predictions"):
+            table_cols = {r[1] for r in c.execute(f"PRAGMA table_info({table_name})").fetchall()}
+            if "machine_id" not in table_cols:
+                c.execute(f"ALTER TABLE {table_name} ADD COLUMN machine_id TEXT NOT NULL DEFAULT 'VVB001'")
+        c.execute("""INSERT OR IGNORE INTO machine_model_calibrations(machine_id,version_id,calibration_id,updated_at)
+                     SELECT 'VVB001',version_id,active_calibration_id,datetime('now') FROM model_versions
+                     WHERE active_calibration_id IS NOT NULL""")
+        c.execute("UPDATE model_versions SET active_calibration_id=NULL WHERE active_calibration_id IS NOT NULL")
         if c.execute("SELECT count(*) FROM app_users").fetchone()[0] == 0:
             username = os.getenv("BOOTSTRAP_ADMIN_USER", "admin")
             password = os.getenv("BOOTSTRAP_ADMIN_PASSWORD", "change-me-on-first-deployment")
@@ -204,6 +222,7 @@ def initialize_mock_database(reset: bool = False) -> Path:
             vals = {
                 "PG_HOST": "localhost", "PG_PORT": "5432", "PG_DATABASE": "mock-demo",
                 "PG_USER": "demo", "PG_PASSWORD": "not-used-in-mock-mode", "PG_TABLE": "mock_sensor_readings",
+                "PG_COL_MACHINE_ID": "machine_id", "DEFAULT_MACHINE_ID": MACHINE_IDS[0],
                 "FRONTEND_ORIGIN": "http://localhost:5173",
             }
             c.executemany("INSERT INTO mock_env(key,value) VALUES(?,?)", vals.items())
@@ -221,14 +240,15 @@ def initialize_mock_database(reset: bool = False) -> Path:
                    VALUES(?,?,?,?,?,?,?,?)""",
                 ("mock-shadow-v2", "mock://artifacts/mock-shadow-v2", "mock-reference-v2", "shadow", json.dumps({"mode":"mock","passed":True,"note":"demo shadow model"}), now, None, None),
             )
-        if c.execute("SELECT count(*) FROM spindle_predictions").fetchone()[0] == 0:
-            start = _now() - timedelta(minutes=119)
-            for i in range(120):
-                row = _prediction(i, start + timedelta(minutes=i))
-                _insert_prediction(c, row, create_alert=(row["maintenance_level"] != "OK" and i % 3 == 0))
-            _live_index = 120
-        else:
-            _live_index = int(c.execute("SELECT count(*) FROM spindle_predictions").fetchone()[0])
+        start = _now() - timedelta(minutes=119)
+        for machine_id in MACHINE_IDS:
+            count = int(c.execute("SELECT count(*) FROM spindle_predictions WHERE machine_id=?", (machine_id,)).fetchone()[0])
+            if count == 0:
+                for i in range(120):
+                    row = _prediction(i, machine_id, start + timedelta(minutes=i))
+                    _insert_prediction(c, row, create_alert=(row["maintenance_level"] != "OK" and i % 3 == 0))
+                count = 120
+            _live_index[machine_id] = count
         c.commit()
         c.close()
         _load_threshold_cache()
@@ -275,8 +295,8 @@ class ThresholdBody(BaseModel):
     MAINTENANCE_HEALTH_INSPECT: float
 class EnvBody(BaseModel): values: dict[str, str]
 class UserCreate(BaseModel): username: str; password: str; role: str = "viewer"
-class RegressionBody(BaseModel): description: str; start: str; end: str; minimum_anomaly_risk: float = 0.6
-class BackfillBody(BaseModel): start: str; end: str; mode: str = "repredict"
+class RegressionBody(BaseModel): description: str; start: str; end: str; machine_id: str = "VVB001"; minimum_anomaly_risk: float = 0.6
+class BackfillBody(BaseModel): start: str; end: str; mode: str = "repredict"; machine_id: str | None = None
 class TrainingConfigBody(BaseModel):
     RETRAIN_BATCH_SIZE: float
     RETRAIN_TIME_CAP_DAYS: float
@@ -284,7 +304,7 @@ class TrainingConfigBody(BaseModel):
     REFERENCE_DEDUP_WINDOW_HOURS: float
     REFERENCE_COSINE_SIMILARITY: float
     AUTO_RETRAIN_ENABLED: bool = True
-class RecalibrateBody(BaseModel): hours: float = 24; min_rows: int = 200; source: str = "spec_bounds"
+class RecalibrateBody(BaseModel): hours: float = 24; min_rows: int = 200; source: str = "spec_bounds"; machine_id: str = "VVB001"
 RECALIBRATE_SOURCES = ("spec_bounds", "threshold")
 class CalibrationActivateBody(BaseModel): calibration_id: int | None = None
 
@@ -310,6 +330,16 @@ def logout(response: Response):
 @app.get("/api/me")
 def me(user: User = Depends(current_user)):
     return {**user.__dict__, "mock_mode": True}
+
+
+@app.get("/api/machines")
+def machines(user: User = Depends(current_user)):
+    c = _connect()
+    items = [r[0] for r in c.execute(
+        "SELECT machine_id FROM (SELECT DISTINCT machine_id FROM spindle_predictions UNION SELECT DISTINCT machine_id FROM alerts) ORDER BY machine_id"
+    ).fetchall() if r[0]]
+    c.close()
+    return {"items": items, "default": MACHINE_IDS[0]}
 
 
 @app.post("/api/users")
@@ -390,10 +420,10 @@ def set_training_config(body: TrainingConfigBody, admin: User = Depends(require_
 
 
 @app.get("/api/alerts")
-def alerts(status: str = "pending", trigger: str | None = None, limit: int = 50, offset: int = 0, user: User = Depends(current_user)):
+def alerts(status: str = "pending", trigger: str | None = None, machine_id: str = "VVB001", limit: int = 50, offset: int = 0, user: User = Depends(current_user)):
     limit = max(1, min(limit, 500)); offset = max(0, offset)
-    count_sql = "SELECT count(*) FROM alerts WHERE status=?"; count_args: list = [status]
-    sql = "SELECT * FROM alerts WHERE status=?"; args: list = [status]
+    count_sql = "SELECT count(*) FROM alerts WHERE status=? AND machine_id=?"; count_args: list = [status, machine_id]
+    sql = "SELECT * FROM alerts WHERE status=? AND machine_id=?"; args: list = [status, machine_id]
     if trigger:
         count_sql += " AND trigger=?"; count_args.append(trigger)
         sql += " AND trigger=?"; args.append(trigger)
@@ -418,10 +448,10 @@ def review(alert_id: int, body: ReviewBody, user: User = Depends(current_user)):
 
 @app.get("/api/alerts/{alert_id}/context")
 def alert_context(alert_id: int, hours: int = 3, user: User = Depends(current_user)):
-    c = _connect(); a = c.execute("SELECT tick_timestamp FROM alerts WHERE id=?", (alert_id,)).fetchone()
+    c = _connect(); a = c.execute("SELECT tick_timestamp,machine_id FROM alerts WHERE id=?", (alert_id,)).fetchone()
     if not a: c.close(); raise HTTPException(404, "Alert not found")
     center = datetime.fromisoformat(a["tick_timestamp"].replace("Z", "+00:00")); lo = _iso(center - timedelta(hours=hours)); hi = _iso(center + timedelta(hours=hours))
-    rows = [dict(r) for r in c.execute("SELECT tick_timestamp,health_state,anomaly_score,maintenance_level FROM spindle_predictions WHERE tick_timestamp BETWEEN ? AND ? ORDER BY tick_timestamp", (lo, hi)).fetchall()]
+    rows = [dict(r) for r in c.execute("SELECT tick_timestamp,health_state,anomaly_score,maintenance_level FROM spindle_predictions WHERE machine_id=? AND tick_timestamp BETWEEN ? AND ? ORDER BY tick_timestamp", (a["machine_id"], lo, hi)).fetchall()]
     c.close(); return rows
 
 
@@ -433,7 +463,7 @@ def regression_tests(user: User = Depends(current_user)):
 @app.post("/api/regression-tests")
 def add_regression(body: RegressionBody, admin: User = Depends(require_admin)):
     if not 0 <= body.minimum_anomaly_risk <= 1: raise HTTPException(400, "minimum_anomaly_risk must be in [0,1]")
-    c = _connect(); cur = c.execute("INSERT INTO regression_tests(description,start_ts,end_ts,minimum_anomaly_risk,created_at) VALUES(?,?,?,?,?)", (body.description, body.start, body.end, body.minimum_anomaly_risk, _iso(_now()))); c.commit(); rid = cur.lastrowid; c.close(); return {"id": rid}
+    c = _connect(); cur = c.execute("INSERT INTO regression_tests(machine_id,description,start_ts,end_ts,minimum_anomaly_risk,created_at) VALUES(?,?,?,?,?,?)", (body.machine_id, body.description, body.start, body.end, body.minimum_anomaly_risk, _iso(_now()))); c.commit(); rid = cur.lastrowid; c.close(); return {"id": rid}
 
 
 @app.post("/api/backfill")
@@ -487,6 +517,7 @@ def delete_model(version_id: str, admin: User = Depends(require_admin)):
     if not row: c.close(); raise HTTPException(404, "Model version not found")
     if row["status"] == "active":
         c.close(); raise HTTPException(400, "Cannot delete the active model version — promote a different version first.")
+    c.execute("DELETE FROM machine_model_calibrations WHERE version_id=?", (version_id,))
     c.execute("DELETE FROM model_calibrations WHERE version_id=?", (version_id,))
     c.execute("DELETE FROM model_versions WHERE version_id=?", (version_id,))
     c.commit(); c.close()
@@ -494,13 +525,13 @@ def delete_model(version_id: str, admin: User = Depends(require_admin)):
 
 
 @app.get("/api/models/{version_id}/calibrations")
-def list_calibrations(version_id: str, user: User = Depends(current_user)):
+def list_calibrations(version_id: str, machine_id: str = "VVB001", user: User = Depends(current_user)):
     c = _connect()
     rows = [dict(r) for r in c.execute(
-        "SELECT id,version_id,source_rows,source_description,created_at,created_by FROM model_calibrations WHERE version_id=? ORDER BY created_at DESC",
-        (version_id,),
+        "SELECT id,version_id,machine_id,source_rows,source_description,created_at,created_by FROM model_calibrations WHERE version_id=? AND machine_id=? ORDER BY created_at DESC",
+        (version_id,machine_id),
     ).fetchall()]
-    row = c.execute("SELECT active_calibration_id FROM model_versions WHERE version_id=?", (version_id,)).fetchone()
+    row = c.execute("SELECT calibration_id AS active_calibration_id FROM machine_model_calibrations WHERE version_id=? AND machine_id=?", (version_id,machine_id)).fetchone()
     c.close()
     return {"items": rows, "active_calibration_id": row["active_calibration_id"] if row else None}
 
@@ -522,7 +553,7 @@ def recalibrate_model(version_id: str, body: RecalibrateBody, admin: User = Depe
         # MAINTENANCE_HEALTH_INSPECT/FAILURE_HEALTH_THRESHOLD thresholds
         # rather than a fixed raw-sensor spec bound.
         all_rows = c.execute(
-            "SELECT anomaly_score, raw_reading FROM spindle_predictions WHERE tick_timestamp >= ? AND maintenance_level='OK'", (cutoff,)
+            "SELECT anomaly_score, raw_reading FROM spindle_predictions WHERE machine_id=? AND tick_timestamp >= ? AND maintenance_level='OK'", (body.machine_id, cutoff)
         ).fetchall()
         reason = "maintenance_level='OK' (runtime threshold)"
     else:
@@ -531,7 +562,7 @@ def recalibrate_model(version_id: str, body: RecalibrateBody, admin: User = Depe
         # recalibrate_service.py uses in real mode — independent of
         # maintenance_level.
         candidates = c.execute(
-            "SELECT anomaly_score, raw_reading FROM spindle_predictions WHERE tick_timestamp >= ?", (cutoff,)
+            "SELECT anomaly_score, raw_reading FROM spindle_predictions WHERE machine_id=? AND tick_timestamp >= ?", (body.machine_id, cutoff)
         ).fetchall()
         active_bounds = {col: bound for col, bound in config.SPEC_MAX.items() if bound is not None}
         all_rows = [r for r in candidates if all(json.loads(r["raw_reading"]).get(col, float("-inf")) <= bound for col, bound in active_bounds.items())]
@@ -555,12 +586,12 @@ def recalibrate_model(version_id: str, body: RecalibrateBody, admin: User = Depe
     calibration = {"baseline_mean": round(mean, 6), "baseline_std": round(std, 6), "mock_mode": True}
     now = _iso(_now())
     cur = c.execute(
-        "INSERT INTO model_calibrations(version_id,calibration,source_rows,source_description,created_at,created_by) VALUES(?,?,?,?,?,?)",
-        (version_id, json.dumps(calibration), len(all_rows), f"Mock live window, last {body.hours:g}h, {reason}", now, admin.username),
+        "INSERT INTO model_calibrations(version_id,machine_id,calibration,source_rows,source_description,created_at,created_by) VALUES(?,?,?,?,?,?,?)",
+        (version_id, body.machine_id, json.dumps(calibration), len(all_rows), f"Machine {body.machine_id}; mock live window, last {body.hours:g}h, {reason}", now, admin.username),
     )
     c.commit(); calibration_id = cur.lastrowid; c.close()
     return {
-        "calibration_id": calibration_id, "version_id": version_id, "created_at": now,
+        "calibration_id": calibration_id, "version_id": version_id, "machine_id": body.machine_id, "created_at": now,
         "rows_used": len(all_rows), "window_hours": body.hours, "source": body.source,
         "baseline_mean_before": None, "baseline_std_before": None,
         "baseline_mean_after": calibration["baseline_mean"], "baseline_std_after": calibration["baseline_std"],
@@ -569,27 +600,30 @@ def recalibrate_model(version_id: str, body: RecalibrateBody, admin: User = Depe
 
 
 @app.post("/api/models/{version_id}/calibration/activate")
-def activate_calibration(version_id: str, body: CalibrationActivateBody, admin: User = Depends(require_admin)):
+def activate_calibration(version_id: str, body: CalibrationActivateBody, machine_id: str = "VVB001", admin: User = Depends(require_admin)):
     c = _connect()
     row = c.execute("SELECT version_id FROM model_versions WHERE version_id=?", (version_id,)).fetchone()
     if not row: c.close(); raise HTTPException(404, "Model version not found")
     if body.calibration_id is not None:
-        cal = c.execute("SELECT id FROM model_calibrations WHERE id=? AND version_id=?", (body.calibration_id, version_id)).fetchone()
+        cal = c.execute("SELECT id FROM model_calibrations WHERE id=? AND version_id=? AND machine_id=?", (body.calibration_id, version_id, machine_id)).fetchone()
         if not cal:
             c.close(); raise HTTPException(400, f"Calibration {body.calibration_id} does not belong to model version {version_id}")
-    c.execute("UPDATE model_versions SET active_calibration_id=? WHERE version_id=?", (body.calibration_id, version_id))
+        c.execute("""INSERT INTO machine_model_calibrations(machine_id,version_id,calibration_id,updated_at) VALUES(?,?,?,?)
+                     ON CONFLICT(machine_id,version_id) DO UPDATE SET calibration_id=excluded.calibration_id,updated_at=excluded.updated_at""",
+                  (machine_id,version_id,body.calibration_id,_iso(_now())))
+    else:
+        c.execute("DELETE FROM machine_model_calibrations WHERE machine_id=? AND version_id=?",(machine_id,version_id))
     c.commit(); c.close()
-    return {"version_id": version_id, "active_calibration_id": body.calibration_id, "mock_mode": True}
+    return {"version_id": version_id, "machine_id": machine_id, "active_calibration_id": body.calibration_id, "mock_mode": True}
 
 
 @app.delete("/api/models/{version_id}/calibration/{calibration_id}")
-def delete_calibration(version_id: str, calibration_id: int, admin: User = Depends(require_admin)):
+def delete_calibration(version_id: str, calibration_id: int, machine_id: str = "VVB001", admin: User = Depends(require_admin)):
     c = _connect()
-    row = c.execute("SELECT active_calibration_id FROM model_versions WHERE version_id=?", (version_id,)).fetchone()
-    if not row: c.close(); raise HTTPException(404, "Model version not found")
-    if row["active_calibration_id"] == calibration_id:
+    row = c.execute("SELECT 1 FROM machine_model_calibrations WHERE machine_id=? AND version_id=? AND calibration_id=?", (machine_id,version_id,calibration_id)).fetchone()
+    if row:
         c.close(); raise HTTPException(400, "Cannot delete the calibration currently in use — activate a different one (or Normal) first.")
-    cur = c.execute("DELETE FROM model_calibrations WHERE id=? AND version_id=?", (calibration_id, version_id))
+    cur = c.execute("DELETE FROM model_calibrations WHERE id=? AND version_id=? AND machine_id=?", (calibration_id, version_id, machine_id))
     if cur.rowcount != 1:
         c.close(); raise HTTPException(400, f"Calibration {calibration_id} does not belong to model version {version_id}")
     c.commit(); c.close()
@@ -597,19 +631,19 @@ def delete_calibration(version_id: str, calibration_id: int, admin: User = Depen
 
 
 @app.get("/api/history")
-def history(limit: int = 50, offset: int = 0, level: str | None = None, user: User = Depends(current_user)):
+def history(limit: int = 50, offset: int = 0, level: str | None = None, machine_id: str = "VVB001", user: User = Depends(current_user)):
     limit = max(1, min(limit, 500)); offset = max(0, offset)
-    where = ""; args: list = []
+    where = " WHERE machine_id=?"; args: list = [machine_id]
     if level:
         if level not in ("OK", "WARN", "CRITICAL"): raise HTTPException(400, "level must be OK, WARN, or CRITICAL")
-        where = " WHERE maintenance_level=?"; args = [level]
+        where += " AND maintenance_level=?"; args.append(level)
     c = _connect()
     total = c.execute(f"SELECT count(*) FROM spindle_predictions{where}", args).fetchone()[0]
     rows = [_row_dict(r) for r in c.execute(f"SELECT * FROM spindle_predictions{where} ORDER BY tick_timestamp DESC LIMIT ? OFFSET ?", args + [limit, offset]).fetchall()]
     for row in rows:
         alert = c.execute(
-            "SELECT status, level, trigger, reviewed_by, reviewed_at FROM alerts WHERE tick_timestamp=? AND model_version=? ORDER BY id DESC LIMIT 1",
-            (row["tick_timestamp"], row["model_version"]),
+            "SELECT status, level, trigger, reviewed_by, reviewed_at FROM alerts WHERE machine_id=? AND tick_timestamp=? AND model_version=? ORDER BY id DESC LIMIT 1",
+            (row["machine_id"], row["tick_timestamp"], row["model_version"]),
         ).fetchone()
         row["alert_status"] = alert["status"] if alert else None
         row["alert_level"] = alert["level"] if alert else None
@@ -635,11 +669,11 @@ def history(limit: int = 50, offset: int = 0, level: str | None = None, user: Us
 
 
 @app.get("/api/near-miss")
-def near_miss(hours: int = 6, limit: int = 50, offset: int = 0, status: str = "pending", user: User = Depends(current_user)):
+def near_miss(hours: int = 6, limit: int = 50, offset: int = 0, status: str = "pending", machine_id: str = "VVB001", user: User = Depends(current_user)):
     if status not in ("pending", "acknowledged", "flagged"): raise HTTPException(400, "status must be pending, acknowledged, or flagged")
     limit = max(1, min(limit, 500)); offset = max(0, offset)
     c = _connect()
-    rows = [_row_dict(r) for r in c.execute("SELECT * FROM spindle_predictions WHERE maintenance_level='OK' AND anomaly_score BETWEEN 0.18 AND 0.60 ORDER BY anomaly_score DESC").fetchall()]
+    rows = [_row_dict(r) for r in c.execute("SELECT * FROM spindle_predictions WHERE machine_id=? AND maintenance_level='OK' AND anomaly_score BETWEEN 0.18 AND 0.60 ORDER BY anomaly_score DESC", (machine_id,)).fetchall()]
     out = []
     for row in rows:
         review = c.execute("SELECT status, reviewed_by, reviewed_at FROM near_miss_reviews WHERE prediction_id=?", (row["id"],)).fetchone()
@@ -657,7 +691,7 @@ def review_near_miss(prediction_id: int, body: ReviewBody, user: User = Depends(
     if body.decision not in ("acknowledged", "flagged"): raise HTTPException(400, "decision must be acknowledged or flagged")
     with _LOCK:
         c = _connect()
-        pred = c.execute("SELECT id, tick_timestamp, anomaly_score FROM spindle_predictions WHERE id=?", (prediction_id,)).fetchone()
+        pred = c.execute("SELECT id, machine_id, tick_timestamp, anomaly_score FROM spindle_predictions WHERE id=?", (prediction_id,)).fetchone()
         if not pred: c.close(); raise HTTPException(404, "Near-miss record not found")
         c.execute(
             """INSERT INTO near_miss_reviews(prediction_id,status,reviewed_by,reviewed_at)
@@ -679,8 +713,8 @@ def review_near_miss(prediction_id: int, body: ReviewBody, user: User = Depends(
             anomaly_score = pred["anomaly_score"]
             min_risk = max(0.05, min(0.95, float(anomaly_score) if anomaly_score is not None else 0.5))
             cur = c.execute(
-                "INSERT INTO regression_tests(description,start_ts,end_ts,minimum_anomaly_risk,created_at) VALUES(?,?,?,?,?)",
-                (f"Near-miss flagged by {user.username} on prediction #{prediction_id}", lo, hi, min_risk, _iso(_now())),
+                "INSERT INTO regression_tests(machine_id,description,start_ts,end_ts,minimum_anomaly_risk,created_at) VALUES(?,?,?,?,?,?)",
+                (pred["machine_id"], f"Near-miss flagged by {user.username} on prediction #{prediction_id}", lo, hi, min_risk, _iso(_now())),
             )
             regression_test_id = cur.lastrowid
         c.commit(); c.close()
@@ -690,15 +724,17 @@ def review_near_miss(prediction_id: int, body: ReviewBody, user: User = Depends(
 @app.websocket("/ws/live")
 async def live(ws: WebSocket):
     global _live_index
+    machine_id = ws.query_params.get("machine_id", MACHINE_IDS[0])
     await ws.accept()
     try:
         while True:
             await asyncio.sleep(1.0)
             with _LOCK:
-                row = _prediction(_live_index)
-                c = _connect(); _insert_prediction(c, row, create_alert=(row["maintenance_level"] != "OK" and _live_index % 3 == 0)); c.commit(); c.close(); _live_index += 1
+                index = _live_index.get(machine_id, 0)
+                row = _prediction(index, machine_id)
+                c = _connect(); _insert_prediction(c, row, create_alert=(row["maintenance_level"] != "OK" and index % 3 == 0)); c.commit(); c.close(); _live_index[machine_id] = index + 1
             payload = {
-                "timestamp": row["tick_timestamp"], "model_version": row["model_version"],
+                "machine_id": machine_id, "timestamp": row["tick_timestamp"], "model_version": row["model_version"],
                 "health_state": row["health_state"], "anomaly_score": row["anomaly_score"],
                 "maintenance": {"level": row["maintenance_level"], "reason": row["maintenance_reason"], "trigger": row["maintenance_trigger"]},
                 **row["raw_reading"], "mock_mode": True,

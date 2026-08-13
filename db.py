@@ -32,6 +32,8 @@ except ImportError:
     # some other way (shell export, systemd EnvironmentFile, etc).
     pass
 
+DEFAULT_MACHINE_ID = os.environ.get("DEFAULT_MACHINE_ID", "VVB001").strip() or "VVB001"
+
 
 def parse_args():
     """
@@ -104,6 +106,10 @@ def get_db_columns():
     swap only means editing config.RAW_SENSOR_COLS, not this function.
     """
     timestamp = os.environ.get(f"PG_COL_{config.COL_TIMESTAMP.upper()}", config.COL_TIMESTAMP)
+    # Optional for backwards compatibility with single-machine source tables.
+    # Set PG_COL_MACHINE_ID to the source column name to enable multi-machine
+    # polling. When it is unset, every row belongs to DEFAULT_MACHINE_ID.
+    machine_id = os.environ.get("PG_COL_MACHINE_ID", "").strip() or None
     sensor_cols = [
         os.environ.get(f"PG_COL_{col.upper()}", col) for col in config.RAW_SENSOR_COLS
     ]
@@ -113,33 +119,54 @@ def get_db_columns():
     by_config_name = dict(zip(config.RAW_SENSOR_COLS, sensor_cols))
     return {
         "timestamp": timestamp,
+        "machine_id": machine_id,
         "sensor_cols": sensor_cols,
         "by_config_name": by_config_name,
     }
 
 
+def row_machine_id(row, dbcols=None) -> str:
+    """Return a normalized machine ID for a source row."""
+    dbcols = dbcols or get_db_columns()
+    column = dbcols["machine_id"]
+    value = row.get(column) if column else DEFAULT_MACHINE_ID
+    value = str(value).strip() if value is not None else ""
+    return value or DEFAULT_MACHINE_ID
+
+
 def fetch_new_rows(conn, table: str, since=None, limit: int = 5000):
     """
-    Returns rows with timestamp > since (or all rows, if since is None),
-    ordered ascending by timestamp, as a list of dicts keyed by the
-    Postgres column names from get_db_columns().
+    Returns rows after `since` (or all rows when it is None), ordered by
+    timestamp and machine ID. Multi-machine sources use a composite
+    `(timestamp, machine_id)` cursor; legacy sources use a timestamp cursor.
 
     limit caps how many rows come back in one poll (protects against a
     huge backlog — e.g. after downtime — flooding memory in one go; the
     watermark just picks up where it left off on the next 60s poll).
     """
     dbcols = get_db_columns()
-    cols = [dbcols["timestamp"]] + dbcols["sensor_cols"]
+    cols = [dbcols["timestamp"]] + ([dbcols["machine_id"]] if dbcols["machine_id"] else []) + dbcols["sensor_cols"]
     col_ident = sql.SQL(", ").join(sql.Identifier(c) for c in cols)
     table_ident = sql.Identifier(table)
     ts_ident = sql.Identifier(dbcols["timestamp"])
 
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         if since is None:
-            query = sql.SQL("SELECT {cols} FROM {table} ORDER BY {ts} ASC LIMIT %s").format(
-                cols=col_ident, table=table_ident, ts=ts_ident
+            order = sql.SQL("{ts}, {machine}").format(ts=ts_ident, machine=sql.Identifier(dbcols["machine_id"])) if dbcols["machine_id"] else ts_ident
+            query = sql.SQL("SELECT {cols} FROM {table} ORDER BY {order} ASC LIMIT %s").format(
+                cols=col_ident, table=table_ident, order=order
             )
             cur.execute(query, (limit,))
+        elif dbcols["machine_id"]:
+            # Composite cursor prevents rows for a second machine at the same
+            # timestamp from being skipped when a poll is split by `limit`.
+            since_ts, since_machine = since
+            machine_ident = sql.Identifier(dbcols["machine_id"])
+            query = sql.SQL(
+                "SELECT {cols} FROM {table} WHERE ({ts}, {machine}) > (%s, %s) "
+                "ORDER BY {ts}, {machine} ASC LIMIT %s"
+            ).format(cols=col_ident, table=table_ident, ts=ts_ident, machine=machine_ident)
+            cur.execute(query, (since_ts, since_machine, limit))
         else:
             query = sql.SQL(
                 "SELECT {cols} FROM {table} WHERE {ts} > %s ORDER BY {ts} ASC LIMIT %s"
@@ -148,7 +175,7 @@ def fetch_new_rows(conn, table: str, since=None, limit: int = 5000):
         return cur.fetchall()
 
 
-def fetch_rows_between(conn, table: str, start, end, limit: int = 200000):
+def fetch_rows_between(conn, table: str, start, end, limit: int = 200000, machine_id: str | None = None):
     """
     Returns rows with start <= timestamp < end, ordered ascending, as a
     list of dicts keyed by the Postgres column names from
@@ -170,20 +197,30 @@ def fetch_rows_between(conn, table: str, start, end, limit: int = 200000):
     1 row/minute is still well under this.
     """
     dbcols = get_db_columns()
-    cols = [dbcols["timestamp"]] + dbcols["sensor_cols"]
+    cols = [dbcols["timestamp"]] + ([dbcols["machine_id"]] if dbcols["machine_id"] else []) + dbcols["sensor_cols"]
     col_ident = sql.SQL(", ").join(sql.Identifier(c) for c in cols)
     table_ident = sql.Identifier(table)
     ts_ident = sql.Identifier(dbcols["timestamp"])
 
-    query = sql.SQL(
-        "SELECT {cols} FROM {table} WHERE {ts} >= %s AND {ts} < %s ORDER BY {ts} ASC LIMIT %s"
-    ).format(cols=col_ident, table=table_ident, ts=ts_ident)
+    machine_column = dbcols["machine_id"]
+    if machine_id and machine_column:
+        query = sql.SQL(
+            "SELECT {cols} FROM {table} WHERE {ts} >= %s AND {ts} < %s AND {machine} = %s ORDER BY {ts} ASC LIMIT %s"
+        ).format(cols=col_ident, table=table_ident, ts=ts_ident, machine=sql.Identifier(machine_column))
+        args = (start, end, machine_id, limit)
+    elif machine_id and machine_id != DEFAULT_MACHINE_ID:
+        return []
+    else:
+        query = sql.SQL(
+            "SELECT {cols} FROM {table} WHERE {ts} >= %s AND {ts} < %s ORDER BY {ts} ASC LIMIT %s"
+        ).format(cols=col_ident, table=table_ident, ts=ts_ident)
+        args = (start, end, limit)
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute(query, (start, end, limit))
+        cur.execute(query, args)
         return cur.fetchall()
 
 
-def fetch_ok_prediction_timestamps(conn, start, end, limit: int = 200000):
+def fetch_ok_prediction_timestamps(conn, start, end, limit: int = 200000, machine_id: str = DEFAULT_MACHINE_ID):
     """
     Returns tick_timestamp values (ascending) from spindle_predictions
     where maintenance_level='OK', for start <= tick_timestamp < end.
@@ -203,8 +240,8 @@ def fetch_ok_prediction_timestamps(conn, start, end, limit: int = 200000):
     would corrupt the rolling window around every skipped row.
     """
     query = """SELECT tick_timestamp FROM spindle_predictions
-               WHERE tick_timestamp >= %s AND tick_timestamp < %s AND maintenance_level='OK'
+               WHERE tick_timestamp >= %s AND tick_timestamp < %s AND maintenance_level='OK' AND machine_id=%s
                ORDER BY tick_timestamp ASC LIMIT %s"""
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute(query, (start, end, limit))
+        cur.execute(query, (start, end, machine_id, limit))
         return [r["tick_timestamp"] for r in cur.fetchall()]

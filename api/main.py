@@ -32,6 +32,13 @@ scheduler=BackgroundScheduler(daemon=True)
 def conn(): return db.get_connection()
 
 
+def machine(value: str | None) -> str:
+    value = (value or db.DEFAULT_MACHINE_ID).strip()
+    if not value or len(value) > 128:
+        raise HTTPException(400, "machine_id must contain 1 to 128 characters")
+    return value
+
+
 def _bootstrap():
     c=conn(); db_schema.migrate(c)
     # api/main.py's own process never read persisted runtime_config back in
@@ -91,8 +98,9 @@ class RegressionBody(BaseModel):
     description:str
     start:str
     end:str
+    machine_id:str=db.DEFAULT_MACHINE_ID
     minimum_anomaly_risk:float=0.6
-class BackfillBody(BaseModel): start:str; end:str; mode:str="repredict"
+class BackfillBody(BaseModel): start:str; end:str; mode:str="repredict"; machine_id:str|None=None
 class TrainingConfigBody(BaseModel):
     RETRAIN_BATCH_SIZE: float
     RETRAIN_TIME_CAP_DAYS: float
@@ -100,7 +108,7 @@ class TrainingConfigBody(BaseModel):
     REFERENCE_DEDUP_WINDOW_HOURS: float
     REFERENCE_COSINE_SIMILARITY: float
     AUTO_RETRAIN_ENABLED: bool = True
-class RecalibrateBody(BaseModel): hours: float = 24; min_rows: int = 200; source: str = "spec_bounds"
+class RecalibrateBody(BaseModel): hours: float = 24; min_rows: int = 200; source: str = "spec_bounds"; machine_id: str = db.DEFAULT_MACHINE_ID
 class CalibrationActivateBody(BaseModel): calibration_id: int | None = None
 
 @app.post("/api/login")
@@ -120,6 +128,19 @@ def login(body:LoginBody,response:Response):
 def logout(response:Response): response.delete_cookie(COOKIE); return {"ok":True}
 @app.get("/api/me")
 def me(user:User=Depends(current_user)): return user.__dict__
+
+@app.get("/api/machines")
+def machines(user:User=Depends(current_user)):
+    c=conn()
+    with c.cursor() as cur:
+        cur.execute("""SELECT machine_id FROM (
+                         SELECT DISTINCT machine_id FROM spindle_predictions
+                         UNION SELECT DISTINCT machine_id FROM alerts
+                       ) machines ORDER BY machine_id""")
+        items=[row[0] for row in cur.fetchall() if row[0]]
+    c.close()
+    if db.DEFAULT_MACHINE_ID not in items: items.insert(0,db.DEFAULT_MACHINE_ID)
+    return {"items":items,"default":db.DEFAULT_MACHINE_ID}
 
 @app.post("/api/users")
 def create_user(body:UserCreate,admin:User=Depends(require_admin)):
@@ -184,9 +205,9 @@ def set_training_config(body:TrainingConfigBody,admin:User=Depends(require_admin
     c=conn(); runtime_config.save_to_db(c,values,admin.username); c.close(); return values
 
 @app.get("/api/alerts")
-def alerts(status:str="pending",trigger:str|None=None,limit:int=50,offset:int=0,user:User=Depends(current_user)):
+def alerts(status:str="pending",trigger:str|None=None,machine_id:str|None=None,limit:int=50,offset:int=0,user:User=Depends(current_user)):
     limit=max(1,min(limit,500)); offset=max(0,offset); c=conn()
-    where=["status=%s"]; args=[status]
+    where=["status=%s","machine_id=%s"]; args=[status,machine(machine_id)]
     if trigger: where.append("trigger=%s"); args.append(trigger)
     with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(f"SELECT count(*) AS total FROM alerts WHERE {' AND '.join(where)}",args); total=cur.fetchone()["total"]
@@ -209,13 +230,13 @@ def review(alert_id:int,body:ReviewBody,user:User=Depends(current_user)):
 def alert_context(alert_id:int,hours:int=3,user:User=Depends(current_user)):
     c=conn()
     with c.cursor() as cur:
-        cur.execute("SELECT tick_timestamp FROM alerts WHERE id=%s",(alert_id,)); row=cur.fetchone()
+        cur.execute("SELECT tick_timestamp,machine_id FROM alerts WHERE id=%s",(alert_id,)); row=cur.fetchone()
         if not row: c.close(); raise HTTPException(404,"Alert not found")
-        ts=row[0]
+        ts,machine_id=row
     with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute("""SELECT tick_timestamp,health_state,anomaly_score,maintenance_level FROM spindle_predictions
-                       WHERE tick_timestamp BETWEEN %s-(%s||' hours')::interval AND %s+(%s||' hours')::interval
-                       ORDER BY tick_timestamp""",(ts,hours,ts,hours)); rows=cur.fetchall()
+                       WHERE machine_id=%s AND tick_timestamp BETWEEN %s-(%s||' hours')::interval AND %s+(%s||' hours')::interval
+                       ORDER BY tick_timestamp""",(machine_id,ts,hours,ts,hours)); rows=cur.fetchall()
     c.close(); return rows
 
 @app.get("/api/regression-tests")
@@ -230,13 +251,13 @@ def add_regression(body:RegressionBody,admin:User=Depends(require_admin)):
     if not 0<=body.minimum_anomaly_risk<=1: raise HTTPException(400,"minimum_anomaly_risk must be in [0,1]")
     c=conn()
     with c.cursor() as cur:
-        cur.execute("INSERT INTO regression_tests(description,timestamp_range,minimum_anomaly_risk) VALUES(%s,tstzrange(%s,%s,'[]'),%s) RETURNING id",(body.description,body.start,body.end,body.minimum_anomaly_risk)); rid=cur.fetchone()[0]
+        cur.execute("INSERT INTO regression_tests(machine_id,description,timestamp_range,minimum_anomaly_risk) VALUES(%s,%s,tstzrange(%s,%s,'[]'),%s) RETURNING id",(machine(body.machine_id),body.description,body.start,body.end,body.minimum_anomaly_risk)); rid=cur.fetchone()[0]
     c.commit(); c.close(); return {"id":rid}
 
 @app.post("/api/backfill")
 def run_backfill(body:BackfillBody,admin:User=Depends(require_admin)):
     c=conn()
-    try: return backfill.run(c,body.start,body.end,body.mode)
+    try: return backfill.run(c,body.start,body.end,body.mode,machine(body.machine_id) if body.machine_id else None)
     except ValueError as e: raise HTTPException(400,str(e))
     finally: c.close()
 
@@ -273,12 +294,13 @@ def delete_model(version_id:str,admin:User=Depends(require_admin)):
     return {"deleted":version_id}
 
 @app.get("/api/models/{version_id}/calibrations")
-def list_calibrations(version_id:str,user:User=Depends(current_user)):
+def list_calibrations(version_id:str,machine_id:str|None=None,user:User=Depends(current_user)):
+    selected_machine=machine(machine_id)
     c=conn()
     with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute("SELECT id,version_id,source_rows,source_description,created_at,created_by FROM model_calibrations WHERE version_id=%s ORDER BY created_at DESC",(version_id,))
+        cur.execute("SELECT id,version_id,machine_id,source_rows,source_description,created_at,created_by FROM model_calibrations WHERE version_id=%s AND machine_id=%s ORDER BY created_at DESC",(version_id,selected_machine))
         rows=cur.fetchall()
-        cur.execute("SELECT active_calibration_id FROM model_versions WHERE version_id=%s",(version_id,))
+        cur.execute("SELECT calibration_id AS active_calibration_id FROM machine_model_calibrations WHERE version_id=%s AND machine_id=%s",(version_id,selected_machine))
         row=cur.fetchone()
         active_calibration_id=row["active_calibration_id"] if row else None
     c.close(); return {"items":rows,"active_calibration_id":active_calibration_id}
@@ -288,31 +310,34 @@ def recalibrate_model(version_id:str,body:RecalibrateBody,admin:User=Depends(req
     if body.min_rows<1: raise HTTPException(400,"min_rows must be >= 1")
     if body.source not in recalibrate_service.SOURCES: raise HTTPException(400,f"source must be one of {recalibrate_service.SOURCES}")
     c=conn()
-    try: return recalibrate_service.run(c,version_id,body.hours,body.min_rows,admin.username,source=body.source)
+    try: return recalibrate_service.run(c,version_id,body.hours,body.min_rows,admin.username,source=body.source,machine_id=machine(body.machine_id))
     except ValueError as e: raise HTTPException(400,str(e))
     finally: c.close()
 @app.post("/api/models/{version_id}/calibration/activate")
-def activate_calibration(version_id:str,body:CalibrationActivateBody,admin:User=Depends(require_admin)):
+def activate_calibration(version_id:str,body:CalibrationActivateBody,machine_id:str|None=None,admin:User=Depends(require_admin)):
+    selected_machine=machine(machine_id)
     c=conn()
-    try: model_registry.set_calibration(c,version_id,body.calibration_id)
+    try: model_registry.set_calibration(c,version_id,body.calibration_id,selected_machine)
     except ValueError as e: raise HTTPException(400,str(e))
     finally: c.close()
-    return {"version_id":version_id,"active_calibration_id":body.calibration_id}
+    return {"version_id":version_id,"machine_id":selected_machine,"active_calibration_id":body.calibration_id}
 @app.delete("/api/models/{version_id}/calibration/{calibration_id}")
-def delete_calibration(version_id:str,calibration_id:int,admin:User=Depends(require_admin)):
+def delete_calibration(version_id:str,calibration_id:int,machine_id:str|None=None,admin:User=Depends(require_admin)):
+    selected_machine=machine(machine_id)
     c=conn()
-    try: model_registry.delete_calibration(c,version_id,calibration_id)
+    try: model_registry.delete_calibration(c,version_id,calibration_id,selected_machine)
     except ValueError as e: raise HTTPException(400,str(e))
     finally: c.close()
     return {"deleted":calibration_id}
 
 @app.get("/api/history")
-def history(limit:int=50,offset:int=0,level:str|None=None,user:User=Depends(current_user)):
+def history(limit:int=50,offset:int=0,level:str|None=None,machine_id:str|None=None,user:User=Depends(current_user)):
     limit=max(1,min(limit,500)); offset=max(0,offset)
-    where=""; args:list=[]
+    selected_machine=machine(machine_id); conditions=["p.machine_id=%s"]; args:list=[selected_machine]
     if level:
         if level not in ("OK","WARN","CRITICAL"): raise HTTPException(400,"level must be OK, WARN, or CRITICAL")
-        where="WHERE p.maintenance_level=%s"; args=[level]
+        conditions.append("p.maintenance_level=%s"); args.append(level)
+    where="WHERE "+" AND ".join(conditions)
     # near-miss eligibility window, same "row count" convention /api/near-miss
     # uses for its regr_slope() window (see that endpoint for why hours*60).
     nm_window=max(2,6*60)
@@ -325,6 +350,7 @@ def history(limit:int=50,offset:int=0,level:str|None=None,user:User=Depends(curr
                    regr_slope(anomaly_score, extract(epoch from tick_timestamp))
                      OVER (ORDER BY tick_timestamp ROWS BETWEEN %s PRECEDING AND CURRENT ROW) AS slope
             FROM spindle_predictions
+            WHERE machine_id=%s
           )
           SELECT p.*,
                  a.status AS alert_status, a.level AS alert_level, a.trigger AS alert_trigger,
@@ -345,30 +371,31 @@ def history(limit:int=50,offset:int=0,level:str|None=None,user:User=Depends(curr
           JOIN nm ON nm.id=p.id
           LEFT JOIN LATERAL (
             SELECT status, level, trigger, reviewed_by, reviewed_at FROM alerts a
-            WHERE a.tick_timestamp=p.tick_timestamp AND a.model_version=p.model_version
+            WHERE a.machine_id=p.machine_id AND a.tick_timestamp=p.tick_timestamp AND a.model_version=p.model_version
             ORDER BY a.id DESC LIMIT 1
           ) a ON true
           LEFT JOIN near_miss_reviews nmr ON nmr.prediction_id=p.id
           {where}
-          ORDER BY p.tick_timestamp DESC LIMIT %s OFFSET %s""",[nm_window]+args+[limit,offset]); rows=cur.fetchall()
+          ORDER BY p.tick_timestamp DESC LIMIT %s OFFSET %s""",[nm_window,selected_machine]+args+[limit,offset]); rows=cur.fetchall()
     c.close(); return {"items":rows,"total":total,"limit":limit,"offset":offset}
 
 @app.get("/api/near-miss")
-def near_miss(hours:int=6,limit:int=50,offset:int=0,status:str="pending",user:User=Depends(current_user)):
+def near_miss(hours:int=6,limit:int=50,offset:int=0,status:str="pending",machine_id:str|None=None,user:User=Depends(current_user)):
     if status not in ("pending","acknowledged","flagged"): raise HTTPException(400,"status must be pending, acknowledged, or flagged")
     limit=max(1,min(limit,500)); offset=max(0,offset); window=max(2,hours*60)
+    selected_machine=machine(machine_id)
     base_cte="""WITH x AS (
-          SELECT id, tick_timestamp, model_version, anomaly_score, health_state, maintenance_level, raw_reading,
+          SELECT id, machine_id, tick_timestamp, model_version, anomaly_score, health_state, maintenance_level, raw_reading,
                  regr_slope(anomaly_score, extract(epoch from tick_timestamp)) OVER (ORDER BY tick_timestamp ROWS BETWEEN %s PRECEDING AND CURRENT ROW) slope
-          FROM spindle_predictions)
+          FROM spindle_predictions WHERE machine_id=%s)
           SELECT x.*, COALESCE(nmr.status,'pending') AS review_status, nmr.reviewed_by, nmr.reviewed_at
           FROM x LEFT JOIN near_miss_reviews nmr ON nmr.prediction_id=x.id
           WHERE x.maintenance_level='OK' AND x.slope IS NOT NULL AND x.slope < 0
             AND COALESCE(nmr.status,'pending')=%s"""
     c=conn()
     with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute(f"SELECT count(*) AS total FROM ({base_cte}) t",(window,status)); total=cur.fetchone()["total"]
-        cur.execute(base_cte+" ORDER BY x.health_state ASC LIMIT %s OFFSET %s",(window,status,limit,offset)); rows=cur.fetchall()
+        cur.execute(f"SELECT count(*) AS total FROM ({base_cte}) t",(window,selected_machine,status)); total=cur.fetchone()["total"]
+        cur.execute(base_cte+" ORDER BY x.health_state ASC LIMIT %s OFFSET %s",(window,selected_machine,status,limit,offset)); rows=cur.fetchall()
     c.close(); return {"items":rows,"total":total,"limit":limit,"offset":offset}
 
 @app.post("/api/near-miss/{prediction_id}/review")
@@ -376,7 +403,7 @@ def review_near_miss(prediction_id:int,body:ReviewBody,user:User=Depends(current
     if body.decision not in ("acknowledged","flagged"): raise HTTPException(400,"decision must be acknowledged or flagged")
     c=conn()
     with c.cursor() as cur:
-        cur.execute("SELECT id, tick_timestamp, anomaly_score FROM spindle_predictions WHERE id=%s",(prediction_id,)); row=cur.fetchone()
+        cur.execute("SELECT id, machine_id, tick_timestamp, anomaly_score FROM spindle_predictions WHERE id=%s",(prediction_id,)); row=cur.fetchone()
         if not row: c.rollback(); c.close(); raise HTTPException(404,"Near-miss record not found")
         cur.execute("""INSERT INTO near_miss_reviews(prediction_id,status,reviewed_by,reviewed_at)
                        VALUES(%s,%s,%s,now())
@@ -393,18 +420,19 @@ def review_near_miss(prediction_id:int,body:ReviewBody,user:User=Depends(current
         # much risk in this time window, or promotion is blocked.
         regression_test_id=None
         if body.decision=="flagged":
-            _, tick_ts, anomaly_score=row
+            _, machine_id, tick_ts, anomaly_score=row
             hours=float(runtime_config.get("NEAR_MISS_REGRESSION_WINDOW_HOURS",1))
             min_risk=max(0.05,min(0.95,float(anomaly_score) if anomaly_score is not None else 0.5))
-            cur.execute("""INSERT INTO regression_tests(description,timestamp_range,minimum_anomaly_risk)
-                           VALUES(%s,tstzrange(%s-(%s||' hours')::interval,%s+(%s||' hours')::interval,'[]'),%s)
+            cur.execute("""INSERT INTO regression_tests(machine_id,description,timestamp_range,minimum_anomaly_risk)
+                           VALUES(%s,%s,tstzrange(%s-(%s||' hours')::interval,%s+(%s||' hours')::interval,'[]'),%s)
                            RETURNING id""",
-                        (f"Near-miss flagged by {user.username} on prediction #{prediction_id}",tick_ts,hours,tick_ts,hours,min_risk))
+                        (machine_id,f"Near-miss flagged by {user.username} on prediction #{prediction_id}",tick_ts,hours,tick_ts,hours,min_risk))
             regression_test_id=cur.fetchone()[0]
     c.commit(); c.close(); return {"prediction_id":prediction_id,"status":body.decision,"regression_test_id":regression_test_id}
 
 @app.websocket("/ws/live")
 async def live(ws:WebSocket):
+    selected_machine=machine(ws.query_params.get("machine_id"))
     await ws.accept(); c=conn(); c.set_isolation_level(0)
     with c.cursor() as cur: cur.execute("LISTEN prediction_tick")
     try:
@@ -413,6 +441,9 @@ async def live(ws:WebSocket):
             if select.select([c],[],[],0)[0]:
                 c.poll()
                 while c.notifies:
-                    note=c.notifies.pop(0); await ws.send_text(note.payload)
+                    note=c.notifies.pop(0)
+                    payload=json.loads(note.payload)
+                    if payload.get("machine_id")==selected_machine:
+                        await ws.send_text(note.payload)
     except WebSocketDisconnect: pass
     finally: c.close()

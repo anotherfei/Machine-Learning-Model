@@ -5,6 +5,7 @@ import './styles.css';
 type Page = 'Dashboard' | 'Status Review' | 'Models' | 'History' | 'Environment' | 'Thresholds';
 type User = { username: string; role: string; mock_mode?: boolean };
 type LiveTick = {
+  machine_id: string;
   timestamp?: string;
   health_state: number;
   anomaly_score: number;
@@ -122,7 +123,7 @@ function Login({ done, apiError }: { done: () => void; apiError?: string }) {
     <section className="login-brand-panel">
       <div className="wordmark">AKEBONO</div>
       <div className="login-visual"><div className="orb one"/><div className="orb two"/><div className="signal-line"><span/><span/><span/><span/><span/></div></div>
-      <div><p className="eyebrow light">VVB001 · CONDITION INTELLIGENCE</p><h1>Know the spindle<br/>before it stops.</h1><p className="login-copy">Continuous vibration, temperature, anomaly, and maintenance-state visibility in one operator console.</p></div>
+      <div><p className="eyebrow light">FLEET CONDITION INTELLIGENCE</p><h1>Know the spindle<br/>before it stops.</h1><p className="login-copy">Continuous vibration, temperature, anomaly, and maintenance-state visibility in one operator console.</p></div>
       <div className="login-foot">Industrial monitoring · Human-reviewed decisions</div>
     </section>
     <section className="login-form-panel"><form onSubmit={async ev=>{ev.preventDefault();setBusy(true);setE('');try{await api('/api/login',{method:'POST',body:JSON.stringify({username:u,password:p})});done();}catch(err:any){setE(err?.name==='AbortError'?'API request timed out. Check the backend terminal.':String(err?.message||err));}finally{setBusy(false);}}}>
@@ -141,8 +142,11 @@ function Notice({ children, tone: t='neutral' }: { children:ReactNode; tone?:str
 
 function App(){
   const [me,setMe]=useState<User|false|undefined>(); const [apiError,setApiError]=useState<string>(); const [page,setPage]=useState<Page>('Dashboard'); const [collapsed,setCollapsed]=useState(false);
+  const [machines,setMachines]=useState<string[]>(['VVB001']); const [machineId,setMachineId]=useState(localStorage.getItem('machine_id')||'VVB001');
   const refreshMe=()=>api('/api/me',{},5000).then((x:User)=>{setMe(x);setApiError(undefined)}).catch((err:any)=>{setMe(false);if(err?.name==='AbortError')setApiError('API timed out on /api/me');else if(!String(err?.message||'').includes('401'))setApiError(String(err?.message||err));});
   useEffect(()=>{refreshMe()},[]);
+  useEffect(()=>{if(me)api('/api/machines').then((r:{items:string[];default:string})=>{const items=r.items.length?r.items:[r.default];setMachines(items);setMachineId(current=>items.includes(current)?current:(r.default||items[0]))}).catch(()=>{})},[me]);
+  useEffect(()=>{localStorage.setItem('machine_id',machineId)},[machineId]);
   if(me===undefined)return <main className="center-screen"><section className="state-panel"><div className="spinner"/><p className="eyebrow">INITIALIZING CONSOLE</p><h1>Connecting to the local API</h1><p className="muted">If this takes more than a few seconds, check <code>localhost:8000/docs</code>.</p></section></main>;
   if(!me)return <Login done={refreshMe} apiError={apiError}/>;
   const nav:Array<{page:Page;icon:string;label:string}>=[
@@ -150,7 +154,7 @@ function App(){
   ];
   return <div className={cn('app-shell',collapsed&&'nav-collapsed')}>
     <aside className="sidebar">
-      <div className="brand-lockup"><div className="brand-symbol"><span/></div><div className="brand-copy"><small>AKEBONO</small><strong>Spindle Monitor</strong><span>VVB001</span></div></div>
+      <div className="brand-lockup"><div className="brand-symbol"><span/></div><div className="brand-copy"><small>AKEBONO</small><strong>Spindle Monitor</strong><span>{machineId}</span></div></div>
       <button className="collapse-btn" onClick={()=>setCollapsed(v=>!v)} title={collapsed?'Expand navigation':'Collapse navigation'}><Icon name="chevron"/></button>
       <nav>{nav.map(n=><button key={n.page} className={cn('nav-item',page===n.page&&'active')} onClick={()=>setPage(n.page)} title={n.label}><Icon name={n.icon}/><span>{n.label}</span>{page===n.page&&<i/>}</button>)}</nav>
       <div className="sidebar-bottom">
@@ -159,8 +163,8 @@ function App(){
       </div>
     </aside>
     <main className="workspace">
-      <header className="topbar"><div><p className="breadcrumb">VVB001 <span>/</span> {page}</p></div><div className="topbar-meta"><span className="system-pill"><span className="pulse-dot"/>System online</span><span className="clock">{new Date().toLocaleDateString([], {weekday:'short',month:'short',day:'numeric'})}</span></div></header>
-      <div className="content"><PageView page={page} role={me.role} mock={!!me.mock_mode}/></div>
+      <header className="topbar"><div><p className="breadcrumb">{machineId} <span>/</span> {page}</p></div><div className="topbar-meta"><Select value={machineId} onChange={setMachineId} options={machines.map(id=>[id,id] as [string,string])}/><span className="system-pill"><span className="pulse-dot"/>System online</span><span className="clock">{new Date().toLocaleDateString([], {weekday:'short',month:'short',day:'numeric'})}</span></div></header>
+      <div className="content"><PageView key={machineId} page={page} role={me.role} mock={!!me.mock_mode} machineId={machineId}/></div>
     </main>
   </div>
 }
@@ -169,11 +173,11 @@ function PageHeader({ eyebrow, title, description, actions }: { eyebrow:string;t
   return <div className="page-header"><div><p className="eyebrow">{eyebrow}</p><h1>{title}</h1><p>{description}</p></div>{actions&&<div className="page-actions">{actions}</div>}</div>
 }
 
-function PageView({page,role,mock}:{page:Page;role:string;mock:boolean}){
-  if(page==='Dashboard')return <Dashboard mock={mock}/>;
-  if(page==='Status Review')return <StatusReview/>;
-  if(page==='Models')return <Models admin={role==='admin'}/>;
-  if(page==='History')return <HistoryPage/>;
+function PageView({page,role,mock,machineId}:{page:Page;role:string;mock:boolean;machineId:string}){
+  if(page==='Dashboard')return <Dashboard mock={mock} machineId={machineId}/>;
+  if(page==='Status Review')return <StatusReview machineId={machineId}/>;
+  if(page==='Models')return <Models admin={role==='admin'} machineId={machineId}/>;
+  if(page==='History')return <HistoryPage machineId={machineId}/>;
   if(page==='Thresholds')return <Thresholds admin={role==='admin'}/>;
   return <Environment/>;
 }
@@ -185,9 +189,9 @@ function Sparkline({values, inverse=false}:{values:number[];inverse?:boolean}){
   return <svg className={cn('sparkline',inverse&&'inverse')} viewBox="0 0 200 54" preserveAspectRatio="none"><polyline points={pts}/></svg>
 }
 
-function Dashboard({mock}:{mock:boolean}){
+function Dashboard({mock,machineId}:{mock:boolean;machineId:string}){
   const [live,setLive]=useState<LiveTick>(); const [history,setHistory]=useState<LiveTick[]>([]); const [wsState,setWsState]=useState<'connecting'|'live'|'offline'>('connecting'); const [detail,setDetail]=useState<string|null>(null); const [menu,setMenu]=useState(false);
-  useEffect(()=>{const proto=location.protocol==='https:'?'wss':'ws';const ws=new WebSocket(`${proto}://${location.host}/ws/live`);ws.onopen=()=>setWsState('live');ws.onmessage=e=>{const row=JSON.parse(e.data);setLive(row);setHistory(h=>[...h.slice(-39),row]);setWsState('live')};ws.onerror=()=>setWsState('offline');ws.onclose=()=>setWsState('offline');return()=>ws.close()},[]);
+  useEffect(()=>{setLive(undefined);setHistory([]);setWsState('connecting');const proto=location.protocol==='https:'?'wss':'ws';const ws=new WebSocket(`${proto}://${location.host}/ws/live?machine_id=${encodeURIComponent(machineId)}`);ws.onopen=()=>setWsState('live');ws.onmessage=e=>{const row=JSON.parse(e.data);setLive(row);setHistory(h=>[...h.slice(-39),row]);setWsState('live')};ws.onerror=()=>setWsState('offline');ws.onclose=()=>setWsState('offline');return()=>ws.close()},[machineId]);
   const level=live?.maintenance?.level||'WAITING'; const health=Number(live?.health_state||0); const anomaly=Number(live?.anomaly_score||0);
   const sensors=Object.keys(SENSOR_META).map(k=>({key:k,value:(live as any)?.[k],...SENSOR_META[k]}));
   return <>
@@ -195,7 +199,7 @@ function Dashboard({mock}:{mock:boolean}){
     {mock&&<div className="demo-ribbon"><span>DEMO</span><p>Temporary synthetic signal is driving this interface. ML inference and plant PostgreSQL are bypassed.</p><button onClick={()=>setDetail('demo')}>What is simulated?</button></div>}
     <section className={cn('status-board',`tone-${tone(level)}`)}>
       <div className="status-main">
-        <div className="status-kicker"><span className="machine-dot"/>VVB001 · SPINDLE CONDITION</div>
+        <div className="status-kicker"><span className="machine-dot"/>{machineId} · SPINDLE CONDITION</div>
         <div className="status-line"><div><span className="status-label">Current state</span><h2>{level}</h2></div><button className="text-button" onClick={()=>setDetail('status')}><Icon name="info"/>Why this status?</button></div>
         <p className="status-reason">{live?.maintenance?.reason||'Waiting for the first monitoring tick from the backend.'}</p>
         <div className="health-row"><div><span>Health state</span><strong>{live?fmt(health,1):'—'}<small>%</small></strong></div><div className="health-track"><i style={{width:`${Math.max(0,Math.min(100,health))}%`}}/></div><span className="health-caption">0 critical <b>·</b> 100 healthy</span></div>
@@ -219,7 +223,7 @@ function DashboardModal({kind,live,onClose}:{kind:string;live?:LiveTick;onClose:
   if(kind==='status'){title='Maintenance status evidence';body=<div className="detail-list"><DetailRow label="State" value={live?.maintenance?.level||'—'} badge={tone(live?.maintenance?.level)}/><DetailRow label="Trigger" value={triggerLabel(live?.maintenance?.trigger)}/><DetailRow label="Reason" value={live?.maintenance?.reason||'No reason received.'}/><DetailRow label="Health" value={`${fmt(live?.health_state,2)}%`}/><DetailRow label="Anomaly score" value={fmt(live?.anomaly_score,4)}/></div>}
   else if(kind==='anomaly'){title='How to read anomaly score';body=<><p>The anomaly score summarizes how unusual the current feature pattern is relative to the active model reference. The frontend only displays this value; it does not calculate or modify it.</p><div className="scale"><span>Lower deviation</span><i/><span>Higher deviation</span></div><p className="muted">Current score: <b>{fmt(live?.anomaly_score,4)}</b></p></>}
   else if(kind==='model'||kind==='system'){title=kind==='model'?'Active model context':'Runtime context';body=<div className="detail-list"><DetailRow label="Model version" value={live?.model_version||'—'}/><DetailRow label="Latest tick" value={shortTime(live?.timestamp)}/><DetailRow label="Data path" value="Backend → WebSocket → browser"/><DetailRow label="Frontend role" value="Visualization only"/></div>}
-  else if(kind==='demo'){title='Temporary mock mode';body=<><p>This session is driven by a local SQLite demo database and synthetic VVB001 ticks so the web experience can be tested without plant infrastructure.</p><div className="callout-grid"><div><b>Simulated</b><span>Sensor values, predictions, alerts, model metadata</span></div><div><b>Real application path</b><span>Authentication, API calls, review actions, WebSocket UI flow</span></div><div><b>Bypassed</b><span>Plant PostgreSQL and production ML inference worker</span></div></div></>}
+  else if(kind==='demo'){title='Temporary mock mode';body=<><p>This session is driven by a local SQLite demo database and synthetic multi-machine ticks so the web experience can be tested without plant infrastructure.</p><div className="callout-grid"><div><b>Simulated</b><span>Sensor values, predictions, alerts, model metadata</span></div><div><b>Real application path</b><span>Authentication, API calls, review actions, WebSocket UI flow</span></div><div><b>Bypassed</b><span>Plant PostgreSQL and production ML inference worker</span></div></div></>}
   else if(kind==='sensors'){title='Sensor channel guide';body=<div className="detail-list">{Object.entries(SENSOR_META).map(([k,m])=><DetailRow key={k} label={`${m.label} (${k})`} value={`${m.detail}${m.unit?` Unit: ${m.unit}.`:''}`}/>)}</div>}
   else if(kind.startsWith('sensor:')){const k=kind.split(':')[1],m=SENSOR_META[k];title=m?.label||k;body=<div className="detail-list"><DetailRow label="Raw key" value={k}/><DetailRow label="Current value" value={`${fmt((live as any)?.[k],3)} ${m?.unit||''}`}/><DetailRow label="Meaning" value={m?.detail||'Sensor channel'}/><DetailRow label="Source" value="Backend live tick"/></div>}
   return <Modal title={title} onClose={onClose}>{body}</Modal>
@@ -233,18 +237,18 @@ function Modal({title,onClose,children,wide=false}:{title:string;onClose:()=>voi
   return <div className="modal-backdrop" onMouseDown={e=>{if(e.target===e.currentTarget)onClose()}}><section className={cn('modal',wide&&'modal-wide')}><header><div><p className="eyebrow">DETAIL VIEW</p><h2>{title}</h2></div><button className="icon-button" onClick={onClose}><Icon name="close"/></button></header><div className="modal-body">{children}</div></section></div>
 }
 
-function StatusReview(){
+function StatusReview({machineId}:{machineId:string}){
   const [tab,setTab]=useState<'alert'|'near'>('alert');
   return <>
     <PageHeader eyebrow="HUMAN REVIEW" title="Status review" description="Confirm maintenance alerts and healthy-state near-misses that need a human decision, in one place." actions={<div className="tab-switch"><button className={cn('tab-btn',tab==='alert'&&'active')} onClick={()=>setTab('alert')}>Alert review</button><button className={cn('tab-btn',tab==='near'&&'active')} onClick={()=>setTab('near')}>Near miss</button></div>}/>
-    {tab==='alert'?<AlertPanel/>:<NearMissPanel/>}
+    {tab==='alert'?<AlertPanel machineId={machineId}/>:<NearMissPanel machineId={machineId}/>}
   </>
 }
 
-function AlertPanel(){
+function AlertPanel({machineId}:{machineId:string}){
   const [rows,setRows]=useState<any[]>([]),[total,setTotal]=useState(0),[error,setError]=useState(''),[status,setStatus]=useState('pending'),[trigger,setTrigger]=useState(''),[selected,setSelected]=useState<any|null>(null),[context,setContext]=useState<any[]>([]),[busy,setBusy]=useState(false);
   const {page,setPage,pageSize,setPageSize,offset}=usePagination(25);
-  const load=()=>api(`/api/alerts?status=${encodeURIComponent(status)}${trigger?`&trigger=${encodeURIComponent(trigger)}`:''}&limit=${pageSize}&offset=${offset}`).then((r:Paged<any>)=>{setRows(r.items);setTotal(r.total)}).catch(e=>setError(String(e.message||e)));
+  const load=()=>api(`/api/alerts?machine_id=${encodeURIComponent(machineId)}&status=${encodeURIComponent(status)}${trigger?`&trigger=${encodeURIComponent(trigger)}`:''}&limit=${pageSize}&offset=${offset}`).then((r:Paged<any>)=>{setRows(r.items);setTotal(r.total)}).catch(e=>setError(String(e.message||e)));
   useEffect(()=>{load()},[status,trigger,pageSize,offset]);
   useEffect(()=>{setPage(1)},[status,trigger]);
   const inspect=async(a:any)=>{setSelected(a);setContext([]);try{setContext(await api(`/api/alerts/${a.id}/context?hours=3`))}catch{setContext([])}};
@@ -258,10 +262,10 @@ function AlertPanel(){
   </>
 }
 
-function NearMissPanel(){
+function NearMissPanel({machineId}:{machineId:string}){
   const [rows,setRows]=useState<any[]>([]),[total,setTotal]=useState(0),[error,setError]=useState(''),[reviewStatus,setReviewStatus]=useState('pending'),[selected,setSelected]=useState<any|null>(null),[busy,setBusy]=useState(false),[actionError,setActionError]=useState('');
   const {page,setPage,pageSize,setPageSize,offset}=usePagination(25);
-  const load=()=>api(`/api/near-miss?status=${encodeURIComponent(reviewStatus)}&limit=${pageSize}&offset=${offset}`).then((r:Paged<any>)=>{setRows(r.items);setTotal(r.total)}).catch(e=>setError(String(e.message||e)));
+  const load=()=>api(`/api/near-miss?machine_id=${encodeURIComponent(machineId)}&status=${encodeURIComponent(reviewStatus)}&limit=${pageSize}&offset=${offset}`).then((r:Paged<any>)=>{setRows(r.items);setTotal(r.total)}).catch(e=>setError(String(e.message||e)));
   useEffect(()=>{load()},[reviewStatus,pageSize,offset]);
   useEffect(()=>{setPage(1)},[reviewStatus]);
   const decide=async(decision:string)=>{
@@ -306,7 +310,7 @@ function MiniContextChart({rows}:{rows:any[]}){const values=rows.map(r=>Number(r
 function JsonGrid({value}:{value:any}){const obj=typeof value==='object'&&value?value:{};return <div className="json-grid">{Object.entries(obj).map(([k,v])=><div key={k}><span>{SENSOR_META[k]?.label||k}</span><strong>{String(v)}</strong></div>)}</div>}
 function Disclosure({title,children,defaultOpen=false}:{title:string;children:ReactNode;defaultOpen?:boolean}){const[o,setO]=useState(defaultOpen);return <div className={cn('disclosure',o&&'open')}><button onClick={()=>setO(v=>!v)}><span>{title}</span><Icon name="chevron"/></button>{o&&<div className="disclosure-body">{children}</div>}</div>}
 
-function Models({admin}:{admin:boolean}){
+function Models({admin,machineId}:{admin:boolean;machineId:string}){
   const [rows,setRows]=useState<any[]>([]),[error,setError]=useState(''),[selected,setSelected]=useState<any|null>(null),[retrain,setRetrain]=useState<any>(),[panel,setPanel]=useState<'training'|'calibration'|null>(null);
   const load=()=>Promise.all([api('/api/models'),api('/api/retrain/status')]).then(([m,s])=>{setRows(m);setRetrain(s)}).catch(e=>setError(String(e.message||e)));useEffect(()=>{load()},[]);
   const activeVersion=rows.find(r=>r.status==='active');
@@ -316,7 +320,7 @@ function Models({admin}:{admin:boolean}){
   <section className="data-surface">{rows.length===0?<Empty title="No model versions" text="No registered model bundles were returned by the backend."/>:<div className="responsive-table"><table><thead><tr><th>Version</th><th>Status</th><th>Created</th><th>Validation</th><th>Promoted by</th><th/></tr></thead><tbody>{rows.map(m=><tr key={m.version_id} onClick={()=>setSelected(m)}><td><strong>{m.version_id}</strong><small>{m.reference_signature||'No reference signature'}</small></td><td><StatusBadge value={m.status}/></td><td>{shortTime(m.created_at)}</td><td><span className={cn('validation-dot',m.validation_report?.passed===false&&'bad')}/>{m.validation_report?.passed===false?'Failed':'Passed / available'}</td><td>{m.promoted_by||'—'}</td><td><Icon name="chevron"/></td></tr>)}</tbody></table></div>}</section>
   {selected&&<Modal title={selected.__retrain?'Retraining schedule':selected.version_id} onClose={()=>setSelected(null)} wide={!selected.__retrain}>{selected.__retrain?<div className="detail-list"><DetailRow label="Confirmed-normal candidates" value={selected.candidate_count??0}/><DetailRow label="Batch threshold" value={selected.batch_size??'—'}/><DetailRow label="Currently due" value={selected.due?'Yes':'No'}/><p className="muted">The backend owns the retraining decision. This popup only exposes the current scheduler state.</p></div>:<><div className="split-detail"><div className="detail-list"><DetailRow label="Status" value={selected.status} badge={tone(selected.status)}/><DetailRow label="Artifact path" value={selected.artifact_path||'—'}/><DetailRow label="Reference signature" value={selected.reference_signature||'—'}/><DetailRow label="Created" value={shortTime(selected.created_at)}/><DetailRow label="Promoted" value={shortTime(selected.promoted_at)}/><DetailRow label="Promoted by" value={selected.promoted_by||'—'}/></div><div><p className="section-label">VALIDATION REPORT</p><pre className="code-panel">{JSON.stringify(selected.validation_report||{},null,2)}</pre></div></div>{admin&&<div className="modal-actions">{selected.status!=='active'&&selected.status!=='rejected'&&<button className="primary" onClick={async()=>{await api(`/api/models/${selected.version_id}/promote`,{method:'POST'});setSelected(null);load()}}>Promote to active</button>}{selected.status!=='active'&&<button className="secondary danger-text" onClick={()=>deleteVersion(selected.version_id)}>Delete version</button>}</div>}</>}</Modal>}
   {panel==='training'&&<Modal title="Training options" onClose={()=>setPanel(null)}><TrainingOptions admin={admin}/></Modal>}
-  {panel==='calibration'&&activeVersion&&<Modal title={`Health% calibration — active model (${activeVersion.version_id})`} onClose={()=>setPanel(null)} wide><CalibrationPanel admin={admin} versionId={activeVersion.version_id}/></Modal>}
+  {panel==='calibration'&&activeVersion&&<Modal title={`Health% calibration — ${machineId} (${activeVersion.version_id})`} onClose={()=>setPanel(null)} wide><CalibrationPanel admin={admin} versionId={activeVersion.version_id} machineId={machineId}/></Modal>}
   </>
 }
 
@@ -341,16 +345,16 @@ function TrainingOptions({admin}:{admin:boolean}){
   </div>
 }
 
-function CalibrationPanel({admin,versionId}:{admin:boolean;versionId:string}){
+function CalibrationPanel({admin,versionId,machineId}:{admin:boolean;versionId:string;machineId:string}){
   const [data,setData]=useState<any>(),[error,setError]=useState(''),[busy,setBusy]=useState(false),[hours,setHours]=useState(24),[minRows,setMinRows]=useState(200),[source,setSource]=useState<'spec_bounds'|'threshold'>('spec_bounds');
   const [specBounds,setSpecBounds]=useState<Record<string,number|null>|null>(null);
   const [thresholds,setThresholds]=useState<any>(null),[thBusy,setThBusy]=useState(false),[thSaved,setThSaved]=useState(false);
-  const load=()=>api(`/api/models/${versionId}/calibrations`).then(setData).catch(e=>setError(String(e.message||e)));
+  const load=()=>api(`/api/models/${versionId}/calibrations?machine_id=${encodeURIComponent(machineId)}`).then(setData).catch(e=>setError(String(e.message||e)));
   useEffect(()=>{load()},[versionId]);
   useEffect(()=>{api('/api/config/spec-bounds').then(r=>setSpecBounds(r.bounds)).catch(()=>{});api('/api/config/thresholds').then(setThresholds).catch(()=>{})},[]);
-  const activate=async(id:number|null)=>{setBusy(true);setError('');try{await api(`/api/models/${versionId}/calibration/activate`,{method:'POST',body:JSON.stringify({calibration_id:id})});await load()}catch(e){setError(String((e as any).message||e))}finally{setBusy(false)}};
-  const recalibrate=async()=>{setBusy(true);setError('');try{await api(`/api/models/${versionId}/recalibrate`,{method:'POST',body:JSON.stringify({hours,min_rows:minRows,source})});await load()}catch(e){setError(String((e as any).message||e))}finally{setBusy(false)}};
-  const removeCalibration=async(id:number)=>{if(!window.confirm('Delete this recalibration run? This cannot be undone.'))return;setBusy(true);setError('');try{await api(`/api/models/${versionId}/calibration/${id}`,{method:'DELETE'});await load()}catch(e){setError(String((e as any).message||e))}finally{setBusy(false)}};
+  const activate=async(id:number|null)=>{setBusy(true);setError('');try{await api(`/api/models/${versionId}/calibration/activate?machine_id=${encodeURIComponent(machineId)}`,{method:'POST',body:JSON.stringify({calibration_id:id})});await load()}catch(e){setError(String((e as any).message||e))}finally{setBusy(false)}};
+  const recalibrate=async()=>{setBusy(true);setError('');try{await api(`/api/models/${versionId}/recalibrate`,{method:'POST',body:JSON.stringify({hours,min_rows:minRows,source,machine_id:machineId})});await load()}catch(e){setError(String((e as any).message||e))}finally{setBusy(false)}};
+  const removeCalibration=async(id:number)=>{if(!window.confirm('Delete this recalibration run? This cannot be undone.'))return;setBusy(true);setError('');try{await api(`/api/models/${versionId}/calibration/${id}?machine_id=${encodeURIComponent(machineId)}`,{method:'DELETE'});await load()}catch(e){setError(String((e as any).message||e))}finally{setBusy(false)}};
   const saveThresholds=async()=>{setThBusy(true);setThSaved(false);try{await api('/api/config/thresholds',{method:'PUT',body:JSON.stringify(thresholds)});setThSaved(true)}catch(e){setError(String((e as any).message||e))}finally{setThBusy(false)}};
   if(error)return <Notice tone="critical">{error}</Notice>;
   if(!data)return <Loading/>;
@@ -380,10 +384,10 @@ function CalibrationPanel({admin,versionId}:{admin:boolean;versionId:string}){
   </div>
 }
 
-function HistoryPage(){
+function HistoryPage({machineId}:{machineId:string}){
   const [rows,setRows]=useState<any[]>([]),[total,setTotal]=useState(0),[error,setError]=useState(''),[q,setQ]=useState(''),[level,setLevel]=useState(''),[selected,setSelected]=useState<any|null>(null);
   const {page,setPage,pageSize,setPageSize,offset}=usePagination(25);
-  const load=()=>api(`/api/history?limit=${pageSize}&offset=${offset}${level?`&level=${encodeURIComponent(level)}`:''}`).then((r:Paged<any>)=>{setRows(r.items);setTotal(r.total)}).catch(e=>setError(String(e.message||e)));
+  const load=()=>api(`/api/history?machine_id=${encodeURIComponent(machineId)}&limit=${pageSize}&offset=${offset}${level?`&level=${encodeURIComponent(level)}`:''}`).then((r:Paged<any>)=>{setRows(r.items);setTotal(r.total)}).catch(e=>setError(String(e.message||e)));
   useEffect(()=>{load()},[level,pageSize,offset]);
   useEffect(()=>{setPage(1)},[level]);
   const filtered=useMemo(()=>rows.filter(r=>!q||JSON.stringify(r).toLowerCase().includes(q.toLowerCase())),[rows,q]);

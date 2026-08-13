@@ -47,10 +47,13 @@ scorer = None
 feature_cols = None
 metadata = None
 
-def reload_model():
+def reload_model(use_local_calibration=None):
     """Reload the active on-disk artifact bundle between ticks."""
     global scorer, feature_cols, metadata
-    scorer, feature_cols, metadata = artifact_utils.load_artifacts()
+    # Production machine-specific overrides live in PostgreSQL and are
+    # applied by worker.py. The process-global artifact is always the pooled
+    # model baseline so one unit's file cannot leak into another unit.
+    scorer, feature_cols, metadata = artifact_utils.load_artifacts(use_local_calibration=use_local_calibration)
     return scorer, feature_cols, metadata
 
 
@@ -201,8 +204,10 @@ def read_sensor():
             yield {
                 **{col: float(row[dbcols["by_config_name"][col]]) for col in config.RAW_SENSOR_COLS},
                 "_timestamp": row[dbcols["timestamp"]],
+                "machine_id": db.row_machine_id(row, dbcols),
             }
-            last_seen = row[dbcols["timestamp"]]
+            last_seen = ((row[dbcols["timestamp"]], db.row_machine_id(row, dbcols))
+                         if dbcols["machine_id"] else row[dbcols["timestamp"]])
         time.sleep(POLL_INTERVAL_SECONDS)
 
 
@@ -243,7 +248,7 @@ def save_result(result: dict, reset: bool = False):
 
 
 if __name__ == "__main__":
-    monitor = SpindleMonitor()
+    monitors = {}
     print("Realtime Spindle Monitoring Started (polling Postgres)")
     print(f"Polling every {POLL_INTERVAL_SECONDS}s")
     tick = 0
@@ -251,12 +256,17 @@ if __name__ == "__main__":
 
     for reading in read_sensor():
         try:
+            machine_id = reading["machine_id"]
+            monitor = monitors.get(machine_id)
+            if monitor is None:
+                monitor = SpindleMonitor(); monitors[machine_id] = monitor
             result = monitor.update(reading)
             if result is None:
                 continue
 
             tick += 1
             print("\n" + "=" * 60)
+            print("Machine ID :", machine_id)
             print(f"data ke : {tick}")
             for col in config.RAW_SENSOR_COLS:
                 print(f"{col} :", result[col])

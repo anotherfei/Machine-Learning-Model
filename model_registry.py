@@ -74,80 +74,53 @@ def promote(conn, version_id: str, promoted_by: str) -> None:
                        WHERE version_id=%s AND status IN ('shadow','retired','active')""", (promoted_by, version_id))
         if cur.rowcount != 1:
             raise ValueError(f"Unknown or rejected model version: {version_id}")
-        # install_bundle() only copies the pooled/default BUNDLE_FILES —
-        # calibration_local.json (a recalibration override, see
-        # artifact_utils.py) lives outside that set and survives a promote
-        # untouched. Left alone, promoting model B while model A's
-        # recalibration override is still on disk would silently apply A's
-        # health%-anchor to B. Sync it to whatever THIS version's own
-        # active_calibration_id says (its own choice, persisted from a
-        # previous /calibration/activate call, or none) instead.
-        cur.execute("SELECT active_calibration_id FROM model_versions WHERE version_id=%s", (version_id,))
-        row = cur.fetchone()
-        cal_id = row[0] if row else None
-        if cal_id:
-            cur.execute("SELECT calibration FROM model_calibrations WHERE id=%s", (cal_id,))
-            cal_row = cur.fetchone()
-            calibration = cal_row[0] if cal_row else None
-        else:
-            calibration = None
-        if calibration is not None:
-            artifact_utils.write_local_calibration(calibration)
-        else:
-            artifact_utils.clear_local_calibration()
+        # The worker applies database-backed per-machine calibrations. A
+        # legacy global file must not survive and leak across machines.
+        artifact_utils.clear_local_calibration()
         cur.execute("NOTIFY model_changed, %s", (version_id,))
     conn.commit()
 
 
-def set_calibration(conn, version_id: str, calibration_id: int | None) -> None:
-    """
-    Point version_id's active_calibration_id at calibration_id (or clear it
-    for None => "normal"/pooled). If version_id is the currently-active
-    model, also syncs the on-disk override immediately (NOTIFY model_changed
-    so the worker picks it up on its next tick) — otherwise this is just
-    recorded for the next time this version gets promoted (see promote()).
-    """
+def set_calibration(conn, version_id: str, calibration_id: int | None, machine_id: str) -> None:
+    """Activate a calibration for one machine, or restore its pooled baseline."""
     with conn.cursor() as cur:
-        if calibration_id is not None:
-            cur.execute("SELECT id, calibration FROM model_calibrations WHERE id=%s AND version_id=%s", (calibration_id, version_id))
-            row = cur.fetchone()
-            if not row:
-                raise ValueError(f"Calibration {calibration_id} does not belong to model version {version_id}")
-            calibration = row[1]
-        else:
-            calibration = None
-        cur.execute("UPDATE model_versions SET active_calibration_id=%s WHERE version_id=%s", (calibration_id, version_id))
-        if cur.rowcount != 1:
+        cur.execute("SELECT 1 FROM model_versions WHERE version_id=%s",(version_id,))
+        if not cur.fetchone():
             raise ValueError(f"Unknown model version: {version_id}")
-        cur.execute("SELECT version_id FROM model_versions WHERE status='active' LIMIT 1")
-        active_row = cur.fetchone()
-        is_active = bool(active_row and active_row[0] == version_id)
-        if is_active:
-            if calibration is not None:
-                artifact_utils.write_local_calibration(calibration)
-            else:
-                artifact_utils.clear_local_calibration()
-            cur.execute("NOTIFY model_changed, %s", (version_id,))
+        if calibration_id is not None:
+            cur.execute("SELECT id FROM model_calibrations WHERE id=%s AND version_id=%s AND machine_id=%s",(calibration_id,version_id,machine_id))
+            if not cur.fetchone():
+                raise ValueError(f"Calibration {calibration_id} does not belong to machine {machine_id} and model version {version_id}")
+            cur.execute("""INSERT INTO machine_model_calibrations(machine_id,version_id,calibration_id)
+                           VALUES(%s,%s,%s) ON CONFLICT(machine_id,version_id) DO UPDATE
+                           SET calibration_id=EXCLUDED.calibration_id,updated_at=now()""",(machine_id,version_id,calibration_id))
+        else:
+            cur.execute("DELETE FROM machine_model_calibrations WHERE machine_id=%s AND version_id=%s",(machine_id,version_id))
+        cur.execute("SELECT 1 FROM model_versions WHERE version_id=%s AND status='active'",(version_id,))
+        if cur.fetchone():
+            cur.execute("NOTIFY model_changed, %s",(version_id,))
     conn.commit()
 
 
-def delete_calibration(conn, version_id: str, calibration_id: int) -> None:
-    """
-    Deletes one recalibration run belonging to version_id. Refuses when
-    calibration_id is that version's active_calibration_id — same guard
-    delete_version() uses for the active model itself: activate a
-    different calibration (or Normal) first, then delete this one.
-    """
+def machine_calibration(conn, version_id: str, machine_id: str):
+    """Return the active health-anchor calibration for one machine."""
     with conn.cursor() as cur:
-        cur.execute("SELECT active_calibration_id FROM model_versions WHERE version_id=%s", (version_id,))
-        row = cur.fetchone()
-        if not row:
-            raise ValueError(f"Unknown model version: {version_id}")
-        if row[0] == calibration_id:
+        cur.execute("""SELECT mc.calibration FROM machine_model_calibrations mmc
+                       JOIN model_calibrations mc ON mc.id=mmc.calibration_id
+                       WHERE mmc.machine_id=%s AND mmc.version_id=%s""",(machine_id,version_id))
+        row=cur.fetchone()
+    return row[0] if row else None
+
+
+def delete_calibration(conn, version_id: str, calibration_id: int, machine_id: str) -> None:
+    """Delete one machine calibration unless that machine is using it."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM machine_model_calibrations WHERE machine_id=%s AND version_id=%s AND calibration_id=%s",(machine_id,version_id,calibration_id))
+        if cur.fetchone():
             raise ValueError("Cannot delete the calibration currently in use — activate a different one (or Normal) first.")
-        cur.execute("DELETE FROM model_calibrations WHERE id=%s AND version_id=%s", (calibration_id, version_id))
+        cur.execute("DELETE FROM model_calibrations WHERE id=%s AND version_id=%s AND machine_id=%s",(calibration_id,version_id,machine_id))
         if cur.rowcount != 1:
-            raise ValueError(f"Calibration {calibration_id} does not belong to model version {version_id}")
+            raise ValueError(f"Calibration {calibration_id} does not belong to machine {machine_id} and model version {version_id}")
     conn.commit()
 
 
@@ -156,9 +129,7 @@ def delete_version(conn, version_id: str) -> None:
     Deletes a non-active model bundle: the DB row (model_calibrations rows
     for it cascade automatically) plus its artifact directory. The active
     model can never be deleted here — promote a different version first —
-    both because it's the model actually serving predictions, and because
-    model_versions_one_active plus the active_calibration_id sync in
-    promote() assume there is always exactly one active row.
+    because it is the model currently serving predictions.
     """
     with conn.cursor() as cur:
         cur.execute("SELECT status, artifact_path FROM model_versions WHERE version_id=%s", (version_id,))

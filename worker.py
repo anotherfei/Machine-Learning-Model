@@ -12,8 +12,19 @@ import db_schema
 import model_registry
 import predict_realtime
 import runtime_config
+from isolation_forest import AnomalyScorer
 
 POLL_SECONDS = 60
+
+
+def _new_monitor(conn, machine_id):
+    if predict_realtime.scorer is None:
+        predict_realtime.reload_model(use_local_calibration=False)
+    base=predict_realtime.scorer; feature_cols=predict_realtime.feature_cols; metadata=predict_realtime.metadata or {}
+    version_id=metadata.get("version_id",metadata.get("trained_at","unversioned"))
+    calibration=model_registry.machine_calibration(conn,version_id,machine_id)
+    machine_scorer=AnomalyScorer.from_calibration(base.model,calibration) if calibration else base
+    return predict_realtime.SpindleMonitor(machine_scorer,feature_cols,metadata)
 
 
 def _listen_conn():
@@ -22,21 +33,25 @@ def _listen_conn():
     return c
 
 
-def _persist(conn, result, tick_ts):
+def _persist(conn, machine_id, result, tick_ts):
     raw = {k: result[k] for k in config.RAW_SENSOR_COLS}
     rec = result["maintenance"]
     with conn.cursor() as cur:
         cur.execute("""INSERT INTO spindle_predictions
-            (tick_timestamp,model_version,raw_reading,anomaly_score,health_raw,health_state,trend_slope_per_day,remaining_days,
+            (machine_id,tick_timestamp,model_version,raw_reading,anomaly_score,health_raw,health_state,trend_slope_per_day,remaining_days,
              failure_probability,maintenance_level,maintenance_reason,maintenance_trigger,top_contributors)
-             VALUES(%s,%s,%s::jsonb,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s::jsonb)""",
-            (tick_ts,result["model_version"],json.dumps(raw),result["anomaly_score"],result["health_raw"],result["health_state"],
+             VALUES(%s,%s,%s,%s::jsonb,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s::jsonb)
+             ON CONFLICT(machine_id,tick_timestamp,model_version) DO NOTHING RETURNING id""",
+            (machine_id,tick_ts,result["model_version"],json.dumps(raw),result["anomaly_score"],result["health_raw"],result["health_state"],
              result["trend_slope_per_day"],result["remaining_days"],json.dumps(result["failure_probability"]),rec["level"],rec["reason"],rec.get("trigger","none"),json.dumps(result.get("top_contributors"))))
+        if cur.fetchone() is None:
+            conn.commit()
+            return
         if rec["level"] in ("WARN","CRITICAL"):
-            cur.execute("""INSERT INTO alerts(tick_timestamp,model_version,trigger,level,health_state,anomaly_score,raw_reading,feature_vector)
-                           VALUES(%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb)""",
-                        (tick_ts,result["model_version"],rec.get("trigger","none"),rec["level"],result["health_state"],result["anomaly_score"],json.dumps(raw),json.dumps(result.get("feature_vector"))))
-        payload=json.dumps({"timestamp": str(tick_ts), "model_version": result["model_version"], "health_state": result["health_state"], "anomaly_score": result["anomaly_score"], "maintenance": rec, **raw})
+            cur.execute("""INSERT INTO alerts(machine_id,tick_timestamp,model_version,trigger,level,health_state,anomaly_score,raw_reading,feature_vector)
+                           VALUES(%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb)""",
+                        (machine_id,tick_ts,result["model_version"],rec.get("trigger","none"),rec["level"],result["health_state"],result["anomaly_score"],json.dumps(raw),json.dumps(result.get("feature_vector"))))
+        payload=json.dumps({"machine_id": machine_id, "timestamp": str(tick_ts), "model_version": result["model_version"], "health_state": result["health_state"], "anomaly_score": result["anomaly_score"], "maintenance": rec, **raw})
         cur.execute("NOTIFY prediction_tick, %s", (payload,))
     conn.commit()
 
@@ -44,7 +59,7 @@ def _persist(conn, result, tick_ts):
 def main():
     conn=db.get_connection(); db_schema.migrate(conn)
     listener=_listen_conn()
-    monitor=predict_realtime.SpindleMonitor()
+    monitors={}
     table=db.get_table_name(); cols=db.get_db_columns(); last_seen=None
     print("Spindle Condition Monitoring worker started")
     while True:
@@ -55,15 +70,24 @@ def main():
                 note=listener.notifies.pop(0)
                 if note.channel=="config_changed": runtime_config.load_from_db(conn)
                 elif note.channel=="model_changed":
-                    sc, fc, md=predict_realtime.reload_model(); monitor.scorer=sc; monitor.feature_cols=fc; monitor.metadata=md
+                    predict_realtime.reload_model(use_local_calibration=False)
+                    # A model/calibration change starts fresh state for every
+                    # unit; carrying Kalman/trend state across models would
+                    # blend two different health scales.
+                    monitors.clear()
                 elif note.channel=="env_changed":
                     print("Environment changed; graceful worker restart requested")
                     return 75
         rows=db.fetch_new_rows(conn,table,since=last_seen)
         for row in rows:
+            machine_id=db.row_machine_id(row,cols)
+            monitor=monitors.get(machine_id)
+            if monitor is None:
+                monitor=_new_monitor(conn,machine_id); monitors[machine_id]=monitor
             reading={col:float(row[cols["by_config_name"][col]]) for col in config.RAW_SENSOR_COLS}
-            tick_ts=row[cols["timestamp"]]; result=monitor.update(reading); last_seen=tick_ts
-            if result is not None: _persist(conn,result,tick_ts)
+            tick_ts=row[cols["timestamp"]]; result=monitor.update(reading)
+            last_seen=(tick_ts,machine_id) if cols["machine_id"] else tick_ts
+            if result is not None: _persist(conn,machine_id,result,tick_ts)
         time.sleep(POLL_SECONDS)
 
 if __name__=="__main__": sys.exit(main())

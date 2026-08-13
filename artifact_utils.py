@@ -116,12 +116,8 @@ def write_local_calibration(calibration: dict, deployment_name: str = None) -> s
     """
     Same file convention as save_local_calibration(), but takes an
     already-computed calibration dict directly instead of a fitted
-    AnomalyScorer. Used by the web-triggered recalibration flow
-    (recalibrate_service.py + POST /api/models/{id}/calibration/activate),
-    where the calibration was computed in one request (and stored in
-    model_calibrations) and "activated" — written here so
-    predict_realtime.py's next reload picks it up — in a later, separate
-    request.
+    AnomalyScorer. This remains the file-based helper for standalone
+    deployments; the multi-machine web worker uses database assignments.
     """
     os.makedirs(config.ARTIFACTS_DIR, exist_ok=True)
     fname = f"calibration_local_{deployment_name}.json" if deployment_name else "calibration_local.json"
