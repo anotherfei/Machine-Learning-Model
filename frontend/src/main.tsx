@@ -7,10 +7,14 @@ type User = { username: string; role: string; mock_mode?: boolean };
 type LiveTick = {
   machine_id: string;
   timestamp?: string;
-  health_state: number;
-  anomaly_score: number;
-  model_version: string;
-  maintenance: { level: string; reason?: string; trigger?: string };
+  prediction_timestamp?: string;
+  prediction_available?: boolean;
+  source?: string;
+  source_table?: string;
+  health_state?: number;
+  anomaly_score?: number;
+  model_version?: string;
+  maintenance?: { level: string; reason?: string; trigger?: string };
   a_rms_mps2?: number;
   v_rms_mms?: number;
   a_peak_mps2?: number;
@@ -144,11 +148,11 @@ function Notice({ children, tone: t='neutral' }: { children:ReactNode; tone?:str
 
 function App(){
   const [me,setMe]=useState<User|false|undefined>(); const [apiError,setApiError]=useState<string>(); const [page,setPage]=useState<Page>('Dashboard'); const [collapsed,setCollapsed]=useState(false);
-  const [machines,setMachines]=useState<string[]>(['MACHINE-001']); const [machineId,setMachineId]=useState(localStorage.getItem('machine_id')||'MACHINE-001');
+  const [machines,setMachines]=useState<string[]>([]); const [machineId,setMachineId]=useState(localStorage.getItem('machine_id')||''); const [sourceError,setSourceError]=useState('');
   const refreshMe=()=>api('/api/me',{},5000).then((x:User)=>{setMe(x);setApiError(undefined)}).catch((err:any)=>{setMe(false);if(err?.name==='AbortError')setApiError('API timed out on /api/me');else if(!String(err?.message||'').includes('401'))setApiError(String(err?.message||err));});
   useEffect(()=>{refreshMe()},[]);
-  useEffect(()=>{if(me)api('/api/machines').then((r:{items:string[];default:string})=>{const items=r.items.length?r.items:[r.default];setMachines(items);setMachineId(current=>items.includes(current)?current:(r.default||items[0]))}).catch(()=>{})},[me]);
-  useEffect(()=>{localStorage.setItem('machine_id',machineId)},[machineId]);
+  useEffect(()=>{if(me)api('/api/machines').then((r:{items:string[];default:string})=>{const items=r.items||[];setMachines(items);setMachineId(current=>items.includes(current)?current:r.default);setSourceError('')}).catch(e=>{setMachines([]);setMachineId('');setSourceError(String(e.message||e))})},[me]);
+  useEffect(()=>{if(machineId)localStorage.setItem('machine_id',machineId);else localStorage.removeItem('machine_id')},[machineId]);
   if(me===undefined)return <main className="center-screen"><section className="state-panel"><div className="spinner"/><p className="eyebrow">INITIALIZING CONSOLE</p><h1>Connecting to the local API</h1><p className="muted">If this takes more than a few seconds, check <code>localhost:8000/docs</code>.</p></section></main>;
   if(!me)return <Login done={refreshMe} apiError={apiError}/>;
   const nav:Array<{page:Page;icon:string;label:string}>=[
@@ -157,7 +161,7 @@ function App(){
   return <div className={cn('app-shell',collapsed&&'nav-collapsed')}>
     <aside className="sidebar">
       <div className="brand-lockup"><div className="brand-symbol"><span/></div><div className="brand-copy"><small>AKEBONO</small><strong>Spindle Monitor</strong><span>{machineId}</span></div></div>
-      <div className="mobile-machine-picker"><Select ariaLabel="Select machine" value={machineId} onChange={setMachineId} options={machines.map(id=>[id,id] as [string,string])}/></div>
+      <div className="mobile-machine-picker"><Select ariaLabel="Select machine" value={machineId} onChange={setMachineId} options={(machines.length?machines:['']).map(id=>[id,id||'No database machines'] as [string,string])}/></div>
       <button className="collapse-btn" onClick={()=>setCollapsed(v=>!v)} title={collapsed?'Expand navigation':'Collapse navigation'}><Icon name="chevron"/></button>
       <nav>{nav.map(n=><button key={n.page} className={cn('nav-item',page===n.page&&'active')} onClick={()=>setPage(n.page)} title={n.label}><Icon name={n.icon}/><span>{n.label}</span>{page===n.page&&<i/>}</button>)}</nav>
       <div className="sidebar-bottom">
@@ -166,8 +170,8 @@ function App(){
       </div>
     </aside>
     <main className="workspace">
-      <header className="topbar"><div><p className="breadcrumb">{machineId} <span>/</span> {page}</p></div><div className="topbar-meta"><div className="machine-picker"><Select ariaLabel="Select machine" value={machineId} onChange={setMachineId} options={machines.map(id=>[id,id] as [string,string])}/></div><span className="system-pill"><span className="pulse-dot"/>System online</span><span className="clock">{new Date().toLocaleDateString([], {weekday:'short',month:'short',day:'numeric'})}</span></div></header>
-      <div className="content"><PageView key={machineId} page={page} role={me.role} mock={!!me.mock_mode} machineId={machineId}/></div>
+      <header className="topbar"><div><p className="breadcrumb">{machineId||'DATABASE'} <span>/</span> {page}</p></div><div className="topbar-meta"><div className="machine-picker"><Select ariaLabel="Select machine" value={machineId} onChange={setMachineId} options={(machines.length?machines:['']).map(id=>[id,id||'No database machines'] as [string,string])}/></div><span className="system-pill"><span className="pulse-dot"/>API online</span><span className="clock">{new Date().toLocaleDateString([], {weekday:'short',month:'short',day:'numeric'})}</span></div></header>
+      <div className="content">{page==='Environment'?<Environment/>:sourceError?<><PageHeader eyebrow="DATABASE SOURCE" title="PostgreSQL connection error" description="The website could not discover machine IDs from the configured raw source." actions={<button className="primary" onClick={()=>setPage('Environment')}>Check environment</button>}/><Notice tone="critical">{sourceError}</Notice></>:machineId?<PageView key={machineId} page={page} role={me.role} mock={!!me.mock_mode} machineId={machineId}/>:<Loading/>}</div>
     </main>
   </div>
 }
@@ -193,24 +197,37 @@ function Sparkline({values, inverse=false}:{values:number[];inverse?:boolean}){
 }
 
 function Dashboard({mock,machineId}:{mock:boolean;machineId:string}){
-  const [live,setLive]=useState<LiveTick>(); const [history,setHistory]=useState<LiveTick[]>([]); const [wsState,setWsState]=useState<'connecting'|'live'|'offline'>('connecting'); const [detail,setDetail]=useState<string|null>(null); const [menu,setMenu]=useState(false);
-  useEffect(()=>{setLive(undefined);setHistory([]);setWsState('connecting');const proto=location.protocol==='https:'?'wss':'ws';const ws=new WebSocket(`${proto}://${location.host}/ws/live?machine_id=${encodeURIComponent(machineId)}`);ws.onopen=()=>setWsState('live');ws.onmessage=e=>{const row=JSON.parse(e.data);setLive(row);setHistory(h=>[...h.slice(-39),row]);setWsState('live')};ws.onerror=()=>setWsState('offline');ws.onclose=()=>setWsState('offline');return()=>ws.close()},[machineId]);
-  const level=live?.maintenance?.level||'WAITING'; const health=Number(live?.health_state||0); const anomaly=Number(live?.anomaly_score||0);
+  const [live,setLive]=useState<LiveTick>(); const [history,setHistory]=useState<LiveTick[]>([]); const [wsState,setWsState]=useState<'connecting'|'live'|'offline'>('connecting'); const [sourceState,setSourceState]=useState<'connecting'|'live'|'offline'>('connecting'); const [sourceError,setSourceError]=useState(''); const [detail,setDetail]=useState<string|null>(null); const [menu,setMenu]=useState(false);
+  useEffect(()=>{
+    let disposed=false;
+    setLive(undefined);setHistory([]);setWsState('connecting');setSourceState('connecting');setSourceError('');
+    const record=(row:LiveTick)=>{if(disposed)return;setLive(row);setHistory(items=>{const withoutSame=items.filter(item=>item.timestamp!==row.timestamp);return[...withoutSame.slice(-39),row]})};
+    const loadSnapshot=()=>api(`/api/live/latest?machine_id=${encodeURIComponent(machineId)}`,{},5000).then((row:LiveTick)=>{record(row);setSourceState('live');setSourceError('')}).catch(e=>{if(!disposed){setSourceState('offline');setSourceError(String(e.message||e))}});
+    loadSnapshot();const poll=window.setInterval(loadSnapshot,5000);
+    const proto=location.protocol==='https:'?'wss':'ws';const ws=new WebSocket(`${proto}://${location.host}/ws/live?machine_id=${encodeURIComponent(machineId)}`);
+    ws.onopen=()=>setWsState('live');
+    ws.onmessage=e=>{const row={...JSON.parse(e.data),prediction_available:true,source:mock?'mock':'postgresql'};record(row);setWsState('live')};
+    ws.onerror=()=>setWsState('offline');ws.onclose=()=>setWsState('offline');
+    return()=>{disposed=true;window.clearInterval(poll);ws.close()};
+  },[machineId,mock]);
+  const predictionAvailable=!!live?.maintenance&&live?.prediction_available!==false;
+  const level=predictionAvailable?(live?.maintenance?.level||'WAITING'):(live?'AWAITING MODEL':'WAITING'); const health=Number(live?.health_state||0); const anomaly=Number(live?.anomaly_score||0);
   const sensors=Object.keys(SENSOR_META).map(k=>({key:k,value:(live as any)?.[k],...SENSOR_META[k]}));
   return <>
-    <PageHeader eyebrow="LIVE CONDITION" title="Machine overview" description="Current spindle condition, anomaly behavior, and sensor context from the production monitoring path." actions={<><span className={cn('connection-badge',wsState)}><span/>{wsState==='live'?'Live stream':wsState==='connecting'?'Connecting…':'Stream offline'}</span><div className="dropdown-wrap"><button className="icon-button" onClick={()=>setMenu(v=>!v)}><Icon name="more"/></button>{menu&&<div className="dropdown-menu right"><button onClick={()=>{setDetail('system');setMenu(false)}}>System details</button><button onClick={()=>{setDetail('model');setMenu(false)}}>Model context</button><button onClick={()=>location.reload()}>Reconnect interface</button></div>}</div></>}/>
+    <PageHeader eyebrow="LIVE CONDITION" title="Machine overview" description="Latest sensor readings from the configured PostgreSQL source, combined with ML results when available." actions={<><span className={cn('connection-badge',sourceState)}><span/>{sourceState==='live'?(mock?'Mock live':wsState==='live'?'PostgreSQL + model live':'PostgreSQL live'):sourceState==='connecting'?'Connecting…':'Database offline'}</span><div className="dropdown-wrap"><button className="icon-button" onClick={()=>setMenu(v=>!v)}><Icon name="more"/></button>{menu&&<div className="dropdown-menu right"><button onClick={()=>{setDetail('system');setMenu(false)}}>System details</button><button onClick={()=>{setDetail('model');setMenu(false)}}>Model context</button><button onClick={()=>location.reload()}>Reconnect interface</button></div>}</div></>}/>
+    {sourceError&&<Notice tone="critical">Real database sync failed: {sourceError}</Notice>}
     {mock&&<div className="demo-ribbon"><span>DEMO</span><p>Temporary synthetic signal is driving this interface. ML inference and plant PostgreSQL are bypassed.</p><button onClick={()=>setDetail('demo')}>What is simulated?</button></div>}
     <section className={cn('status-board',`tone-${tone(level)}`)}>
       <div className="status-main">
         <div className="status-kicker"><span className="machine-dot"/>{machineId} · SPINDLE CONDITION</div>
         <div className="status-line"><div><span className="status-label">Current state</span><h2>{level}</h2></div><button className="text-button" onClick={()=>setDetail('status')}><Icon name="info"/>Why this status?</button></div>
-        <p className="status-reason">{live?.maintenance?.reason||'Waiting for the first monitoring tick from the backend.'}</p>
-        <div className="health-row"><div><span>Health state</span><strong>{live?fmt(health,1):'—'}<small>%</small></strong></div><div className="health-track"><i style={{width:`${Math.max(0,Math.min(100,health))}%`}}/></div><span className="health-caption">0 critical <b>·</b> 100 healthy</span></div>
+        <p className="status-reason">{predictionAvailable?live?.maintenance?.reason:'Real sensor data is connected. Waiting for the ML worker to produce a prediction.'}</p>
+        <div className="health-row"><div><span>Health state</span><strong>{predictionAvailable?fmt(health,1):'—'}<small>{predictionAvailable?'%':''}</small></strong></div><div className="health-track"><i style={{width:`${predictionAvailable?Math.max(0,Math.min(100,health)):0}%`}}/></div><span className="health-caption">0 critical <b>·</b> 100 healthy</span></div>
       </div>
       <div className="status-side">
-        <div className="metric-stack"><span>Anomaly score<button className="mini-info" onClick={()=>setDetail('anomaly')}><Icon name="info"/></button></span><strong>{live?fmt(anomaly,4):'—'}</strong><Sparkline values={history.map(x=>Number(x.anomaly_score))}/></div>
+        <div className="metric-stack"><span>Anomaly score<button className="mini-info" onClick={()=>setDetail('anomaly')}><Icon name="info"/></button></span><strong>{predictionAvailable?fmt(anomaly,4):'—'}</strong><Sparkline values={history.map(x=>Number(x.anomaly_score))}/></div>
         <div className="vertical-divider"/>
-        <div className="metric-stack"><span>Model</span><strong className="model-name">{live?.model_version||'—'}</strong><small>{shortTime(live?.timestamp)}</small></div>
+        <div className="metric-stack"><span>Model</span><strong className="model-name">{predictionAvailable?live?.model_version:'Awaiting worker'}</strong><small>{shortTime(live?.prediction_timestamp||live?.timestamp)}</small></div>
       </div>
     </section>
     <section className="sensor-panel">

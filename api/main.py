@@ -13,6 +13,7 @@ from pydantic import BaseModel
 from apscheduler.schedulers.background import BackgroundScheduler
 
 import config
+import artifact_utils
 import db
 import db_schema
 import env_manager
@@ -39,6 +40,68 @@ def machine(value: str | None) -> str:
     return value
 
 
+def _register_current_artifacts(cur):
+    """Register a newly trained root bundle and make it active.
+
+    The manual trainer intentionally writes artifacts before the API starts.
+    A fresh training metadata file has no version_id; that is the explicit
+    signal that this bundle has not yet entered the database registry.
+    """
+    model_path=os.path.join(config.ARTIFACTS_DIR,"isolation_forest.pkl")
+    metadata_path=os.path.join(config.ARTIFACTS_DIR,"metadata.json")
+    if not os.path.exists(model_path) or not os.path.exists(metadata_path):
+        return
+    with open(metadata_path,encoding="utf-8") as handle:
+        metadata=json.load(handle)
+
+    version_id=metadata.get("version_id")
+    if version_id:
+        cur.execute("SELECT 1 FROM model_versions WHERE version_id=%s",(version_id,))
+        if cur.fetchone():
+            return
+        path=model_registry.bundle_path(version_id)
+        if not os.path.isdir(path):
+            path=model_registry.snapshot_current(version_id)
+    else:
+        version_id=model_registry.new_version_id()
+        path=model_registry.snapshot_current(version_id)
+
+    # The versioned metadata is stamped by snapshot_current. Reinstall it so
+    # the worker reports the same version that is stored in model_versions.
+    model_registry.install_bundle(version_id)
+    reference_rows=artifact_utils.load_reference_rows()
+    if reference_rows is not None:
+        signature_source=[f"{row['machine_id']}\0{row['timestamp']}" for row in reference_rows]
+    else:
+        timestamps=artifact_utils.load_reference_timestamps()
+        signature_source=timestamps if timestamps is not None else []
+    signature=model_registry.reference_signature(signature_source)
+
+    cur.execute("UPDATE model_versions SET status='retired' WHERE status='active'")
+    cur.execute(
+        """INSERT INTO model_versions
+           (version_id,artifact_path,reference_signature,status,promoted_at,promoted_by)
+           VALUES(%s,%s,%s,'active',now(),'manual-training-bootstrap')""",
+        (version_id,path,signature),
+    )
+    for machine_id,item in (artifact_utils.load_machine_calibrations() or {}).items():
+        cur.execute(
+            """INSERT INTO model_calibrations
+               (version_id,machine_id,calibration,source_rows,source_description,created_by)
+               VALUES(%s,%s,%s::jsonb,%s,%s,'manual-training-bootstrap') RETURNING id""",
+            (
+                version_id,machine_id,json.dumps(item["calibration"]),item["source_rows"],
+                "Initial machine anchor from balanced commissioning training",
+            ),
+        )
+        calibration_id=cur.fetchone()[0]
+        cur.execute(
+            """INSERT INTO machine_model_calibrations(machine_id,version_id,calibration_id)
+               VALUES(%s,%s,%s)""",
+            (machine_id,version_id,calibration_id),
+        )
+
+
 def _bootstrap():
     c=conn(); db_schema.migrate(c)
     # api/main.py's own process never read persisted runtime_config back in
@@ -56,36 +119,7 @@ def _bootstrap():
             password=os.getenv("BOOTSTRAP_ADMIN_PASSWORD")
             if username and password:
                 cur.execute("INSERT INTO app_users(username,password_hash,role) VALUES(%s,%s,'admin')", (username,hash_password(password)))
-        # Register legacy/current bundle once if artifacts exist and registry is empty.
-        cur.execute("SELECT count(*) FROM model_versions"); mv=cur.fetchone()[0]
-        if mv==0 and os.path.exists(os.path.join(os.path.dirname(__file__),"..","artifacts","isolation_forest.pkl")):
-            vid=model_registry.new_version_id(); path=model_registry.snapshot_current(vid)
-            # snapshot_current stamps the version ID into the versioned copy.
-            # Install that copy back to the active artifact path before the
-            # worker starts so predictions and per-machine calibration lookups
-            # use the same registry version ID from the first tick onward.
-            model_registry.install_bundle(vid)
-            import artifact_utils
-            reference_rows=artifact_utils.load_reference_rows()
-            if reference_rows is not None:
-                signature_source=[f"{row['machine_id']}\0{row['timestamp']}" for row in reference_rows]
-            else:
-                ts=artifact_utils.load_reference_timestamps(); signature_source=ts if ts is not None else []
-            signature=model_registry.reference_signature(signature_source)
-            cur.execute("INSERT INTO model_versions(version_id,artifact_path,reference_signature,status,promoted_at,promoted_by) VALUES(%s,%s,%s,'active',now(),'bootstrap')",(vid,path,signature))
-            for machine_id, item in (artifact_utils.load_machine_calibrations() or {}).items():
-                cur.execute(
-                    """INSERT INTO model_calibrations(version_id,machine_id,calibration,source_rows,source_description,created_by)
-                       VALUES(%s,%s,%s::jsonb,%s,%s,'bootstrap') RETURNING id""",
-                    (vid,machine_id,json.dumps(item["calibration"]),item["source_rows"],
-                     "Initial calibration from balanced pooled commissioning training"),
-                )
-                calibration_id=cur.fetchone()[0]
-                cur.execute(
-                    """INSERT INTO machine_model_calibrations(machine_id,version_id,calibration_id)
-                       VALUES(%s,%s,%s)""",
-                    (machine_id,vid,calibration_id),
-                )
+        _register_current_artifacts(cur)
     c.commit(); c.close()
 
 
@@ -159,24 +193,74 @@ def me(user:User=Depends(current_user)): return user.__dict__
 @app.get("/api/machines")
 def machines(user:User=Depends(current_user)):
     c=conn()
-    with c.cursor() as cur:
-        cur.execute("""SELECT machine_id FROM (
-                         SELECT DISTINCT machine_id FROM spindle_predictions
-                         UNION SELECT DISTINCT machine_id FROM alerts
-                       ) machines ORDER BY machine_id""")
-        items={row[0] for row in cur.fetchall() if row[0]}
     try:
-        items.update(db.fetch_machine_ids(c,db.get_table_name()))
+        # The configured raw source is authoritative. Persisted control-plane
+        # rows may contain retired/test machine IDs and must not populate the
+        # production selector.
+        items=db.fetch_machine_ids(c,db.get_table_name())
     except Exception as exc:
-        # Persisted predictions still provide a usable selector if the raw
-        # source table is temporarily unavailable. The worker will report
-        # the underlying source error through its normal operational path.
         c.rollback()
-        print(f"[machines] Source-table discovery unavailable: {exc}")
-    c.close()
-    items=sorted(items)
-    if not items: items=[db.DEFAULT_MACHINE_ID]
-    return {"items":items,"default":db.DEFAULT_MACHINE_ID if db.DEFAULT_MACHINE_ID in items else items[0]}
+        raise HTTPException(503,f"Cannot discover machines from PostgreSQL source {db.get_table_name()!r}: {exc}")
+    finally:
+        c.close()
+    items=sorted(set(items))
+    if not items:
+        raise HTTPException(503,f"PostgreSQL source {db.get_table_name()!r} contains no machine IDs")
+    default=db.DEFAULT_MACHINE_ID if db.DEFAULT_MACHINE_ID in items else items[0]
+    return {"items":items,"default":default,"source":"postgresql","table":db.get_table_name()}
+
+
+@app.get("/api/live/latest")
+def latest_live(machine_id:str|None=None,user:User=Depends(current_user)):
+    selected_machine=machine(machine_id)
+    c=conn()
+    try:
+        source_row=db.fetch_latest_row(c,db.get_table_name(),selected_machine)
+        if source_row is None:
+            raise HTTPException(404,f"No source rows found for machine {selected_machine}")
+        columns=db.get_db_columns()
+        raw={
+            config_name:float(source_row[db_name]) if source_row[db_name] is not None else None
+            for config_name,db_name in columns["by_config_name"].items()
+        }
+        with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """SELECT tick_timestamp,model_version,anomaly_score,health_state,
+                          maintenance_level,maintenance_reason,maintenance_trigger
+                   FROM spindle_predictions WHERE machine_id=%s
+                   ORDER BY tick_timestamp DESC LIMIT 1""",
+                (selected_machine,),
+            )
+            prediction=cur.fetchone()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        c.rollback()
+        raise HTTPException(503,f"Cannot read live PostgreSQL source for {selected_machine}: {exc}")
+    finally:
+        c.close()
+
+    response={
+        "machine_id":selected_machine,
+        "timestamp":source_row[columns["timestamp"]],
+        "source":"postgresql",
+        "source_table":db.get_table_name(),
+        "prediction_available":prediction is not None,
+        **raw,
+    }
+    if prediction:
+        response.update({
+            "prediction_timestamp":prediction["tick_timestamp"],
+            "model_version":prediction["model_version"],
+            "anomaly_score":prediction["anomaly_score"],
+            "health_state":prediction["health_state"],
+            "maintenance":{
+                "level":prediction["maintenance_level"],
+                "reason":prediction["maintenance_reason"],
+                "trigger":prediction["maintenance_trigger"],
+            },
+        })
+    return response
 
 @app.post("/api/users")
 def create_user(body:UserCreate,admin:User=Depends(require_admin)):

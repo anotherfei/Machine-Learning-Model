@@ -351,7 +351,38 @@ def machines(user: User = Depends(current_user)):
         "SELECT machine_id FROM (SELECT DISTINCT machine_id FROM spindle_predictions UNION SELECT DISTINCT machine_id FROM alerts) ORDER BY machine_id"
     ).fetchall() if r[0]]
     c.close()
-    return {"items": items, "default": MACHINE_IDS[0]}
+    return {"items": items, "default": MACHINE_IDS[0], "source": "mock", "table": "mock_demo.db"}
+
+
+@app.get("/api/live/latest")
+def latest_live(machine_id: str = MACHINE_IDS[0], user: User = Depends(current_user)):
+    c = _connect()
+    row = c.execute(
+        "SELECT * FROM spindle_predictions WHERE machine_id=? ORDER BY tick_timestamp DESC LIMIT 1",
+        (machine_id,),
+    ).fetchone()
+    c.close()
+    if not row:
+        raise HTTPException(404, f"No mock rows found for machine {machine_id}")
+    row = dict(row)
+    raw = json.loads(row["raw_reading"]) if isinstance(row["raw_reading"], str) else row["raw_reading"]
+    return {
+        "machine_id": machine_id,
+        "timestamp": row["tick_timestamp"],
+        "prediction_timestamp": row["tick_timestamp"],
+        "model_version": row["model_version"],
+        "anomaly_score": row["anomaly_score"],
+        "health_state": row["health_state"],
+        "maintenance": {
+            "level": row["maintenance_level"],
+            "reason": row["maintenance_reason"],
+            "trigger": row["maintenance_trigger"],
+        },
+        "prediction_available": True,
+        "source": "mock",
+        "mock_mode": True,
+        **raw,
+    }
 
 
 @app.post("/api/users")

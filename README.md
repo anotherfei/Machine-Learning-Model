@@ -72,6 +72,10 @@ Production mode starts:
 
 The worker owns the actual `SpindleMonitor` inference path. The frontend does not duplicate ML or maintenance logic.
 
+The production dashboard discovers machine IDs and polls the latest sensor row directly from the configured PostgreSQL source. This keeps real sensor channels visible while the ML worker warms up or reconnects. Prediction WebSocket messages add model health and maintenance results when available. Source discovery failures are shown explicitly in the UI instead of silently displaying a fake/default machine.
+
+On worker startup, only a recent warm-up tail is read for each machine; the worker then continues from the current source watermark. It does not replay the entire historical table before reaching live data.
+
 ### Multiple machines
 
 The sensor source may contain multiple machines in one table. Set these values in `.env`:

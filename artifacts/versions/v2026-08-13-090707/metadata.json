@@ -1,0 +1,26 @@
+{
+  "trained_at": "2026-08-13T09:06:30.409523",
+  "n_features": 55,
+  "pipeline_hash": "753fe8cbacb55ef4d142f4caf5fa0fce",
+  "reference_window_minutes_config_value": 2880,
+  "n_reference_rows": 2292,
+  "has_reference_timestamps": true,
+  "training_mode": "balanced_pooled",
+  "training_machine_ids": [
+    "B16-MTV-06",
+    "B16-MTV-07",
+    "B16-MTV-08",
+    "B16-MTV-09"
+  ],
+  "available_reference_rows_per_machine": {
+    "B16-MTV-06": 891,
+    "B16-MTV-07": 573,
+    "B16-MTV-08": 1319,
+    "B16-MTV-09": 907
+  },
+  "model_fit_rows_per_machine": 573,
+  "balance_method": "equal_rows_deterministic_sample",
+  "reference_window_start": "2025-05-31T00:00:00+00:00",
+  "reference_window_end": "2025-07-31T00:00:00+00:00",
+  "version_id": "v2026-08-13-090707"
+}

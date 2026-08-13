@@ -78,7 +78,12 @@ def main():
                 elif note.channel=="env_changed":
                     print("Environment changed; graceful worker restart requested")
                     return 75
-        rows=db.fetch_new_rows(conn,table,since=last_seen)
+        if last_seen is None:
+            warmup_rows=config.WINDOW_SIZE+config.KALMAN_INIT_SAMPLES+5
+            rows=db.fetch_recent_rows(conn,table,rows_per_machine=warmup_rows)
+            print(f"[worker] Initial source sync: {len(rows)} recent rows across machines")
+        else:
+            rows=db.fetch_new_rows(conn,table,since=last_seen)
         for row in rows:
             machine_id=db.row_machine_id(row,cols)
             monitor=monitors.get(machine_id)

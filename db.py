@@ -154,6 +154,44 @@ def fetch_machine_ids(conn, table: str, limit: int = 1000) -> list[str]:
         return [str(row[0]).strip() for row in cur.fetchall() if str(row[0]).strip()]
 
 
+def fetch_latest_row(conn, table: str, machine_id: str):
+    """Return the newest raw source row for one machine, or None.
+
+    This is intentionally independent of the inference worker. The website
+    uses it to prove that it is connected to the configured production source
+    and to display current sensor channels even while a model is warming up or
+    the worker is unavailable.
+    """
+    dbcols = get_db_columns()
+    columns = [dbcols["timestamp"]] + ([dbcols["machine_id"]] if dbcols["machine_id"] else []) + dbcols["sensor_cols"]
+    column_identifiers = sql.SQL(", ").join(sql.Identifier(column) for column in columns)
+    table_identifier = sql.Identifier(table)
+    timestamp_identifier = sql.Identifier(dbcols["timestamp"])
+
+    if dbcols["machine_id"]:
+        query = sql.SQL(
+            "SELECT {columns} FROM {table} WHERE {machine} = %s "
+            "ORDER BY {timestamp} DESC LIMIT 1"
+        ).format(
+            columns=column_identifiers,
+            table=table_identifier,
+            machine=sql.Identifier(dbcols["machine_id"]),
+            timestamp=timestamp_identifier,
+        )
+        args = (machine_id,)
+    elif machine_id != DEFAULT_MACHINE_ID:
+        return None
+    else:
+        query = sql.SQL(
+            "SELECT {columns} FROM {table} ORDER BY {timestamp} DESC LIMIT 1"
+        ).format(columns=column_identifiers, table=table_identifier, timestamp=timestamp_identifier)
+        args = ()
+
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(query, args)
+        return cur.fetchone()
+
+
 def fetch_new_rows(conn, table: str, since=None, limit: int = 5000):
     """
     Returns rows after `since` (or all rows when it is None), ordered by
@@ -237,6 +275,45 @@ def fetch_rows_between(conn, table: str, start, end, limit: int = 200000, machin
         args = (start, end, limit)
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(query, args)
+        return cur.fetchall()
+
+
+def fetch_recent_rows(conn, table: str, rows_per_machine: int = 30):
+    """Return a recent warm-up tail for every machine in chronological order.
+
+    A production worker restart should synchronize to the current source, not
+    replay the table from its oldest row. Each machine gets enough independent
+    history to rebuild rolling/Kalman state before incremental polling resumes.
+    """
+    rows_per_machine = max(1, min(int(rows_per_machine), 10000))
+    dbcols = get_db_columns()
+    columns = [dbcols["timestamp"]] + ([dbcols["machine_id"]] if dbcols["machine_id"] else []) + dbcols["sensor_cols"]
+    column_identifiers = sql.SQL(", ").join(sql.Identifier(column) for column in columns)
+    timestamp_identifier = sql.Identifier(dbcols["timestamp"])
+    table_identifier = sql.Identifier(table)
+
+    if dbcols["machine_id"]:
+        machine_identifier = sql.Identifier(dbcols["machine_id"])
+        query = sql.SQL(
+            "WITH ranked AS ("
+            " SELECT {columns}, row_number() OVER (PARTITION BY {machine} ORDER BY {timestamp} DESC) AS source_rank"
+            " FROM {table}"
+            ") SELECT {columns} FROM ranked WHERE source_rank <= %s "
+            "ORDER BY {timestamp}, {machine}"
+        ).format(
+            columns=column_identifiers,
+            machine=machine_identifier,
+            timestamp=timestamp_identifier,
+            table=table_identifier,
+        )
+    else:
+        query = sql.SQL(
+            "SELECT {columns} FROM (SELECT {columns} FROM {table} "
+            "ORDER BY {timestamp} DESC LIMIT %s) recent ORDER BY {timestamp}"
+        ).format(columns=column_identifiers, table=table_identifier, timestamp=timestamp_identifier)
+
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(query, (rows_per_machine,))
         return cur.fetchall()
 
 

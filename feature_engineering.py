@@ -18,6 +18,35 @@ from scipy.stats import kurtosis, skew
 import config
 
 
+def _effectively_constant(values) -> bool:
+    """Whether a window has too little variation for stable moments.
+
+    Industrial channels are often quantized and can remain exactly or almost
+    flat for many samples. Passing those values to scipy.stats skew/kurtosis
+    causes catastrophic-cancellation warnings and produces unstable features.
+    """
+    values = np.asarray(values, dtype=float)
+    if values.size == 0:
+        return True
+    scale = max(1.0, float(np.max(np.abs(values))))
+    tolerance = np.finfo(float).eps * scale * 100
+    return float(np.ptp(values)) <= tolerance
+
+
+def _safe_kurtosis(values) -> float:
+    if len(values) <= 3 or _effectively_constant(values):
+        return 0.0
+    value = float(kurtosis(values, bias=False))
+    return value if np.isfinite(value) else 0.0
+
+
+def _safe_skew(values) -> float:
+    if len(values) <= 2 or _effectively_constant(values):
+        return 0.0
+    value = float(skew(values, bias=False))
+    return value if np.isfinite(value) else 0.0
+
+
 def _rolling_stats(series: pd.Series, window: int, min_periods: int, prefix: str) -> pd.DataFrame:
     roll = series.rolling(window=window, min_periods=min_periods)
     out = pd.DataFrame({
@@ -26,18 +55,21 @@ def _rolling_stats(series: pd.Series, window: int, min_periods: int, prefix: str
         f"{prefix}_max": roll.max(),
         f"{prefix}_min": roll.min(),
         f"{prefix}_rms": roll.apply(lambda x: np.sqrt(np.mean(np.square(x))), raw=True),
-        f"{prefix}_kurtosis": roll.apply(lambda x: kurtosis(x, bias=False) if len(x) > 3 else np.nan, raw=True),
-        f"{prefix}_skew": roll.apply(lambda x: skew(x, bias=False) if len(x) > 2 else np.nan, raw=True),
+        f"{prefix}_kurtosis": roll.apply(_safe_kurtosis, raw=True),
+        f"{prefix}_skew": roll.apply(_safe_skew, raw=True),
     })
     # crest factor = peak / rms — classic early-defect vibration indicator
-    out[f"{prefix}_crest_factor"] = roll.max() / out[f"{prefix}_rms"].replace(0, np.nan)
+    rms = out[f"{prefix}_rms"]
+    out[f"{prefix}_crest_factor"] = (roll.max() / rms.replace(0, np.nan)).where(rms != 0, 0.0)
     return out
 
 
 def _trend_slope(series: pd.Series, window: int, min_periods: int) -> pd.Series:
     def _slope(x):
-        if len(x) < 2 or np.all(x == x[0]):
+        if len(x) < 2:
             return np.nan
+        if _effectively_constant(x):
+            return 0.0
         idx = np.arange(len(x))
         return np.polyfit(idx, x, 1)[0]
 
@@ -68,9 +100,15 @@ def create_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
     # raw columns now that's all 10 pairs instead of 3.
     corr_frame = {}
     for col_a, col_b in itertools.combinations(sensor_cols, 2):
-        corr_frame[f"{col_a}_{col_b}_corr"] = (
-            df[col_a].rolling(window=w, min_periods=mp).corr(df[col_b])
-        )
+        rolling_a = df[col_a].rolling(window=w, min_periods=mp)
+        rolling_b = df[col_b].rolling(window=w, min_periods=mp)
+        correlation = rolling_a.corr(df[col_b])
+        ready = (rolling_a.count() >= mp) & (rolling_b.count() >= mp)
+        # Correlation is undefined when either complete window is constant.
+        # Treat that as no measured linear relationship rather than dropping
+        # an otherwise valid production tick from the feature table.
+        correlation = correlation.mask(ready & correlation.isna(), 0.0)
+        corr_frame[f"{col_a}_{col_b}_corr"] = correlation
     feat_frames.append(pd.DataFrame(corr_frame))
 
     result = pd.concat(feat_frames, axis=1)
