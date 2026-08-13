@@ -96,6 +96,7 @@ def _fit_and_save(
     reference_rows=None,
     machine_reference_frames=None,
     machine_health_frames=None,
+    reference_features=None,
     metadata_extra=None,
 ):
     scorer = AnomalyScorer()
@@ -135,6 +136,7 @@ def _fit_and_save(
         feature_cols,
         reference_timestamps=reference_df[config.COL_TIMESTAMP],
         reference_rows=reference_rows,
+        reference_features=reference_features,
         machine_calibrations=machine_calibrations,
         metadata_extra=metadata_extra,
     )
@@ -298,6 +300,10 @@ def _train_from_live(args):
         for machine_id, frame in balanced_frames.items()
         for timestamp in frame[config.COL_TIMESTAMP]
     ]
+    reference_features = pd.concat(
+        [frame.assign(machine_id=machine_id) for machine_id, frame in balanced_frames.items()],
+        ignore_index=True,
+    )[["machine_id", config.COL_TIMESTAMP, *feature_cols]]
 
     _fit_and_save(
         reference_df,
@@ -305,6 +311,7 @@ def _train_from_live(args):
         health_check_df=health_check_df,
         health_check_label="all selected commissioning windows",
         reference_rows=reference_rows,
+        reference_features=reference_features,
         machine_reference_frames=machine_reference_frames,
         machine_health_frames=machine_health_frames,
         metadata_extra={

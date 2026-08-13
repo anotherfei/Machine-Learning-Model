@@ -62,7 +62,7 @@ TRAINING_KEYS = (
 def validate_training_config(values: dict[str, Any]) -> dict[str, float]:
     """
     These already drove retrain_service.run_shadow_retrain() before this
-    validator existed (see should_retrain()/_dedup()/_current_reference_features())
+    validator existed (see should_retrain()/_dedup_within_machine()/reference balancing)
     — they just weren't editable from anywhere but a direct DB write.
     This only validates the values are sane; it doesn't change what they do.
     """

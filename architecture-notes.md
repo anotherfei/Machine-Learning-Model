@@ -44,6 +44,31 @@ scale for one specific machine without refitting the tree. It is useful
 when a new machine joins after initial training or a serviced machine's
 healthy operating baseline has materially changed.
 
+## Shared-model retraining
+
+The active bundle carries `reference_features.csv`: the exact balanced,
+machine-aware feature corpus used to fit its tree. Shadow retraining starts
+from this artifact instead of trying to recover pooled features from a
+timestamp-only CSV lookup.
+
+Only alerts that an operator marks `confirmed_normal` become retraining
+candidates. The scheduler evaluates the batch and age thresholds per machine.
+Candidates are cosine-deduplicated only against candidates from the same
+machine, then merged into that machine's reference. Rebalancing gives every
+machine the same row count and prioritizes new confirmed-normal rows when old
+rows must be displaced. Retraining never onboards a new machine from alert
+samples because those are a biased slice of its operating distribution. Add a
+new machine by rerunning balanced initial training with a confirmed-healthy
+commissioning window.
+
+Each shadow model must pass the confirmed-normal false-positive gate for every
+machine independently. Permanent false-negative regression windows are rebuilt
+from the matching machine's live raw rows and scored with that machine's
+proposed calibration. A shadow is promotable only if every machine-level gate
+and every regression test passes. Promotable shadows already contain and have
+database assignments for fresh per-machine calibrations, so promotion switches
+the shared tree and its machine health anchors together.
+
 ## Production
 
 `React/Vite -> FastAPI -> PostgreSQL` for control-plane requests and history.

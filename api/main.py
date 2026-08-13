@@ -92,10 +92,14 @@ def _bootstrap():
 def _scheduled_retrain():
     if not runtime_config.get("AUTO_RETRAIN_ENABLED", True):
         return
+    c=None
     try:
-        c=conn(); retrain_service.run_shadow_retrain(c, force=False); c.close()
+        c=conn(); retrain_service.run_shadow_retrain(c, force=False)
     except Exception as e:
         print(f"[retrain-job] {e}")
+    finally:
+        if c is not None:
+            c.close()
 
 @app.on_event("startup")
 def startup():
@@ -221,7 +225,7 @@ def spec_bounds(user:User=Depends(current_user)):
 @app.get("/api/config/training")
 def training_config(user:User=Depends(current_user)):
     # Same knobs retrain_service.py already reads via runtime_config.get()
-    # (should_retrain(), _dedup(), _current_reference_features()) — this
+    # (should_retrain(), _dedup_within_machine(), reference balancing) — this
     # just surfaces them for the Models page instead of requiring a direct
     # DB write to change what "training" does. AUTO_RETRAIN_ENABLED gates
     # _scheduled_retrain() (the hourly APScheduler job) directly; it
@@ -300,6 +304,7 @@ def retrain_status(user:User=Depends(current_user)):
 def retrain_now(admin:User=Depends(require_admin)):
     c=conn()
     try: return retrain_service.run_shadow_retrain(c,force=True)
+    except ValueError as e: raise HTTPException(400,str(e))
     finally: c.close()
 
 @app.get("/api/models")

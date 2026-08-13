@@ -87,6 +87,8 @@ Every `(timestamp, machine_id)` row is polled in order. The worker creates an in
 
 Health-anchor recalibrations are also machine-specific: activating a recalibration for one machine does not change another machine's scorer.
 
+Shadow retraining follows the same shared-model rule. Confirmed-normal alerts are grouped and deduplicated by machine, new rows replace older rows without allowing one machine to dominate, and the proposed reference is balanced before fitting. False-positive validation runs separately for every machine, while regression windows are rebuilt and tested against their recorded machine ID. A promotable shadow includes fresh per-machine calibrations that take effect with the model when it is promoted.
+
 For an older source table without a machine column, leave `PG_COL_MACHINE_ID` unset; all rows are assigned to `DEFAULT_MACHINE_ID`. Omitting both `--all-machines` and `--machine-id` also preserves single-machine training with `DEFAULT_MACHINE_ID`:
 
 ```powershell

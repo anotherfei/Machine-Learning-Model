@@ -44,12 +44,12 @@ def config_hash(feature_config: dict = None) -> str:
     return hashlib.md5(combined.encode()).hexdigest()
 
 
-def _json_safe(value):
+def to_json_safe(value):
     """Convert numpy/pandas scalars and non-finite values to strict JSON."""
     if isinstance(value, dict):
-        return {str(k): _json_safe(v) for k, v in value.items()}
+        return {str(k): to_json_safe(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
-        return [_json_safe(v) for v in value]
+        return [to_json_safe(v) for v in value]
     if hasattr(value, "item"):
         value = value.item()
     if value is pd.NA or (isinstance(value, float) and not math.isfinite(value)):
@@ -65,7 +65,18 @@ def _write_optional_json(filename: str, payload) -> bool:
             os.remove(path)
         return False
     with open(path, "w") as f:
-        json.dump(_json_safe(payload), f, indent=2, allow_nan=False)
+        json.dump(to_json_safe(payload), f, indent=2, allow_nan=False)
+    return True
+
+
+def _write_optional_csv(filename: str, frame) -> bool:
+    """Write an optional table artifact, removing an older stale copy if absent."""
+    path = os.path.join(config.ARTIFACTS_DIR, filename)
+    if frame is None:
+        if os.path.exists(path):
+            os.remove(path)
+        return False
+    frame.to_csv(path, index=False)
     return True
 
 
@@ -74,6 +85,7 @@ def save_artifacts(
     feature_columns: list,
     reference_timestamps=None,
     reference_rows=None,
+    reference_features=None,
     machine_calibrations=None,
     metadata_extra: dict | None = None,
 ):
@@ -87,6 +99,9 @@ def save_artifacts(
         reference set should have been.
     reference_rows: optional machine-aware identities for the selected
         training rows. Each item contains machine_id and timestamp.
+    reference_features: optional machine-aware feature table containing the
+        exact balanced rows used to fit the shared model. Shadow retraining
+        uses this rather than trying to reconstruct live features by timestamp.
     machine_calibrations: optional per-machine health anchors computed
         after fitting the one shared model.
     metadata_extra: training-strategy provenance added to metadata.json.
@@ -116,6 +131,7 @@ def save_artifacts(
             for row in reference_rows
         ]
     wrote_reference_rows = _write_optional_json("reference_rows.json", normalized_reference_rows)
+    wrote_reference_features = _write_optional_csv("reference_features.csv", reference_features)
     wrote_machine_calibrations = _write_optional_json("machine_calibrations.json", machine_calibrations)
 
     metadata = {
@@ -139,6 +155,8 @@ def save_artifacts(
         extras.append("reference_timestamps.json")
     if wrote_reference_rows:
         extras.append("reference_rows.json")
+    if wrote_reference_features:
+        extras.append("reference_features.csv")
     if wrote_machine_calibrations:
         extras.append("machine_calibrations.json")
     extra = f", {', '.join(extras)}" if extras else ""
@@ -304,3 +322,15 @@ def load_machine_calibrations():
         return None
     with open(path) as f:
         return json.load(f)
+
+
+def load_reference_features():
+    """Load the exact machine-aware feature corpus used to fit the model."""
+    path = os.path.join(config.ARTIFACTS_DIR, "reference_features.csv")
+    if not os.path.exists(path):
+        return None
+    return pd.read_csv(
+        path,
+        parse_dates=[config.COL_TIMESTAMP],
+        dtype={"machine_id": str},
+    )

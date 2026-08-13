@@ -17,6 +17,7 @@ BUNDLE_FILES = (
     "metadata.json",
     "reference_timestamps.json",
     "reference_rows.json",
+    "reference_features.csv",
     "machine_calibrations.json",
 )
 
