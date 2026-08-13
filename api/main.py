@@ -12,10 +12,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from apscheduler.schedulers.background import BackgroundScheduler
 
+import config
 import db
 import db_schema
 import env_manager
 import model_registry
+import recalibrate_service
 import retrain_service
 import runtime_config
 import backfill
@@ -32,6 +34,14 @@ def conn(): return db.get_connection()
 
 def _bootstrap():
     c=conn(); db_schema.migrate(c)
+    # api/main.py's own process never read persisted runtime_config back in
+    # (only worker.py did, on the config_changed NOTIFY) — GETs here just
+    # returned in-memory _DEFAULTS until something PUT in THIS process.
+    # That's mostly cosmetic for thresholds (worker enforces the real
+    # policy either way), but _scheduled_retrain() below runs in this
+    # process and needs an accurate AUTO_RETRAIN_ENABLED on every restart,
+    # not just "since the last PUT" — so load it here too.
+    runtime_config.load_from_db(c)
     with c.cursor() as cur:
         cur.execute("SELECT count(*) FROM app_users"); n=cur.fetchone()[0]
         if n==0:
@@ -50,6 +60,8 @@ def _bootstrap():
 
 
 def _scheduled_retrain():
+    if not runtime_config.get("AUTO_RETRAIN_ENABLED", True):
+        return
     try:
         c=conn(); retrain_service.run_shadow_retrain(c, force=False); c.close()
     except Exception as e:
@@ -81,6 +93,15 @@ class RegressionBody(BaseModel):
     end:str
     minimum_anomaly_risk:float=0.6
 class BackfillBody(BaseModel): start:str; end:str; mode:str="repredict"
+class TrainingConfigBody(BaseModel):
+    RETRAIN_BATCH_SIZE: float
+    RETRAIN_TIME_CAP_DAYS: float
+    REFERENCE_WINDOW_MONTHS: float
+    REFERENCE_DEDUP_WINDOW_HOURS: float
+    REFERENCE_COSINE_SIMILARITY: float
+    AUTO_RETRAIN_ENABLED: bool = True
+class RecalibrateBody(BaseModel): hours: float = 24; min_rows: int = 200; source: str = "spec_bounds"
+class CalibrationActivateBody(BaseModel): calibration_id: int | None = None
 
 @app.post("/api/login")
 def login(body:LoginBody,response:Response):
@@ -134,6 +155,31 @@ def thresholds(user:User=Depends(current_user)):
 def set_thresholds(body:ThresholdBody,admin:User=Depends(require_admin)):
     values=body.model_dump()
     try: runtime_config.validate_thresholds(values)
+    except ValueError as e: raise HTTPException(400,str(e))
+    c=conn(); runtime_config.save_to_db(c,values,admin.username); c.close(); return values
+
+@app.get("/api/config/spec-bounds")
+def spec_bounds(user:User=Depends(current_user)):
+    # config.SPEC_MAX is a source-level constant (see config.py) — unlike
+    # thresholds/training it isn't runtime_config-backed, so there's no PUT:
+    # changing it means editing config.py and redeploying, not a form here.
+    return {"bounds":config.SPEC_MAX,"editable":False}
+
+@app.get("/api/config/training")
+def training_config(user:User=Depends(current_user)):
+    # Same knobs retrain_service.py already reads via runtime_config.get()
+    # (should_retrain(), _dedup(), _current_reference_features()) — this
+    # just surfaces them for the Models page instead of requiring a direct
+    # DB write to change what "training" does. AUTO_RETRAIN_ENABLED gates
+    # _scheduled_retrain() (the hourly APScheduler job) directly; it
+    # doesn't affect the "Run shadow retrain" button, which is always a
+    # deliberate manual action regardless of this setting.
+    keys=(*runtime_config.TRAINING_KEYS,"AUTO_RETRAIN_ENABLED")
+    return {k:runtime_config.get(k) for k in keys}
+@app.put("/api/config/training")
+def set_training_config(body:TrainingConfigBody,admin:User=Depends(require_admin)):
+    values=body.model_dump()
+    try: runtime_config.validate_training_config(values)
     except ValueError as e: raise HTTPException(400,str(e))
     c=conn(); runtime_config.save_to_db(c,values,admin.username); c.close(); return values
 
@@ -218,6 +264,47 @@ def promote(version_id:str,admin:User=Depends(require_admin)):
     return {"active":version_id}
 @app.post("/api/models/{version_id}/rollback")
 def rollback(version_id:str,admin:User=Depends(require_admin)): return promote(version_id,admin)
+@app.delete("/api/models/{version_id}")
+def delete_model(version_id:str,admin:User=Depends(require_admin)):
+    c=conn()
+    try: model_registry.delete_version(c,version_id)
+    except ValueError as e: raise HTTPException(400,str(e))
+    finally: c.close()
+    return {"deleted":version_id}
+
+@app.get("/api/models/{version_id}/calibrations")
+def list_calibrations(version_id:str,user:User=Depends(current_user)):
+    c=conn()
+    with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT id,version_id,source_rows,source_description,created_at,created_by FROM model_calibrations WHERE version_id=%s ORDER BY created_at DESC",(version_id,))
+        rows=cur.fetchall()
+        cur.execute("SELECT active_calibration_id FROM model_versions WHERE version_id=%s",(version_id,))
+        row=cur.fetchone()
+        active_calibration_id=row["active_calibration_id"] if row else None
+    c.close(); return {"items":rows,"active_calibration_id":active_calibration_id}
+@app.post("/api/models/{version_id}/recalibrate")
+def recalibrate_model(version_id:str,body:RecalibrateBody,admin:User=Depends(require_admin)):
+    if body.hours<=0: raise HTTPException(400,"hours must be > 0")
+    if body.min_rows<1: raise HTTPException(400,"min_rows must be >= 1")
+    if body.source not in recalibrate_service.SOURCES: raise HTTPException(400,f"source must be one of {recalibrate_service.SOURCES}")
+    c=conn()
+    try: return recalibrate_service.run(c,version_id,body.hours,body.min_rows,admin.username,source=body.source)
+    except ValueError as e: raise HTTPException(400,str(e))
+    finally: c.close()
+@app.post("/api/models/{version_id}/calibration/activate")
+def activate_calibration(version_id:str,body:CalibrationActivateBody,admin:User=Depends(require_admin)):
+    c=conn()
+    try: model_registry.set_calibration(c,version_id,body.calibration_id)
+    except ValueError as e: raise HTTPException(400,str(e))
+    finally: c.close()
+    return {"version_id":version_id,"active_calibration_id":body.calibration_id}
+@app.delete("/api/models/{version_id}/calibration/{calibration_id}")
+def delete_calibration(version_id:str,calibration_id:int,admin:User=Depends(require_admin)):
+    c=conn()
+    try: model_registry.delete_calibration(c,version_id,calibration_id)
+    except ValueError as e: raise HTTPException(400,str(e))
+    finally: c.close()
+    return {"deleted":calibration_id}
 
 @app.get("/api/history")
 def history(limit:int=50,offset:int=0,level:str|None=None,user:User=Depends(current_user)):
@@ -226,15 +313,36 @@ def history(limit:int=50,offset:int=0,level:str|None=None,user:User=Depends(curr
     if level:
         if level not in ("OK","WARN","CRITICAL"): raise HTTPException(400,"level must be OK, WARN, or CRITICAL")
         where="WHERE p.maintenance_level=%s"; args=[level]
+    # near-miss eligibility window, same "row count" convention /api/near-miss
+    # uses for its regr_slope() window (see that endpoint for why hours*60).
+    nm_window=max(2,6*60)
     c=conn()
     with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(f"SELECT count(*) AS total FROM spindle_predictions p {where}",args); total=cur.fetchone()["total"]
         cur.execute(f"""
+          WITH nm AS (
+            SELECT id, maintenance_level,
+                   regr_slope(anomaly_score, extract(epoch from tick_timestamp))
+                     OVER (ORDER BY tick_timestamp ROWS BETWEEN %s PRECEDING AND CURRENT ROW) AS slope
+            FROM spindle_predictions
+          )
           SELECT p.*,
                  a.status AS alert_status, a.level AS alert_level, a.trigger AS alert_trigger,
                  a.reviewed_by AS alert_reviewed_by, a.reviewed_at AS alert_reviewed_at,
-                 nmr.status AS near_miss_status, nmr.reviewed_by AS near_miss_reviewed_by, nmr.reviewed_at AS near_miss_reviewed_at
+                 -- A prediction with no near_miss_reviews row hasn't necessarily
+                 -- never been a near-miss — it may just not have been reviewed
+                 -- yet. /api/near-miss treats "eligible, no row" as status
+                 -- 'pending' (COALESCE(nmr.status,'pending')); this has to
+                 -- recompute the same eligibility (maintenance_level='OK' AND
+                 -- slope<0) or a pending near-miss silently disappears from
+                 -- History instead of showing "Near miss - Pending" the way
+                 -- the Near Miss queue itself does.
+                 COALESCE(nmr.status,
+                          CASE WHEN nm.maintenance_level='OK' AND nm.slope IS NOT NULL AND nm.slope<0
+                               THEN 'pending' END) AS near_miss_status,
+                 nmr.reviewed_by AS near_miss_reviewed_by, nmr.reviewed_at AS near_miss_reviewed_at
           FROM spindle_predictions p
+          JOIN nm ON nm.id=p.id
           LEFT JOIN LATERAL (
             SELECT status, level, trigger, reviewed_by, reviewed_at FROM alerts a
             WHERE a.tick_timestamp=p.tick_timestamp AND a.model_version=p.model_version
@@ -242,7 +350,7 @@ def history(limit:int=50,offset:int=0,level:str|None=None,user:User=Depends(curr
           ) a ON true
           LEFT JOIN near_miss_reviews nmr ON nmr.prediction_id=p.id
           {where}
-          ORDER BY p.tick_timestamp DESC LIMIT %s OFFSET %s""",args+[limit,offset]); rows=cur.fetchall()
+          ORDER BY p.tick_timestamp DESC LIMIT %s OFFSET %s""",[nm_window]+args+[limit,offset]); rows=cur.fetchall()
     c.close(); return {"items":rows,"total":total,"limit":limit,"offset":offset}
 
 @app.get("/api/near-miss")

@@ -18,6 +18,7 @@ _DEFAULTS = {
     "REFERENCE_DEDUP_WINDOW_HOURS": 24,
     "REFERENCE_COSINE_SIMILARITY": 0.98,
     "NEAR_MISS_REGRESSION_WINDOW_HOURS": 1,
+    "AUTO_RETRAIN_ENABLED": True,
 }
 
 _lock = threading.RLock()
@@ -52,6 +53,34 @@ def validate_thresholds(values: dict[str, Any]) -> dict[str, float]:
     return merged
 
 
+TRAINING_KEYS = (
+    "RETRAIN_BATCH_SIZE", "RETRAIN_TIME_CAP_DAYS", "REFERENCE_WINDOW_MONTHS",
+    "REFERENCE_DEDUP_WINDOW_HOURS", "REFERENCE_COSINE_SIMILARITY",
+)
+
+
+def validate_training_config(values: dict[str, Any]) -> dict[str, float]:
+    """
+    These already drove retrain_service.run_shadow_retrain() before this
+    validator existed (see should_retrain()/_dedup()/_current_reference_features())
+    — they just weren't editable from anywhere but a direct DB write.
+    This only validates the values are sane; it doesn't change what they do.
+    """
+    merged = {k: values.get(k, get(k)) for k in TRAINING_KEYS}
+    merged = {k: float(v) for k, v in merged.items()}
+    if merged["RETRAIN_BATCH_SIZE"] < 1:
+        raise ValueError("RETRAIN_BATCH_SIZE must be >= 1")
+    if merged["RETRAIN_TIME_CAP_DAYS"] < 1:
+        raise ValueError("RETRAIN_TIME_CAP_DAYS must be >= 1")
+    if merged["REFERENCE_WINDOW_MONTHS"] < 1:
+        raise ValueError("REFERENCE_WINDOW_MONTHS must be >= 1")
+    if merged["REFERENCE_DEDUP_WINDOW_HOURS"] < 0:
+        raise ValueError("REFERENCE_DEDUP_WINDOW_HOURS must be >= 0")
+    if not (0 <= merged["REFERENCE_COSINE_SIMILARITY"] <= 1):
+        raise ValueError("REFERENCE_COSINE_SIMILARITY must be in [0, 1]")
+    return merged
+
+
 def load_from_db(conn) -> dict[str, Any]:
     with conn.cursor() as cur:
         cur.execute("SELECT key, value FROM runtime_config")
@@ -70,6 +99,8 @@ def load_from_db(conn) -> dict[str, Any]:
 def save_to_db(conn, values: dict[str, Any], updated_by: str | None = None) -> None:
     if any(k in values for k in ("MAINTENANCE_PROB_URGENT", "MAINTENANCE_PROB_PLAN", "FAILURE_HEALTH_THRESHOLD", "MAINTENANCE_HEALTH_INSPECT")):
         validate_thresholds(values)
+    if any(k in values for k in TRAINING_KEYS):
+        validate_training_config(values)
     with conn.cursor() as cur:
         for key, value in values.items():
             cur.execute(

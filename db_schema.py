@@ -43,6 +43,27 @@ CREATE TABLE IF NOT EXISTS model_versions (
 CREATE UNIQUE INDEX IF NOT EXISTS model_versions_one_active
   ON model_versions ((status)) WHERE status='active';
 
+-- Health%-anchor recalibration runs (see recalibrate.py / recalibrate_service.py).
+-- Each row is ONE computed baseline_mean/std anchor for a specific model
+-- version, sourced from a recent live window; computing one does not
+-- change what's deployed by itself — model_versions.active_calibration_id
+-- (below) is the actual on/off switch a human flips from the Models page.
+CREATE TABLE IF NOT EXISTS model_calibrations (
+  id BIGSERIAL PRIMARY KEY,
+  version_id TEXT NOT NULL REFERENCES model_versions(version_id) ON DELETE CASCADE,
+  calibration JSONB NOT NULL,
+  source_rows INTEGER NOT NULL,
+  source_description TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  created_by TEXT
+);
+CREATE INDEX IF NOT EXISTS model_calibrations_version_idx ON model_calibrations(version_id, created_at DESC);
+
+-- NULL = use the pooled/default calibration baked into the bundle itself
+-- ("normal"). Set = use that specific recalibration run's baseline
+-- instead ("recalibrated"). See model_registry.promote()/set_calibration().
+ALTER TABLE model_versions ADD COLUMN IF NOT EXISTS active_calibration_id BIGINT REFERENCES model_calibrations(id);
+
 CREATE TABLE IF NOT EXISTS regression_tests (
   id BIGSERIAL PRIMARY KEY,
   description TEXT NOT NULL,

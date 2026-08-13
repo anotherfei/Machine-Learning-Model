@@ -181,3 +181,30 @@ def fetch_rows_between(conn, table: str, start, end, limit: int = 200000):
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(query, (start, end, limit))
         return cur.fetchall()
+
+
+def fetch_ok_prediction_timestamps(conn, start, end, limit: int = 200000):
+    """
+    Returns tick_timestamp values (ascending) from spindle_predictions
+    where maintenance_level='OK', for start <= tick_timestamp < end.
+
+    This is the *threshold-based* alternative to select_spec_normal_rows()
+    (see preprocessing.py): instead of judging "normal" from fixed raw
+    sensor spec bounds (config.SPEC_*), it reads the label the live
+    pipeline already assigned each tick — which itself comes from the
+    runtime-editable maintenance thresholds (MAINTENANCE_HEALTH_INSPECT /
+    FAILURE_HEALTH_THRESHOLD / MAINTENANCE_PROB_*, see runtime_config.py
+    and maintenance.py), not a static config value. Only timestamps come
+    back (not raw_reading) because recalibrate_service still needs the
+    *full* contiguous window from the production sensor table to compute
+    correct rolling features before filtering down to these rows — same
+    reasoning as select_spec_normal_rows()'s docstring: filtering the raw
+    readings first and feature-engineering the resulting gaps afterward
+    would corrupt the rolling window around every skipped row.
+    """
+    query = """SELECT tick_timestamp FROM spindle_predictions
+               WHERE tick_timestamp >= %s AND tick_timestamp < %s AND maintenance_level='OK'
+               ORDER BY tick_timestamp ASC LIMIT %s"""
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(query, (start, end, limit))
+        return [r["tick_timestamp"] for r in cur.fetchall()]

@@ -68,3 +68,40 @@ into its own reference-style table — was deliberately left alone:
 
 If you do want the full rename later, the regression-tests wiring above already gives you the
 FN-side data path — the remaining work is purely UI/schema vocabulary, not new backend logic.
+
+## Addendum: do `MAINTENANCE_TREND_DEBOUNCE_TICKS`/`MAINTENANCE_TREND_RECOVERY_TICKS` mean these aren't "true" FP/FN?
+
+Short answer: no — the debounce/recovery window is already baked into the thing being judged,
+so a human confirming or flagging it is still judging a real decision, not a raw noisy score.
+
+Longer version, traced through the actual code:
+- `maintenance.py`'s `MaintenanceDebouncer` requires `MAINTENANCE_TREND_DEBOUNCE_TICKS` (5)
+  consecutive confirming ticks to escalate, and the longer `MAINTENANCE_TREND_RECOVERY_TICKS`
+  (15) to de-escalate — deliberately asymmetric, since a false "all clear" is worse than a slow
+  one. While a candidate level hasn't hit its required tick count yet, the debouncer holds and
+  keeps *reporting the previous, already-confirmed level*.
+- `worker.py` only ever persists that reported (post-debounce) `level` — to `spindle_predictions`,
+  to `alerts`, and (via the same `maintenance_level` column) to Near Miss eligibility. The raw,
+  still-climbing/clearing candidate level is never written anywhere a reviewer sees it.
+- So by the time anything reaches Alert Review or Near Miss, the debouncing has *already happened*.
+  A `confirmed_normal` alert isn't "the reviewer disagreed with a jittery raw score" — it's "the
+  reviewer disagreed with the level the debouncer had already confirmed and the system actually
+  acted on." Same for a flagged Near Miss: `maintenance_level='OK'` there is the debounced OK, not
+  a single noisy tick.
+- That makes it a real FP/FN of the *deployed decision* (what evaluate_production.py's
+  `y_maintenance_pred` also scores against) — the debounce ticks changed how quickly that decision
+  was reached and how long it persisted, not whether the human's judgment of it is valid.
+
+Where the ticks *do* matter is interpretation, not validity: two `confirmed_normal` alerts can
+still mean different things — a WARN that took the full 5 ticks to earn and turned out fine, versus
+one on the edge of clearing that would've self-resolved in another tick or two if RECOVERY_TICKS
+were shorter. Neither is "not a real FP", but the first says more about the underlying signal
+(`MAINTENANCE_TREND_DEBOUNCE_TICKS`, a review-time decision) than about hysteresis, and the second
+says more about the hold-down window itself (`MAINTENANCE_TREND_RECOVERY_TICKS`, a policy knob).
+The `maintenance_reason` field already carries this context (e.g. "Holding at WARN — needs N more
+confirming ticks") and is shown on both the Alert and History detail views, so a reviewer isn't
+judging blind — but nothing currently separates "FP where debounce config was the dominant factor"
+from "FP where the model was just wrong" in aggregate counts. That split wasn't built here (it's
+a metrics/analysis question, not a bug), but it's the natural next step if the debounce ticks
+specifically — as opposed to review outcomes in general — are what you want to evaluate.
+

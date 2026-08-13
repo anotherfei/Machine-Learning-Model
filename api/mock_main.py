@@ -163,6 +163,10 @@ def initialize_mock_database(reset: bool = False) -> Path:
               version_id TEXT PRIMARY KEY, artifact_path TEXT NOT NULL, reference_signature TEXT NOT NULL,
               status TEXT NOT NULL, validation_report TEXT, created_at TEXT NOT NULL, promoted_at TEXT, promoted_by TEXT
             );
+            CREATE TABLE IF NOT EXISTS model_calibrations(
+              id INTEGER PRIMARY KEY AUTOINCREMENT, version_id TEXT NOT NULL, calibration TEXT NOT NULL,
+              source_rows INTEGER NOT NULL, source_description TEXT, created_at TEXT NOT NULL, created_by TEXT
+            );
             CREATE TABLE IF NOT EXISTS regression_tests(
               id INTEGER PRIMARY KEY AUTOINCREMENT, description TEXT NOT NULL, start_ts TEXT NOT NULL, end_ts TEXT NOT NULL,
               minimum_anomaly_risk REAL NOT NULL, created_at TEXT NOT NULL
@@ -182,6 +186,14 @@ def initialize_mock_database(reset: bool = False) -> Path:
             );
             """
         )
+        # SQLite has no "ADD COLUMN IF NOT EXISTS"; guard manually so this
+        # (idempotent, run on every startup) doesn't fail with "duplicate
+        # column name" on the second run. NULL = "normal"/pooled
+        # calibration — same convention as model_registry.py's Postgres
+        # column of the same name.
+        existing_cols = {r[1] for r in c.execute("PRAGMA table_info(model_versions)").fetchall()}
+        if "active_calibration_id" not in existing_cols:
+            c.execute("ALTER TABLE model_versions ADD COLUMN active_calibration_id INTEGER")
         if c.execute("SELECT count(*) FROM app_users").fetchone()[0] == 0:
             username = os.getenv("BOOTSTRAP_ADMIN_USER", "admin")
             password = os.getenv("BOOTSTRAP_ADMIN_PASSWORD", "change-me-on-first-deployment")
@@ -198,11 +210,15 @@ def initialize_mock_database(reset: bool = False) -> Path:
         if c.execute("SELECT count(*) FROM model_versions").fetchone()[0] == 0:
             now = _iso(_now())
             c.execute(
-                "INSERT INTO model_versions VALUES(?,?,?,?,?,?,?,?)",
+                """INSERT INTO model_versions
+                   (version_id,artifact_path,reference_signature,status,validation_report,created_at,promoted_at,promoted_by)
+                   VALUES(?,?,?,?,?,?,?,?)""",
                 ("mock-demo-v1", "mock://artifacts/mock-demo-v1", "mock-reference", "active", json.dumps({"mode":"mock","passed":True}), now, now, "bootstrap"),
             )
             c.execute(
-                "INSERT INTO model_versions VALUES(?,?,?,?,?,?,?,?)",
+                """INSERT INTO model_versions
+                   (version_id,artifact_path,reference_signature,status,validation_report,created_at,promoted_at,promoted_by)
+                   VALUES(?,?,?,?,?,?,?,?)""",
                 ("mock-shadow-v2", "mock://artifacts/mock-shadow-v2", "mock-reference-v2", "shadow", json.dumps({"mode":"mock","passed":True,"note":"demo shadow model"}), now, None, None),
             )
         if c.execute("SELECT count(*) FROM spindle_predictions").fetchone()[0] == 0:
@@ -261,6 +277,16 @@ class EnvBody(BaseModel): values: dict[str, str]
 class UserCreate(BaseModel): username: str; password: str; role: str = "viewer"
 class RegressionBody(BaseModel): description: str; start: str; end: str; minimum_anomaly_risk: float = 0.6
 class BackfillBody(BaseModel): start: str; end: str; mode: str = "repredict"
+class TrainingConfigBody(BaseModel):
+    RETRAIN_BATCH_SIZE: float
+    RETRAIN_TIME_CAP_DAYS: float
+    REFERENCE_WINDOW_MONTHS: float
+    REFERENCE_DEDUP_WINDOW_HOURS: float
+    REFERENCE_COSINE_SIMILARITY: float
+    AUTO_RETRAIN_ENABLED: bool = True
+class RecalibrateBody(BaseModel): hours: float = 24; min_rows: int = 200; source: str = "spec_bounds"
+RECALIBRATE_SOURCES = ("spec_bounds", "threshold")
+class CalibrationActivateBody(BaseModel): calibration_id: int | None = None
 
 
 @app.post("/api/login")
@@ -334,6 +360,35 @@ def set_thresholds(body: ThresholdBody, admin: User = Depends(require_admin)):
     return values
 
 
+@app.get("/api/config/spec-bounds")
+def spec_bounds(user: User = Depends(current_user)):
+    # Same static config.SPEC_MAX constant real mode reads in
+    # recalibrate_model()'s spec-bounds branch above — surfaced read-only
+    # since it lives in config.py, not runtime_config, so there's no PUT.
+    return {"bounds": config.SPEC_MAX, "editable": False}
+
+
+@app.get("/api/config/training")
+def training_config(user: User = Depends(current_user)):
+    keys = (*runtime_config.TRAINING_KEYS, "AUTO_RETRAIN_ENABLED")
+    return {k: runtime_config.get(k) for k in keys}
+
+
+@app.put("/api/config/training")
+def set_training_config(body: TrainingConfigBody, admin: User = Depends(require_admin)):
+    values = runtime_config.validate_training_config(body.model_dump())
+    values["AUTO_RETRAIN_ENABLED"] = body.AUTO_RETRAIN_ENABLED
+    c = _connect()
+    for key, value in values.items():
+        c.execute("INSERT INTO runtime_config(key,value,updated_by) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_by=excluded.updated_by", (key, json.dumps(value), admin.username))
+    c.commit(); c.close(); runtime_config.set_local(values)
+    # Mock mode has no scheduled background retrain job to gate (see
+    # api/main.py's _scheduled_retrain) — "Run shadow retrain" is always a
+    # manual click here regardless of this setting. It's still stored and
+    # returned so the Models page toggle isn't a dead control.
+    return values
+
+
 @app.get("/api/alerts")
 def alerts(status: str = "pending", trigger: str | None = None, limit: int = 50, offset: int = 0, user: User = Depends(current_user)):
     limit = max(1, min(limit, 500)); offset = max(0, offset)
@@ -396,7 +451,14 @@ def retrain_status(user: User = Depends(current_user)):
 def retrain_now(admin: User = Depends(require_admin)):
     vid = f"mock-shadow-{int(time.time())}"
     report = {"mode": "mock", "passed": True, "note": "Synthetic shadow model created for UI testing only."}
-    c = _connect(); c.execute("INSERT INTO model_versions VALUES(?,?,?,?,?,?,?,?)", (vid, f"mock://artifacts/{vid}", "mock-reference", "shadow", json.dumps(report), _iso(_now()), None, None)); c.commit(); c.close()
+    c = _connect()
+    c.execute(
+        """INSERT INTO model_versions
+           (version_id,artifact_path,reference_signature,status,validation_report,created_at,promoted_at,promoted_by)
+           VALUES(?,?,?,?,?,?,?,?)""",
+        (vid, f"mock://artifacts/{vid}", "mock-reference", "shadow", json.dumps(report), _iso(_now()), None, None),
+    )
+    c.commit(); c.close()
     return {"version_id": vid, "status": "shadow", "validation_report": report}
 
 
@@ -416,6 +478,122 @@ def promote(version_id: str, admin: User = Depends(require_admin)):
 @app.post("/api/models/{version_id}/rollback")
 def rollback(version_id: str, admin: User = Depends(require_admin)):
     return promote(version_id, admin)
+
+
+@app.delete("/api/models/{version_id}")
+def delete_model(version_id: str, admin: User = Depends(require_admin)):
+    c = _connect()
+    row = c.execute("SELECT status FROM model_versions WHERE version_id=?", (version_id,)).fetchone()
+    if not row: c.close(); raise HTTPException(404, "Model version not found")
+    if row["status"] == "active":
+        c.close(); raise HTTPException(400, "Cannot delete the active model version — promote a different version first.")
+    c.execute("DELETE FROM model_calibrations WHERE version_id=?", (version_id,))
+    c.execute("DELETE FROM model_versions WHERE version_id=?", (version_id,))
+    c.commit(); c.close()
+    return {"deleted": version_id}
+
+
+@app.get("/api/models/{version_id}/calibrations")
+def list_calibrations(version_id: str, user: User = Depends(current_user)):
+    c = _connect()
+    rows = [dict(r) for r in c.execute(
+        "SELECT id,version_id,source_rows,source_description,created_at,created_by FROM model_calibrations WHERE version_id=? ORDER BY created_at DESC",
+        (version_id,),
+    ).fetchall()]
+    row = c.execute("SELECT active_calibration_id FROM model_versions WHERE version_id=?", (version_id,)).fetchone()
+    c.close()
+    return {"items": rows, "active_calibration_id": row["active_calibration_id"] if row else None}
+
+
+@app.post("/api/models/{version_id}/recalibrate")
+def recalibrate_model(version_id: str, body: RecalibrateBody, admin: User = Depends(require_admin)):
+    if body.hours <= 0: raise HTTPException(400, "hours must be > 0")
+    if body.min_rows < 1: raise HTTPException(400, "min_rows must be >= 1")
+    if body.source not in RECALIBRATE_SOURCES: raise HTTPException(400, f"source must be one of {RECALIBRATE_SOURCES}")
+    c = _connect()
+    active = c.execute("SELECT version_id FROM model_versions WHERE status='active'").fetchone()
+    if not active or active["version_id"] != version_id:
+        c.close()
+        raise HTTPException(400, f"Only the active model version can be recalibrated from here (active is {active['version_id'] if active else None!r}).")
+    cutoff = _iso(_now() - timedelta(hours=body.hours))
+    if body.source == "threshold":
+        # Threshold source: "normal" = whatever the live pipeline itself
+        # tagged maintenance_level='OK', i.e. governed by the runtime
+        # MAINTENANCE_HEALTH_INSPECT/FAILURE_HEALTH_THRESHOLD thresholds
+        # rather than a fixed raw-sensor spec bound.
+        all_rows = c.execute(
+            "SELECT anomaly_score, raw_reading FROM spindle_predictions WHERE tick_timestamp >= ? AND maintenance_level='OK'", (cutoff,)
+        ).fetchall()
+        reason = "maintenance_level='OK' (runtime threshold)"
+    else:
+        # Spec-bounds source: "normal" = every raw reading within
+        # config.SPEC_MAX's fixed rated bounds, same definition
+        # recalibrate_service.py uses in real mode — independent of
+        # maintenance_level.
+        candidates = c.execute(
+            "SELECT anomaly_score, raw_reading FROM spindle_predictions WHERE tick_timestamp >= ?", (cutoff,)
+        ).fetchall()
+        active_bounds = {col: bound for col, bound in config.SPEC_MAX.items() if bound is not None}
+        all_rows = [r for r in candidates if all(json.loads(r["raw_reading"]).get(col, float("-inf")) <= bound for col, bound in active_bounds.items())]
+        reason = "within config.SPEC_MAX bounds"
+    if len(all_rows) < body.min_rows:
+        c.close()
+        raise HTTPException(400, (
+            f"Only {len(all_rows)} normal rows ({reason}) in the last {body.hours:g} hour(s) "
+            f"(need >= {body.min_rows}). Mock mode only has a small synthetic dataset — widen "
+            f"the window, lower the minimum, or try the other reference source."
+        ))
+    # Mock stand-in for isolation_forest.AnomalyScorer.calibrate(): real
+    # recalibration (recalibrate_service.py) fits baseline_mean/std against
+    # the deployed tree's own raw scores. Mock mode has no tree to score
+    # against, so this uses the demo anomaly_score distribution directly —
+    # structurally the same calibration shape, not a real recalibration.
+    scores = [r["anomaly_score"] for r in all_rows]
+    mean = sum(scores) / len(scores)
+    variance = sum((s - mean) ** 2 for s in scores) / len(scores)
+    std = max(variance ** 0.5, 1e-6)
+    calibration = {"baseline_mean": round(mean, 6), "baseline_std": round(std, 6), "mock_mode": True}
+    now = _iso(_now())
+    cur = c.execute(
+        "INSERT INTO model_calibrations(version_id,calibration,source_rows,source_description,created_at,created_by) VALUES(?,?,?,?,?,?)",
+        (version_id, json.dumps(calibration), len(all_rows), f"Mock live window, last {body.hours:g}h, {reason}", now, admin.username),
+    )
+    c.commit(); calibration_id = cur.lastrowid; c.close()
+    return {
+        "calibration_id": calibration_id, "version_id": version_id, "created_at": now,
+        "rows_used": len(all_rows), "window_hours": body.hours, "source": body.source,
+        "baseline_mean_before": None, "baseline_std_before": None,
+        "baseline_mean_after": calibration["baseline_mean"], "baseline_std_after": calibration["baseline_std"],
+        "mock_mode": True,
+    }
+
+
+@app.post("/api/models/{version_id}/calibration/activate")
+def activate_calibration(version_id: str, body: CalibrationActivateBody, admin: User = Depends(require_admin)):
+    c = _connect()
+    row = c.execute("SELECT version_id FROM model_versions WHERE version_id=?", (version_id,)).fetchone()
+    if not row: c.close(); raise HTTPException(404, "Model version not found")
+    if body.calibration_id is not None:
+        cal = c.execute("SELECT id FROM model_calibrations WHERE id=? AND version_id=?", (body.calibration_id, version_id)).fetchone()
+        if not cal:
+            c.close(); raise HTTPException(400, f"Calibration {body.calibration_id} does not belong to model version {version_id}")
+    c.execute("UPDATE model_versions SET active_calibration_id=? WHERE version_id=?", (body.calibration_id, version_id))
+    c.commit(); c.close()
+    return {"version_id": version_id, "active_calibration_id": body.calibration_id, "mock_mode": True}
+
+
+@app.delete("/api/models/{version_id}/calibration/{calibration_id}")
+def delete_calibration(version_id: str, calibration_id: int, admin: User = Depends(require_admin)):
+    c = _connect()
+    row = c.execute("SELECT active_calibration_id FROM model_versions WHERE version_id=?", (version_id,)).fetchone()
+    if not row: c.close(); raise HTTPException(404, "Model version not found")
+    if row["active_calibration_id"] == calibration_id:
+        c.close(); raise HTTPException(400, "Cannot delete the calibration currently in use — activate a different one (or Normal) first.")
+    cur = c.execute("DELETE FROM model_calibrations WHERE id=? AND version_id=?", (calibration_id, version_id))
+    if cur.rowcount != 1:
+        c.close(); raise HTTPException(400, f"Calibration {calibration_id} does not belong to model version {version_id}")
+    c.commit(); c.close()
+    return {"deleted": calibration_id, "mock_mode": True}
 
 
 @app.get("/api/history")
@@ -441,7 +619,16 @@ def history(limit: int = 50, offset: int = 0, level: str | None = None, user: Us
         nmr = c.execute(
             "SELECT status, reviewed_by, reviewed_at FROM near_miss_reviews WHERE prediction_id=?", (row["id"],)
         ).fetchone()
-        row["near_miss_status"] = nmr["status"] if nmr else None
+        if nmr:
+            row["near_miss_status"] = nmr["status"]
+        else:
+            # Same eligibility test /api/near-miss uses. Without this, a
+            # near-miss that simply hasn't been reviewed yet (no row in
+            # near_miss_reviews) looks identical to "never was a near-miss"
+            # here — both None — and silently disappears from History
+            # instead of showing "Near miss - Pending".
+            eligible = row["maintenance_level"] == "OK" and row["anomaly_score"] is not None and 0.18 <= row["anomaly_score"] <= 0.60
+            row["near_miss_status"] = "pending" if eligible else None
         row["near_miss_reviewed_by"] = nmr["reviewed_by"] if nmr else None
         row["near_miss_reviewed_at"] = nmr["reviewed_at"] if nmr else None
     c.close(); return {"items": rows, "total": total, "limit": limit, "offset": offset}

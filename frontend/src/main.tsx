@@ -101,6 +101,8 @@ const Icon = ({ name }: { name: string }) => {
     pulse: <><path d="M3 12h4l2-5 4 10 2-5h6"/></>,
     shield: <><path d="M12 3 5 6v5c0 4.6 2.9 7.7 7 10 4.1-2.3 7-5.4 7-10V6l-7-3Z"/><path d="m9 12 2 2 4-4"/></>,
     more: <><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></>,
+    check: <path d="M5 12.5 10 17l9-10"/>,
+    trash: <><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/><path d="M10 11v6M14 11v6"/></>,
   };
   return <svg className="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{p[name]}</svg>;
 };
@@ -281,6 +283,8 @@ function NearMissPanel(){
 }
 
 function Select({value,onChange,options}:{value:string;onChange:(v:string)=>void;options:Array<[string,string]>}){return <label className="select-wrap"><select value={value} onChange={e=>onChange(e.target.value)}>{options.map(([v,l])=><option key={v} value={v}>{l}</option>)}</select><span>⌄</span></label>}
+function Switch({checked,onChange,disabled}:{checked:boolean;onChange:()=>void;disabled?:boolean}){return <button type="button" role="switch" aria-checked={checked} disabled={disabled} className={cn('switch',checked&&'on')} onClick={onChange}><span className="switch-thumb"/></button>}
+function InUseBadge(){return <span className="in-use-badge"><Icon name="check"/>In use</span>}
 
 function Pagination({page,pageSize,total,onPage,onPageSize,sizes=PAGE_SIZES}:{page:number;pageSize:number;total:number;onPage:(p:number)=>void;onPageSize:(n:number)=>void;sizes?:number[]}){
   const pages=Math.max(1,Math.ceil(total/pageSize));
@@ -303,13 +307,77 @@ function JsonGrid({value}:{value:any}){const obj=typeof value==='object'&&value?
 function Disclosure({title,children,defaultOpen=false}:{title:string;children:ReactNode;defaultOpen?:boolean}){const[o,setO]=useState(defaultOpen);return <div className={cn('disclosure',o&&'open')}><button onClick={()=>setO(v=>!v)}><span>{title}</span><Icon name="chevron"/></button>{o&&<div className="disclosure-body">{children}</div>}</div>}
 
 function Models({admin}:{admin:boolean}){
-  const [rows,setRows]=useState<any[]>([]),[error,setError]=useState(''),[selected,setSelected]=useState<any|null>(null),[retrain,setRetrain]=useState<any>();
+  const [rows,setRows]=useState<any[]>([]),[error,setError]=useState(''),[selected,setSelected]=useState<any|null>(null),[retrain,setRetrain]=useState<any>(),[panel,setPanel]=useState<'training'|'calibration'|null>(null);
   const load=()=>Promise.all([api('/api/models'),api('/api/retrain/status')]).then(([m,s])=>{setRows(m);setRetrain(s)}).catch(e=>setError(String(e.message||e)));useEffect(()=>{load()},[]);
-  return <><PageHeader eyebrow="MODEL LIFECYCLE" title="Models & retraining" description="Review active and shadow bundles, validation evidence, and the human-controlled promotion path." actions={admin?<button className="primary" onClick={async()=>{await api('/api/retrain/trigger',{method:'POST'});load()}}>Run shadow retrain</button>:undefined}/>{error&&<Notice tone="critical">{error}</Notice>}
+  const activeVersion=rows.find(r=>r.status==='active');
+  const deleteVersion=async(versionId:string)=>{if(!window.confirm(`Delete model version ${versionId}? This removes its artifacts and recalibration history and cannot be undone.`))return;try{await api(`/api/models/${versionId}`,{method:'DELETE'});setSelected(null);load()}catch(e){setError(String((e as any).message||e))}};
+  return <><PageHeader eyebrow="MODEL LIFECYCLE" title="Models & retraining" description="Review active and shadow bundles, validation evidence, and the human-controlled promotion path." actions={<><button className="secondary" onClick={()=>setPanel('training')}>Training options</button>{activeVersion&&<button className="secondary" onClick={()=>setPanel('calibration')}>Health% calibration</button>}{admin&&<button className="primary" onClick={async()=>{await api('/api/retrain/trigger',{method:'POST'});load()}}>Run shadow retrain</button>}</>}/>{error&&<Notice tone="critical">{error}</Notice>}
   {retrain&&<div className="inline-summary"><div><span>Reference candidates</span><strong>{retrain.candidate_count??0}</strong></div><div><span>Batch target</span><strong>{retrain.batch_size??'—'}</strong></div><div><span>Retrain state</span><StatusBadge value={retrain.due?'DUE':'NOT DUE'} forced={retrain.due?'warning':'normal'}/></div><button className="text-button" onClick={()=>setSelected({__retrain:true,...retrain})}>How scheduling works <Icon name="info"/></button></div>}
   <section className="data-surface">{rows.length===0?<Empty title="No model versions" text="No registered model bundles were returned by the backend."/>:<div className="responsive-table"><table><thead><tr><th>Version</th><th>Status</th><th>Created</th><th>Validation</th><th>Promoted by</th><th/></tr></thead><tbody>{rows.map(m=><tr key={m.version_id} onClick={()=>setSelected(m)}><td><strong>{m.version_id}</strong><small>{m.reference_signature||'No reference signature'}</small></td><td><StatusBadge value={m.status}/></td><td>{shortTime(m.created_at)}</td><td><span className={cn('validation-dot',m.validation_report?.passed===false&&'bad')}/>{m.validation_report?.passed===false?'Failed':'Passed / available'}</td><td>{m.promoted_by||'—'}</td><td><Icon name="chevron"/></td></tr>)}</tbody></table></div>}</section>
-  {selected&&<Modal title={selected.__retrain?'Retraining schedule':selected.version_id} onClose={()=>setSelected(null)} wide={!selected.__retrain}>{selected.__retrain?<div className="detail-list"><DetailRow label="Confirmed-normal candidates" value={selected.candidate_count??0}/><DetailRow label="Batch threshold" value={selected.batch_size??'—'}/><DetailRow label="Currently due" value={selected.due?'Yes':'No'}/><p className="muted">The backend owns the retraining decision. This popup only exposes the current scheduler state.</p></div>:<><div className="split-detail"><div className="detail-list"><DetailRow label="Status" value={selected.status} badge={tone(selected.status)}/><DetailRow label="Artifact path" value={selected.artifact_path||'—'}/><DetailRow label="Reference signature" value={selected.reference_signature||'—'}/><DetailRow label="Created" value={shortTime(selected.created_at)}/><DetailRow label="Promoted" value={shortTime(selected.promoted_at)}/><DetailRow label="Promoted by" value={selected.promoted_by||'—'}/></div><div><p className="section-label">VALIDATION REPORT</p><pre className="code-panel">{JSON.stringify(selected.validation_report||{},null,2)}</pre></div></div>{admin&&selected.status!=='active'&&selected.status!=='rejected'&&<div className="modal-actions"><button className="primary" onClick={async()=>{await api(`/api/models/${selected.version_id}/promote`,{method:'POST'});setSelected(null);load()}}>Promote to active</button></div>}</>}</Modal>}
+  {selected&&<Modal title={selected.__retrain?'Retraining schedule':selected.version_id} onClose={()=>setSelected(null)} wide={!selected.__retrain}>{selected.__retrain?<div className="detail-list"><DetailRow label="Confirmed-normal candidates" value={selected.candidate_count??0}/><DetailRow label="Batch threshold" value={selected.batch_size??'—'}/><DetailRow label="Currently due" value={selected.due?'Yes':'No'}/><p className="muted">The backend owns the retraining decision. This popup only exposes the current scheduler state.</p></div>:<><div className="split-detail"><div className="detail-list"><DetailRow label="Status" value={selected.status} badge={tone(selected.status)}/><DetailRow label="Artifact path" value={selected.artifact_path||'—'}/><DetailRow label="Reference signature" value={selected.reference_signature||'—'}/><DetailRow label="Created" value={shortTime(selected.created_at)}/><DetailRow label="Promoted" value={shortTime(selected.promoted_at)}/><DetailRow label="Promoted by" value={selected.promoted_by||'—'}/></div><div><p className="section-label">VALIDATION REPORT</p><pre className="code-panel">{JSON.stringify(selected.validation_report||{},null,2)}</pre></div></div>{admin&&<div className="modal-actions">{selected.status!=='active'&&selected.status!=='rejected'&&<button className="primary" onClick={async()=>{await api(`/api/models/${selected.version_id}/promote`,{method:'POST'});setSelected(null);load()}}>Promote to active</button>}{selected.status!=='active'&&<button className="secondary danger-text" onClick={()=>deleteVersion(selected.version_id)}>Delete version</button>}</div>}</>}</Modal>}
+  {panel==='training'&&<Modal title="Training options" onClose={()=>setPanel(null)}><TrainingOptions admin={admin}/></Modal>}
+  {panel==='calibration'&&activeVersion&&<Modal title={`Health% calibration — active model (${activeVersion.version_id})`} onClose={()=>setPanel(null)} wide><CalibrationPanel admin={admin} versionId={activeVersion.version_id}/></Modal>}
   </>
+}
+
+function TrainingOptions({admin}:{admin:boolean}){
+  const [v,setV]=useState<any>(),[saved,setSaved]=useState(false),[error,setError]=useState('');
+  useEffect(()=>{api('/api/config/training').then(setV).catch(e=>setError(String(e.message||e)))},[]);
+  const meta:Record<string,{label:string;desc:string;unit:string}>={
+    RETRAIN_BATCH_SIZE:{label:'Retrain batch size',desc:'Confirmed-normal alerts needed before a shadow retrain is due.',unit:'alerts'},
+    RETRAIN_TIME_CAP_DAYS:{label:'Retrain time cap',desc:'Retrain becomes due after this many days even below the batch size.',unit:'days'},
+    REFERENCE_WINDOW_MONTHS:{label:'Reference window',desc:'How much history is kept in the reference set used for calibration and dedup.',unit:'months'},
+    REFERENCE_DEDUP_WINDOW_HOURS:{label:'Dedup window',desc:'Candidates within this many hours of an existing reference row are treated as duplicates.',unit:'hours'},
+    REFERENCE_COSINE_SIMILARITY:{label:'Dedup similarity',desc:'Cosine-similarity threshold above which a candidate is considered a duplicate.',unit:'0–1'},
+  };
+  if(error)return <Notice tone="critical">{error}</Notice>;
+  if(!v)return <Loading/>;
+  return <div className="settings-surface">
+  <div className="setting-row"><div><strong>Automatic retraining</strong><span>Hourly background check that runs a shadow retrain once enough confirmed-normal candidates are available. Turning this off doesn't disable the manual "Run shadow retrain" button above.</span><code>AUTO_RETRAIN_ENABLED</code></div><div className="setting-control toggle-control"><Switch checked={!!v.AUTO_RETRAIN_ENABLED} disabled={!admin} onChange={()=>setV({...v,AUTO_RETRAIN_ENABLED:!v.AUTO_RETRAIN_ENABLED})}/><span className={cn('toggle-state',v.AUTO_RETRAIN_ENABLED?'on':'off')}>{v.AUTO_RETRAIN_ENABLED?'On':'Off'}</span></div></div>
+  {Object.keys(v).filter(k=>k!=='AUTO_RETRAIN_ENABLED').map(k=><div className="setting-row" key={k}><div><strong>{meta[k]?.label||k}</strong><span>{meta[k]?.desc||k}</span><code>{k}</code></div><div className="setting-control"><input type="number" step="any" value={v[k]} disabled={!admin} onChange={e=>setV({...v,[k]:Number(e.target.value)})}/><span>{meta[k]?.unit}</span></div></div>)}
+  {admin&&<div className="modal-actions"><button className="primary" onClick={async()=>{setSaved(false);await api('/api/config/training',{method:'PUT',body:JSON.stringify(v)});setSaved(true)}}>Save training options</button></div>}
+  {saved&&<Notice tone="normal">Saved. The next shadow retrain — manual or scheduled — uses these values; nothing retrains automatically just from saving.</Notice>}
+  <p className="muted">These already drove every shadow retrain — this just makes them editable instead of a direct database write.</p>
+  </div>
+}
+
+function CalibrationPanel({admin,versionId}:{admin:boolean;versionId:string}){
+  const [data,setData]=useState<any>(),[error,setError]=useState(''),[busy,setBusy]=useState(false),[hours,setHours]=useState(24),[minRows,setMinRows]=useState(200),[source,setSource]=useState<'spec_bounds'|'threshold'>('spec_bounds');
+  const [specBounds,setSpecBounds]=useState<Record<string,number|null>|null>(null);
+  const [thresholds,setThresholds]=useState<any>(null),[thBusy,setThBusy]=useState(false),[thSaved,setThSaved]=useState(false);
+  const load=()=>api(`/api/models/${versionId}/calibrations`).then(setData).catch(e=>setError(String(e.message||e)));
+  useEffect(()=>{load()},[versionId]);
+  useEffect(()=>{api('/api/config/spec-bounds').then(r=>setSpecBounds(r.bounds)).catch(()=>{});api('/api/config/thresholds').then(setThresholds).catch(()=>{})},[]);
+  const activate=async(id:number|null)=>{setBusy(true);setError('');try{await api(`/api/models/${versionId}/calibration/activate`,{method:'POST',body:JSON.stringify({calibration_id:id})});await load()}catch(e){setError(String((e as any).message||e))}finally{setBusy(false)}};
+  const recalibrate=async()=>{setBusy(true);setError('');try{await api(`/api/models/${versionId}/recalibrate`,{method:'POST',body:JSON.stringify({hours,min_rows:minRows,source})});await load()}catch(e){setError(String((e as any).message||e))}finally{setBusy(false)}};
+  const removeCalibration=async(id:number)=>{if(!window.confirm('Delete this recalibration run? This cannot be undone.'))return;setBusy(true);setError('');try{await api(`/api/models/${versionId}/calibration/${id}`,{method:'DELETE'});await load()}catch(e){setError(String((e as any).message||e))}finally{setBusy(false)}};
+  const saveThresholds=async()=>{setThBusy(true);setThSaved(false);try{await api('/api/config/thresholds',{method:'PUT',body:JSON.stringify(thresholds)});setThSaved(true)}catch(e){setError(String((e as any).message||e))}finally{setThBusy(false)}};
+  if(error)return <Notice tone="critical">{error}</Notice>;
+  if(!data)return <Loading/>;
+  const activeId=data.active_calibration_id;
+  return <div className="settings-surface">
+    <div className={cn('setting-row',activeId==null&&'in-use-row')}><div><strong>Normal (pooled default)</strong><span>The health% anchor baked into this model's own bundle, unmodified.</span></div><div className="calibration-actions">{activeId==null?<InUseBadge/>:(admin?<button className="text-button" disabled={busy} onClick={()=>activate(null)}>Use this</button>:<span className="muted">Not in use</span>)}</div></div>
+    {data.items.length===0&&<p className="muted">No recalibration runs yet for this model version.</p>}
+    {data.items.map((c:any)=><div className={cn('setting-row',activeId===c.id&&'in-use-row')} key={c.id}><div><strong>Recalibrated — {shortTime(c.created_at)}</strong><span>{c.source_description||'—'} · {c.source_rows} rows · by {c.created_by||'—'}</span></div><div className="calibration-actions">{activeId===c.id?<InUseBadge/>:(admin?<button className="text-button" disabled={busy} onClick={()=>activate(c.id)}>Use this</button>:<span className="muted">Not in use</span>)}{admin&&<button className="icon-button danger" disabled={busy||activeId===c.id} title={activeId===c.id?'Switch off this calibration before deleting it':'Delete this recalibration'} onClick={()=>removeCalibration(c.id)}><Icon name="trash"/></button>}</div></div>)}
+    {admin&&<Disclosure title="Recalibrate now"><div className="explain-grid">
+      <label className="env-field"><span>Live window</span><input type="number" min={1} step="any" value={hours} onChange={e=>setHours(Number(e.target.value))}/><small>Hours of recent readings to compute the new baseline from.</small></label>
+      <label className="env-field"><span>Minimum rows required</span><input type="number" min={1} value={minRows} onChange={e=>setMinRows(Number(e.target.value))}/><small>Recalibration is refused if fewer normal rows than this are available in the window.</small></label>
+    </div>
+    <div className="setting-row"><div><strong>Reference source</strong><span>What counts as "normal" for this run.</span></div><div className="setting-control"><Select value={source} onChange={v=>setSource(v as 'spec_bounds'|'threshold')} options={[['spec_bounds','Spec bounds'],['threshold','Maintenance threshold']]}/></div></div>
+    <p className="muted">{source==='spec_bounds'?'Every raw sensor reading stays within the fixed rated bounds (config.SPEC_MAX) — a static definition, independent of the maintenance policy.':'The row\'s own live prediction came back OK — i.e. health stayed above the Thresholds page\'s inspection/failure limits. Tracks whatever the maintenance policy is currently tuned to instead of a fixed sensor range.'}</p>
+    {source==='spec_bounds'?<div className="source-detail">
+      <div className="source-detail-head"><span>config.SPEC_MAX</span><span className="static-tag">Fixed in code, not editable here</span></div>
+      {specBounds?<div className="json-grid">{Object.entries(specBounds).map(([k,val])=><div key={k}><span>{SENSOR_META[k]?.label||k}</span><strong>{val==null?'Not set':`≤ ${val} ${SENSOR_META[k]?.unit||''}`}</strong></div>)}</div>:<Loading/>}
+    </div>:<div className="source-detail">
+      <div className="source-detail-head"><span>Maintenance thresholds</span>{admin&&thresholds&&<button className="text-button" disabled={thBusy} onClick={saveThresholds}>{thBusy?'Saving…':'Save changes'}</button>}</div>
+      {thresholds?<div className="explain-grid">
+        <label className="env-field"><span>Inspection health threshold</span><input type="number" step="any" value={thresholds.MAINTENANCE_HEALTH_INSPECT} disabled={!admin} onChange={e=>setThresholds({...thresholds,MAINTENANCE_HEALTH_INSPECT:Number(e.target.value)})}/><small>Health % below which inspection is recommended.</small></label>
+        <label className="env-field"><span>Failure health threshold</span><input type="number" step="any" value={thresholds.FAILURE_HEALTH_THRESHOLD} disabled={!admin} onChange={e=>setThresholds({...thresholds,FAILURE_HEALTH_THRESHOLD:Number(e.target.value)})}/><small>Health % below which maintenance becomes critical.</small></label>
+      </div>:<Loading/>}
+      {thSaved&&<Notice tone="normal">Saved — this is the same value the Thresholds page uses, so it updates there too.</Notice>}
+    </div>}
+    <div className="modal-actions"><button className="primary" disabled={busy} onClick={recalibrate}>{busy?'Recalibrating…':'Recalibrate now'}</button></div><p className="muted">Only the active model version can be recalibrated here. Computing a recalibration doesn't change what's deployed by itself — pick "Use this" above to activate it, or leave it on Normal to discard it.</p></Disclosure>}
+  </div>
 }
 
 function HistoryPage(){
