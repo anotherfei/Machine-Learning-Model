@@ -19,6 +19,8 @@ type LiveTick = {
   mock_mode?: boolean;
 };
 
+const SENSOR_MODEL = 'ifm VVB001';
+
 const SENSOR_META: Record<string, { label: string; unit: string; detail: string }> = {
   a_rms_mps2: { label: 'Acceleration RMS', unit: 'm/s²', detail: 'Overall vibration acceleration energy.' },
   v_rms_mms: { label: 'Velocity RMS', unit: 'mm/s', detail: 'Overall vibration velocity severity.' },
@@ -142,7 +144,7 @@ function Notice({ children, tone: t='neutral' }: { children:ReactNode; tone?:str
 
 function App(){
   const [me,setMe]=useState<User|false|undefined>(); const [apiError,setApiError]=useState<string>(); const [page,setPage]=useState<Page>('Dashboard'); const [collapsed,setCollapsed]=useState(false);
-  const [machines,setMachines]=useState<string[]>(['VVB001']); const [machineId,setMachineId]=useState(localStorage.getItem('machine_id')||'VVB001');
+  const [machines,setMachines]=useState<string[]>(['MACHINE-001']); const [machineId,setMachineId]=useState(localStorage.getItem('machine_id')||'MACHINE-001');
   const refreshMe=()=>api('/api/me',{},5000).then((x:User)=>{setMe(x);setApiError(undefined)}).catch((err:any)=>{setMe(false);if(err?.name==='AbortError')setApiError('API timed out on /api/me');else if(!String(err?.message||'').includes('401'))setApiError(String(err?.message||err));});
   useEffect(()=>{refreshMe()},[]);
   useEffect(()=>{if(me)api('/api/machines').then((r:{items:string[];default:string})=>{const items=r.items.length?r.items:[r.default];setMachines(items);setMachineId(current=>items.includes(current)?current:(r.default||items[0]))}).catch(()=>{})},[me]);
@@ -155,6 +157,7 @@ function App(){
   return <div className={cn('app-shell',collapsed&&'nav-collapsed')}>
     <aside className="sidebar">
       <div className="brand-lockup"><div className="brand-symbol"><span/></div><div className="brand-copy"><small>AKEBONO</small><strong>Spindle Monitor</strong><span>{machineId}</span></div></div>
+      <div className="mobile-machine-picker"><Select ariaLabel="Select machine" value={machineId} onChange={setMachineId} options={machines.map(id=>[id,id] as [string,string])}/></div>
       <button className="collapse-btn" onClick={()=>setCollapsed(v=>!v)} title={collapsed?'Expand navigation':'Collapse navigation'}><Icon name="chevron"/></button>
       <nav>{nav.map(n=><button key={n.page} className={cn('nav-item',page===n.page&&'active')} onClick={()=>setPage(n.page)} title={n.label}><Icon name={n.icon}/><span>{n.label}</span>{page===n.page&&<i/>}</button>)}</nav>
       <div className="sidebar-bottom">
@@ -163,7 +166,7 @@ function App(){
       </div>
     </aside>
     <main className="workspace">
-      <header className="topbar"><div><p className="breadcrumb">{machineId} <span>/</span> {page}</p></div><div className="topbar-meta"><Select value={machineId} onChange={setMachineId} options={machines.map(id=>[id,id] as [string,string])}/><span className="system-pill"><span className="pulse-dot"/>System online</span><span className="clock">{new Date().toLocaleDateString([], {weekday:'short',month:'short',day:'numeric'})}</span></div></header>
+      <header className="topbar"><div><p className="breadcrumb">{machineId} <span>/</span> {page}</p></div><div className="topbar-meta"><div className="machine-picker"><Select ariaLabel="Select machine" value={machineId} onChange={setMachineId} options={machines.map(id=>[id,id] as [string,string])}/></div><span className="system-pill"><span className="pulse-dot"/>System online</span><span className="clock">{new Date().toLocaleDateString([], {weekday:'short',month:'short',day:'numeric'})}</span></div></header>
       <div className="content"><PageView key={machineId} page={page} role={me.role} mock={!!me.mock_mode} machineId={machineId}/></div>
     </main>
   </div>
@@ -222,7 +225,7 @@ function DashboardModal({kind,live,onClose}:{kind:string;live?:LiveTick;onClose:
   let title='Details',body:ReactNode=null;
   if(kind==='status'){title='Maintenance status evidence';body=<div className="detail-list"><DetailRow label="State" value={live?.maintenance?.level||'—'} badge={tone(live?.maintenance?.level)}/><DetailRow label="Trigger" value={triggerLabel(live?.maintenance?.trigger)}/><DetailRow label="Reason" value={live?.maintenance?.reason||'No reason received.'}/><DetailRow label="Health" value={`${fmt(live?.health_state,2)}%`}/><DetailRow label="Anomaly score" value={fmt(live?.anomaly_score,4)}/></div>}
   else if(kind==='anomaly'){title='How to read anomaly score';body=<><p>The anomaly score summarizes how unusual the current feature pattern is relative to the active model reference. The frontend only displays this value; it does not calculate or modify it.</p><div className="scale"><span>Lower deviation</span><i/><span>Higher deviation</span></div><p className="muted">Current score: <b>{fmt(live?.anomaly_score,4)}</b></p></>}
-  else if(kind==='model'||kind==='system'){title=kind==='model'?'Active model context':'Runtime context';body=<div className="detail-list"><DetailRow label="Model version" value={live?.model_version||'—'}/><DetailRow label="Latest tick" value={shortTime(live?.timestamp)}/><DetailRow label="Data path" value="Backend → WebSocket → browser"/><DetailRow label="Frontend role" value="Visualization only"/></div>}
+  else if(kind==='model'||kind==='system'){title=kind==='model'?'Active model context':'Runtime context';body=<div className="detail-list"><DetailRow label="Machine ID" value={live?.machine_id||'—'}/><DetailRow label="Sensor model" value={SENSOR_MODEL}/><DetailRow label="Model version" value={live?.model_version||'—'}/><DetailRow label="Latest tick" value={shortTime(live?.timestamp)}/><DetailRow label="Data path" value="Backend → WebSocket → browser"/><DetailRow label="Frontend role" value="Visualization only"/></div>}
   else if(kind==='demo'){title='Temporary mock mode';body=<><p>This session is driven by a local SQLite demo database and synthetic multi-machine ticks so the web experience can be tested without plant infrastructure.</p><div className="callout-grid"><div><b>Simulated</b><span>Sensor values, predictions, alerts, model metadata</span></div><div><b>Real application path</b><span>Authentication, API calls, review actions, WebSocket UI flow</span></div><div><b>Bypassed</b><span>Plant PostgreSQL and production ML inference worker</span></div></div></>}
   else if(kind==='sensors'){title='Sensor channel guide';body=<div className="detail-list">{Object.entries(SENSOR_META).map(([k,m])=><DetailRow key={k} label={`${m.label} (${k})`} value={`${m.detail}${m.unit?` Unit: ${m.unit}.`:''}`}/>)}</div>}
   else if(kind.startsWith('sensor:')){const k=kind.split(':')[1],m=SENSOR_META[k];title=m?.label||k;body=<div className="detail-list"><DetailRow label="Raw key" value={k}/><DetailRow label="Current value" value={`${fmt((live as any)?.[k],3)} ${m?.unit||''}`}/><DetailRow label="Meaning" value={m?.detail||'Sensor channel'}/><DetailRow label="Source" value="Backend live tick"/></div>}
@@ -286,7 +289,7 @@ function NearMissPanel({machineId}:{machineId:string}){
   </>
 }
 
-function Select({value,onChange,options}:{value:string;onChange:(v:string)=>void;options:Array<[string,string]>}){return <label className="select-wrap"><select value={value} onChange={e=>onChange(e.target.value)}>{options.map(([v,l])=><option key={v} value={v}>{l}</option>)}</select><span>⌄</span></label>}
+function Select({value,onChange,options,ariaLabel}:{value:string;onChange:(v:string)=>void;options:Array<[string,string]>;ariaLabel?:string}){return <label className="select-wrap"><select aria-label={ariaLabel} value={value} onChange={e=>onChange(e.target.value)}>{options.map(([v,l])=><option key={v} value={v}>{l}</option>)}</select><span>⌄</span></label>}
 function Switch({checked,onChange,disabled}:{checked:boolean;onChange:()=>void;disabled?:boolean}){return <button type="button" role="switch" aria-checked={checked} disabled={disabled} className={cn('switch',checked&&'on')} onClick={onChange}><span className="switch-thumb"/></button>}
 function InUseBadge(){return <span className="in-use-badge"><Icon name="check"/>In use</span>}
 

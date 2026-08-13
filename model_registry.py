@@ -10,7 +10,15 @@ import artifact_utils
 import config
 
 BUNDLES_DIR = os.path.join(config.ARTIFACTS_DIR, "versions")
-BUNDLE_FILES = ("isolation_forest.pkl", "feature_columns.json", "calibration.json", "metadata.json", "reference_timestamps.json")
+BUNDLE_FILES = (
+    "isolation_forest.pkl",
+    "feature_columns.json",
+    "calibration.json",
+    "metadata.json",
+    "reference_timestamps.json",
+    "reference_rows.json",
+    "machine_calibrations.json",
+)
 
 
 def new_version_id(now: dt.datetime | None = None) -> str:
@@ -22,8 +30,9 @@ def bundle_path(version_id: str) -> str:
     return os.path.join(BUNDLES_DIR, version_id)
 
 
-def reference_signature(timestamps) -> str:
-    payload = "\n".join(sorted(str(x) for x in timestamps)).encode()
+def reference_signature(reference_items) -> str:
+    """Hash timestamp-only or machine-aware reference identities."""
+    payload = "\n".join(sorted(str(x) for x in reference_items)).encode()
     return hashlib.sha256(payload).hexdigest()
 
 
@@ -53,10 +62,15 @@ def install_bundle(version_id: str) -> None:
     os.makedirs(config.ARTIFACTS_DIR, exist_ok=True)
     for name in BUNDLE_FILES:
         src = src_dir / name
+        destination = Path(config.ARTIFACTS_DIR) / name
         if src.exists():
             tmp = Path(config.ARTIFACTS_DIR) / (name + ".tmp")
             shutil.copy2(src, tmp)
-            os.replace(tmp, Path(config.ARTIFACTS_DIR) / name)
+            os.replace(tmp, destination)
+        elif name not in required and destination.exists():
+            # Optional provenance/calibration files belong to a specific
+            # version and must not leak from the previously installed bundle.
+            destination.unlink()
 
 
 def active_version(conn) -> str | None:

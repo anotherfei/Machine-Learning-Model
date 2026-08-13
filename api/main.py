@@ -60,9 +60,32 @@ def _bootstrap():
         cur.execute("SELECT count(*) FROM model_versions"); mv=cur.fetchone()[0]
         if mv==0 and os.path.exists(os.path.join(os.path.dirname(__file__),"..","artifacts","isolation_forest.pkl")):
             vid=model_registry.new_version_id(); path=model_registry.snapshot_current(vid)
+            # snapshot_current stamps the version ID into the versioned copy.
+            # Install that copy back to the active artifact path before the
+            # worker starts so predictions and per-machine calibration lookups
+            # use the same registry version ID from the first tick onward.
+            model_registry.install_bundle(vid)
             import artifact_utils
-            ts=artifact_utils.load_reference_timestamps(); signature=model_registry.reference_signature(ts if ts is not None else [])
+            reference_rows=artifact_utils.load_reference_rows()
+            if reference_rows is not None:
+                signature_source=[f"{row['machine_id']}\0{row['timestamp']}" for row in reference_rows]
+            else:
+                ts=artifact_utils.load_reference_timestamps(); signature_source=ts if ts is not None else []
+            signature=model_registry.reference_signature(signature_source)
             cur.execute("INSERT INTO model_versions(version_id,artifact_path,reference_signature,status,promoted_at,promoted_by) VALUES(%s,%s,%s,'active',now(),'bootstrap')",(vid,path,signature))
+            for machine_id, item in (artifact_utils.load_machine_calibrations() or {}).items():
+                cur.execute(
+                    """INSERT INTO model_calibrations(version_id,machine_id,calibration,source_rows,source_description,created_by)
+                       VALUES(%s,%s,%s::jsonb,%s,%s,'bootstrap') RETURNING id""",
+                    (vid,machine_id,json.dumps(item["calibration"]),item["source_rows"],
+                     "Initial calibration from balanced pooled commissioning training"),
+                )
+                calibration_id=cur.fetchone()[0]
+                cur.execute(
+                    """INSERT INTO machine_model_calibrations(machine_id,version_id,calibration_id)
+                       VALUES(%s,%s,%s)""",
+                    (machine_id,vid,calibration_id),
+                )
     c.commit(); c.close()
 
 
@@ -137,10 +160,19 @@ def machines(user:User=Depends(current_user)):
                          SELECT DISTINCT machine_id FROM spindle_predictions
                          UNION SELECT DISTINCT machine_id FROM alerts
                        ) machines ORDER BY machine_id""")
-        items=[row[0] for row in cur.fetchall() if row[0]]
+        items={row[0] for row in cur.fetchall() if row[0]}
+    try:
+        items.update(db.fetch_machine_ids(c,db.get_table_name()))
+    except Exception as exc:
+        # Persisted predictions still provide a usable selector if the raw
+        # source table is temporarily unavailable. The worker will report
+        # the underlying source error through its normal operational path.
+        c.rollback()
+        print(f"[machines] Source-table discovery unavailable: {exc}")
     c.close()
-    if db.DEFAULT_MACHINE_ID not in items: items.insert(0,db.DEFAULT_MACHINE_ID)
-    return {"items":items,"default":db.DEFAULT_MACHINE_ID}
+    items=sorted(items)
+    if not items: items=[db.DEFAULT_MACHINE_ID]
+    return {"items":items,"default":db.DEFAULT_MACHINE_ID if db.DEFAULT_MACHINE_ID in items else items[0]}
 
 @app.post("/api/users")
 def create_user(body:UserCreate,admin:User=Depends(require_admin)):

@@ -32,7 +32,8 @@ DB_PATH = ROOT / "mock_demo.db"
 _LOCK = threading.RLock()
 _RNG = random.Random(42)
 _login_attempts = defaultdict(deque)
-MACHINE_IDS = ("VVB001", "VVB002", "VVB003")
+MACHINE_IDS = ("MACHINE-001", "MACHINE-002", "MACHINE-003")
+LEGACY_MACHINE_IDS = dict(zip(("VVB001", "VVB002", "VVB003"), MACHINE_IDS))
 _live_index: dict[str, int] = {}
 
 app = FastAPI(title="Spindle Condition Monitoring API (Mock Demo)", version="1.0")
@@ -83,7 +84,7 @@ def _sensor_values(i: int, machine_id: str) -> dict[str, float]:
     }
 
 
-def _prediction(i: int, machine_id: str = "VVB001", when: datetime | None = None) -> dict:
+def _prediction(i: int, machine_id: str = "MACHINE-001", when: datetime | None = None) -> dict:
     when = when or _now()
     raw = _sensor_values(i, machine_id)
     # Keep demo values visually useful: mostly healthy, with periodic warnings/critical points.
@@ -155,7 +156,7 @@ def initialize_mock_database(reset: bool = False) -> Path:
             );
             CREATE TABLE IF NOT EXISTS runtime_config(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_by TEXT);
             CREATE TABLE IF NOT EXISTS alerts(
-              id INTEGER PRIMARY KEY AUTOINCREMENT, machine_id TEXT NOT NULL DEFAULT 'VVB001', tick_timestamp TEXT NOT NULL, model_version TEXT NOT NULL,
+              id INTEGER PRIMARY KEY AUTOINCREMENT, machine_id TEXT NOT NULL DEFAULT 'MACHINE-001', tick_timestamp TEXT NOT NULL, model_version TEXT NOT NULL,
               trigger TEXT NOT NULL, level TEXT NOT NULL, health_state REAL NOT NULL, anomaly_score REAL NOT NULL,
               raw_reading TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', reviewed_by TEXT, reviewed_at TEXT
             );
@@ -167,7 +168,7 @@ def initialize_mock_database(reset: bool = False) -> Path:
               status TEXT NOT NULL, validation_report TEXT, created_at TEXT NOT NULL, promoted_at TEXT, promoted_by TEXT
             );
             CREATE TABLE IF NOT EXISTS model_calibrations(
-              id INTEGER PRIMARY KEY AUTOINCREMENT, version_id TEXT NOT NULL, machine_id TEXT NOT NULL DEFAULT 'VVB001', calibration TEXT NOT NULL,
+              id INTEGER PRIMARY KEY AUTOINCREMENT, version_id TEXT NOT NULL, machine_id TEXT NOT NULL DEFAULT 'MACHINE-001', calibration TEXT NOT NULL,
               source_rows INTEGER NOT NULL, source_description TEXT, created_at TEXT NOT NULL, created_by TEXT
             );
             CREATE TABLE IF NOT EXISTS machine_model_calibrations(
@@ -175,12 +176,12 @@ def initialize_mock_database(reset: bool = False) -> Path:
               updated_at TEXT NOT NULL, PRIMARY KEY(machine_id,version_id)
             );
             CREATE TABLE IF NOT EXISTS regression_tests(
-              id INTEGER PRIMARY KEY AUTOINCREMENT, machine_id TEXT NOT NULL DEFAULT 'VVB001', description TEXT NOT NULL, start_ts TEXT NOT NULL, end_ts TEXT NOT NULL,
+              id INTEGER PRIMARY KEY AUTOINCREMENT, machine_id TEXT NOT NULL DEFAULT 'MACHINE-001', description TEXT NOT NULL, start_ts TEXT NOT NULL, end_ts TEXT NOT NULL,
               minimum_anomaly_risk REAL NOT NULL, created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS mock_env(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS spindle_predictions(
-              id INTEGER PRIMARY KEY AUTOINCREMENT, machine_id TEXT NOT NULL DEFAULT 'VVB001', tick_timestamp TEXT NOT NULL, model_version TEXT NOT NULL,
+              id INTEGER PRIMARY KEY AUTOINCREMENT, machine_id TEXT NOT NULL DEFAULT 'MACHINE-001', tick_timestamp TEXT NOT NULL, model_version TEXT NOT NULL,
               raw_reading TEXT NOT NULL, anomaly_score REAL NOT NULL, health_raw REAL NOT NULL, health_state REAL NOT NULL,
               trend_slope_per_day REAL NOT NULL, remaining_days REAL NOT NULL, failure_probability TEXT NOT NULL,
               maintenance_level TEXT NOT NULL, maintenance_reason TEXT NOT NULL, maintenance_trigger TEXT NOT NULL,
@@ -203,13 +204,24 @@ def initialize_mock_database(reset: bool = False) -> Path:
             c.execute("ALTER TABLE model_versions ADD COLUMN active_calibration_id INTEGER")
         calibration_cols = {r[1] for r in c.execute("PRAGMA table_info(model_calibrations)").fetchall()}
         if "machine_id" not in calibration_cols:
-            c.execute("ALTER TABLE model_calibrations ADD COLUMN machine_id TEXT NOT NULL DEFAULT 'VVB001'")
+            c.execute("ALTER TABLE model_calibrations ADD COLUMN machine_id TEXT NOT NULL DEFAULT 'MACHINE-001'")
         for table_name in ("alerts", "regression_tests", "spindle_predictions"):
             table_cols = {r[1] for r in c.execute(f"PRAGMA table_info({table_name})").fetchall()}
             if "machine_id" not in table_cols:
-                c.execute(f"ALTER TABLE {table_name} ADD COLUMN machine_id TEXT NOT NULL DEFAULT 'VVB001'")
+                c.execute(f"ALTER TABLE {table_name} ADD COLUMN machine_id TEXT NOT NULL DEFAULT 'MACHINE-001'")
+        # Earlier mock builds mistakenly used the VVB001 sensor model as an
+        # asset ID. Relabel those demo rows while keeping VVB001 as sensor
+        # specification metadata in config.py/preprocessing.py.
+        for old_machine_id, new_machine_id in LEGACY_MACHINE_IDS.items():
+            for table_name in ("alerts", "regression_tests", "spindle_predictions", "model_calibrations"):
+                c.execute(f"UPDATE {table_name} SET machine_id=? WHERE machine_id=?", (new_machine_id, old_machine_id))
+            c.execute("""INSERT OR IGNORE INTO machine_model_calibrations(machine_id,version_id,calibration_id,updated_at)
+                         SELECT ?,version_id,calibration_id,updated_at FROM machine_model_calibrations WHERE machine_id=?""",
+                      (new_machine_id, old_machine_id))
+            c.execute("DELETE FROM machine_model_calibrations WHERE machine_id=?", (old_machine_id,))
+        c.execute("UPDATE mock_env SET value=? WHERE key='DEFAULT_MACHINE_ID' AND value IN ('VVB001','VVB002','VVB003')", (MACHINE_IDS[0],))
         c.execute("""INSERT OR IGNORE INTO machine_model_calibrations(machine_id,version_id,calibration_id,updated_at)
-                     SELECT 'VVB001',version_id,active_calibration_id,datetime('now') FROM model_versions
+                     SELECT 'MACHINE-001',version_id,active_calibration_id,datetime('now') FROM model_versions
                      WHERE active_calibration_id IS NOT NULL""")
         c.execute("UPDATE model_versions SET active_calibration_id=NULL WHERE active_calibration_id IS NOT NULL")
         if c.execute("SELECT count(*) FROM app_users").fetchone()[0] == 0:
@@ -295,7 +307,7 @@ class ThresholdBody(BaseModel):
     MAINTENANCE_HEALTH_INSPECT: float
 class EnvBody(BaseModel): values: dict[str, str]
 class UserCreate(BaseModel): username: str; password: str; role: str = "viewer"
-class RegressionBody(BaseModel): description: str; start: str; end: str; machine_id: str = "VVB001"; minimum_anomaly_risk: float = 0.6
+class RegressionBody(BaseModel): description: str; start: str; end: str; machine_id: str = "MACHINE-001"; minimum_anomaly_risk: float = 0.6
 class BackfillBody(BaseModel): start: str; end: str; mode: str = "repredict"; machine_id: str | None = None
 class TrainingConfigBody(BaseModel):
     RETRAIN_BATCH_SIZE: float
@@ -304,7 +316,7 @@ class TrainingConfigBody(BaseModel):
     REFERENCE_DEDUP_WINDOW_HOURS: float
     REFERENCE_COSINE_SIMILARITY: float
     AUTO_RETRAIN_ENABLED: bool = True
-class RecalibrateBody(BaseModel): hours: float = 24; min_rows: int = 200; source: str = "spec_bounds"; machine_id: str = "VVB001"
+class RecalibrateBody(BaseModel): hours: float = 24; min_rows: int = 200; source: str = "spec_bounds"; machine_id: str = "MACHINE-001"
 RECALIBRATE_SOURCES = ("spec_bounds", "threshold")
 class CalibrationActivateBody(BaseModel): calibration_id: int | None = None
 
@@ -420,7 +432,7 @@ def set_training_config(body: TrainingConfigBody, admin: User = Depends(require_
 
 
 @app.get("/api/alerts")
-def alerts(status: str = "pending", trigger: str | None = None, machine_id: str = "VVB001", limit: int = 50, offset: int = 0, user: User = Depends(current_user)):
+def alerts(status: str = "pending", trigger: str | None = None, machine_id: str = "MACHINE-001", limit: int = 50, offset: int = 0, user: User = Depends(current_user)):
     limit = max(1, min(limit, 500)); offset = max(0, offset)
     count_sql = "SELECT count(*) FROM alerts WHERE status=? AND machine_id=?"; count_args: list = [status, machine_id]
     sql = "SELECT * FROM alerts WHERE status=? AND machine_id=?"; args: list = [status, machine_id]
@@ -525,7 +537,7 @@ def delete_model(version_id: str, admin: User = Depends(require_admin)):
 
 
 @app.get("/api/models/{version_id}/calibrations")
-def list_calibrations(version_id: str, machine_id: str = "VVB001", user: User = Depends(current_user)):
+def list_calibrations(version_id: str, machine_id: str = "MACHINE-001", user: User = Depends(current_user)):
     c = _connect()
     rows = [dict(r) for r in c.execute(
         "SELECT id,version_id,machine_id,source_rows,source_description,created_at,created_by FROM model_calibrations WHERE version_id=? AND machine_id=? ORDER BY created_at DESC",
@@ -600,7 +612,7 @@ def recalibrate_model(version_id: str, body: RecalibrateBody, admin: User = Depe
 
 
 @app.post("/api/models/{version_id}/calibration/activate")
-def activate_calibration(version_id: str, body: CalibrationActivateBody, machine_id: str = "VVB001", admin: User = Depends(require_admin)):
+def activate_calibration(version_id: str, body: CalibrationActivateBody, machine_id: str = "MACHINE-001", admin: User = Depends(require_admin)):
     c = _connect()
     row = c.execute("SELECT version_id FROM model_versions WHERE version_id=?", (version_id,)).fetchone()
     if not row: c.close(); raise HTTPException(404, "Model version not found")
@@ -618,7 +630,7 @@ def activate_calibration(version_id: str, body: CalibrationActivateBody, machine
 
 
 @app.delete("/api/models/{version_id}/calibration/{calibration_id}")
-def delete_calibration(version_id: str, calibration_id: int, machine_id: str = "VVB001", admin: User = Depends(require_admin)):
+def delete_calibration(version_id: str, calibration_id: int, machine_id: str = "MACHINE-001", admin: User = Depends(require_admin)):
     c = _connect()
     row = c.execute("SELECT 1 FROM machine_model_calibrations WHERE machine_id=? AND version_id=? AND calibration_id=?", (machine_id,version_id,calibration_id)).fetchone()
     if row:
@@ -631,7 +643,7 @@ def delete_calibration(version_id: str, calibration_id: int, machine_id: str = "
 
 
 @app.get("/api/history")
-def history(limit: int = 50, offset: int = 0, level: str | None = None, machine_id: str = "VVB001", user: User = Depends(current_user)):
+def history(limit: int = 50, offset: int = 0, level: str | None = None, machine_id: str = "MACHINE-001", user: User = Depends(current_user)):
     limit = max(1, min(limit, 500)); offset = max(0, offset)
     where = " WHERE machine_id=?"; args: list = [machine_id]
     if level:
@@ -669,7 +681,7 @@ def history(limit: int = 50, offset: int = 0, level: str | None = None, machine_
 
 
 @app.get("/api/near-miss")
-def near_miss(hours: int = 6, limit: int = 50, offset: int = 0, status: str = "pending", machine_id: str = "VVB001", user: User = Depends(current_user)):
+def near_miss(hours: int = 6, limit: int = 50, offset: int = 0, status: str = "pending", machine_id: str = "MACHINE-001", user: User = Depends(current_user)):
     if status not in ("pending", "acknowledged", "flagged"): raise HTTPException(400, "status must be pending, acknowledged, or flagged")
     limit = max(1, min(limit, 500)); offset = max(0, offset)
     c = _connect()

@@ -32,7 +32,7 @@ except ImportError:
     # some other way (shell export, systemd EnvironmentFile, etc).
     pass
 
-DEFAULT_MACHINE_ID = os.environ.get("DEFAULT_MACHINE_ID", "VVB001").strip() or "VVB001"
+DEFAULT_MACHINE_ID = os.environ.get("DEFAULT_MACHINE_ID", "MACHINE-001").strip() or "MACHINE-001"
 
 
 def parse_args():
@@ -132,6 +132,26 @@ def row_machine_id(row, dbcols=None) -> str:
     value = row.get(column) if column else DEFAULT_MACHINE_ID
     value = str(value).strip() if value is not None else ""
     return value or DEFAULT_MACHINE_ID
+
+
+def fetch_machine_ids(conn, table: str, limit: int = 1000) -> list[str]:
+    """Discover asset IDs from the sensor source table.
+
+    VVB001 identifies the shared sensor model/specification; this returns
+    values from the separate asset identity column configured through
+    PG_COL_MACHINE_ID. Legacy single-machine tables return the configured
+    DEFAULT_MACHINE_ID.
+    """
+    machine_column = get_db_columns()["machine_id"]
+    if not machine_column:
+        return [DEFAULT_MACHINE_ID]
+    query = sql.SQL(
+        "SELECT DISTINCT {machine} FROM {table} WHERE {machine} IS NOT NULL "
+        "ORDER BY {machine} LIMIT %s"
+    ).format(machine=sql.Identifier(machine_column), table=sql.Identifier(table))
+    with conn.cursor() as cur:
+        cur.execute(query, (max(1, min(limit, 10000)),))
+        return [str(row[0]).strip() for row in cur.fetchall() if str(row[0]).strip()]
 
 
 def fetch_new_rows(conn, table: str, since=None, limit: int = 5000):

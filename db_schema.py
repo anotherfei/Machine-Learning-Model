@@ -6,7 +6,7 @@ import runtime_config
 SCHEMA_SQL = r'''
 CREATE TABLE IF NOT EXISTS alerts (
   id BIGSERIAL PRIMARY KEY,
-  machine_id TEXT NOT NULL DEFAULT 'VVB001',
+  machine_id TEXT NOT NULL DEFAULT 'MACHINE-001',
   tick_timestamp TIMESTAMPTZ NOT NULL,
   model_version TEXT NOT NULL,
   trigger TEXT NOT NULL CHECK (trigger IN ('health_threshold','health_inspect','trend_probability','none')),
@@ -20,7 +20,9 @@ CREATE TABLE IF NOT EXISTS alerts (
   reviewed_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-ALTER TABLE alerts ADD COLUMN IF NOT EXISTS machine_id TEXT NOT NULL DEFAULT 'VVB001';
+ALTER TABLE alerts ADD COLUMN IF NOT EXISTS machine_id TEXT NOT NULL DEFAULT 'MACHINE-001';
+ALTER TABLE alerts ALTER COLUMN machine_id SET DEFAULT 'MACHINE-001';
+UPDATE alerts SET machine_id='MACHINE-001' WHERE machine_id='VVB001';
 CREATE INDEX IF NOT EXISTS alerts_machine_status_idx ON alerts(machine_id, status, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS reference_candidates (
@@ -53,14 +55,16 @@ CREATE UNIQUE INDEX IF NOT EXISTS model_versions_one_active
 CREATE TABLE IF NOT EXISTS model_calibrations (
   id BIGSERIAL PRIMARY KEY,
   version_id TEXT NOT NULL REFERENCES model_versions(version_id) ON DELETE CASCADE,
-  machine_id TEXT NOT NULL DEFAULT 'VVB001',
+  machine_id TEXT NOT NULL DEFAULT 'MACHINE-001',
   calibration JSONB NOT NULL,
   source_rows INTEGER NOT NULL,
   source_description TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   created_by TEXT
 );
-ALTER TABLE model_calibrations ADD COLUMN IF NOT EXISTS machine_id TEXT NOT NULL DEFAULT 'VVB001';
+ALTER TABLE model_calibrations ADD COLUMN IF NOT EXISTS machine_id TEXT NOT NULL DEFAULT 'MACHINE-001';
+ALTER TABLE model_calibrations ALTER COLUMN machine_id SET DEFAULT 'MACHINE-001';
+UPDATE model_calibrations SET machine_id='MACHINE-001' WHERE machine_id='VVB001';
 CREATE INDEX IF NOT EXISTS model_calibrations_version_idx ON model_calibrations(version_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS model_calibrations_machine_version_idx ON model_calibrations(machine_id, version_id, created_at DESC);
 
@@ -76,23 +80,30 @@ CREATE TABLE IF NOT EXISTS machine_model_calibrations (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY(machine_id, version_id)
 );
+INSERT INTO machine_model_calibrations(machine_id,version_id,calibration_id,updated_at)
+SELECT 'MACHINE-001',version_id,calibration_id,updated_at
+FROM machine_model_calibrations WHERE machine_id='VVB001'
+ON CONFLICT(machine_id,version_id) DO NOTHING;
+DELETE FROM machine_model_calibrations WHERE machine_id='VVB001';
 -- Preserve the old single-machine assignment when upgrading an existing DB.
 INSERT INTO machine_model_calibrations(machine_id,version_id,calibration_id)
-SELECT 'VVB001',version_id,active_calibration_id FROM model_versions
+SELECT 'MACHINE-001',version_id,active_calibration_id FROM model_versions
 WHERE active_calibration_id IS NOT NULL
 ON CONFLICT(machine_id,version_id) DO NOTHING;
 UPDATE model_versions SET active_calibration_id=NULL WHERE active_calibration_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS regression_tests (
   id BIGSERIAL PRIMARY KEY,
-  machine_id TEXT NOT NULL DEFAULT 'VVB001',
+  machine_id TEXT NOT NULL DEFAULT 'MACHINE-001',
   description TEXT NOT NULL,
   timestamp_range TSTZRANGE NOT NULL,
   source_alert_id BIGINT REFERENCES alerts(id),
   minimum_anomaly_risk REAL NOT NULL DEFAULT 0.6,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-ALTER TABLE regression_tests ADD COLUMN IF NOT EXISTS machine_id TEXT NOT NULL DEFAULT 'VVB001';
+ALTER TABLE regression_tests ADD COLUMN IF NOT EXISTS machine_id TEXT NOT NULL DEFAULT 'MACHINE-001';
+ALTER TABLE regression_tests ALTER COLUMN machine_id SET DEFAULT 'MACHINE-001';
+UPDATE regression_tests SET machine_id='MACHINE-001' WHERE machine_id='VVB001';
 
 CREATE TABLE IF NOT EXISTS runtime_config (
   key TEXT PRIMARY KEY,
@@ -118,7 +129,7 @@ CREATE TABLE IF NOT EXISTS env_change_log (
 
 CREATE TABLE IF NOT EXISTS spindle_predictions (
   id BIGSERIAL PRIMARY KEY,
-  machine_id TEXT NOT NULL DEFAULT 'VVB001',
+  machine_id TEXT NOT NULL DEFAULT 'MACHINE-001',
   tick_timestamp TIMESTAMPTZ NOT NULL,
   model_version TEXT NOT NULL,
   raw_reading JSONB NOT NULL,
@@ -134,7 +145,15 @@ CREATE TABLE IF NOT EXISTS spindle_predictions (
   top_contributors JSONB,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-ALTER TABLE spindle_predictions ADD COLUMN IF NOT EXISTS machine_id TEXT NOT NULL DEFAULT 'VVB001';
+ALTER TABLE spindle_predictions ADD COLUMN IF NOT EXISTS machine_id TEXT NOT NULL DEFAULT 'MACHINE-001';
+ALTER TABLE spindle_predictions ALTER COLUMN machine_id SET DEFAULT 'MACHINE-001';
+DELETE FROM spindle_predictions legacy
+USING spindle_predictions current
+WHERE legacy.machine_id='VVB001' AND current.machine_id='MACHINE-001'
+  AND legacy.tick_timestamp=current.tick_timestamp
+  AND legacy.model_version=current.model_version
+  AND legacy.id<>current.id;
+UPDATE spindle_predictions SET machine_id='MACHINE-001' WHERE machine_id='VVB001';
 ALTER TABLE spindle_predictions ADD COLUMN IF NOT EXISTS is_backfill BOOLEAN NOT NULL DEFAULT FALSE;
 CREATE INDEX IF NOT EXISTS spindle_predictions_machine_ts_idx ON spindle_predictions(machine_id, tick_timestamp DESC);
 DROP INDEX IF EXISTS spindle_predictions_tick_model_uq;

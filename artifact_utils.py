@@ -23,6 +23,7 @@ import os
 import json
 import hashlib
 import datetime
+import math
 import joblib
 import pandas as pd
 
@@ -43,7 +44,39 @@ def config_hash(feature_config: dict = None) -> str:
     return hashlib.md5(combined.encode()).hexdigest()
 
 
-def save_artifacts(scorer, feature_columns: list, reference_timestamps=None):
+def _json_safe(value):
+    """Convert numpy/pandas scalars and non-finite values to strict JSON."""
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if hasattr(value, "item"):
+        value = value.item()
+    if value is pd.NA or (isinstance(value, float) and not math.isfinite(value)):
+        return None
+    return value
+
+
+def _write_optional_json(filename: str, payload) -> bool:
+    """Write an optional artifact, removing an older stale copy if absent."""
+    path = os.path.join(config.ARTIFACTS_DIR, filename)
+    if payload is None:
+        if os.path.exists(path):
+            os.remove(path)
+        return False
+    with open(path, "w") as f:
+        json.dump(_json_safe(payload), f, indent=2, allow_nan=False)
+    return True
+
+
+def save_artifacts(
+    scorer,
+    feature_columns: list,
+    reference_timestamps=None,
+    reference_rows=None,
+    machine_calibrations=None,
+    metadata_extra: dict | None = None,
+):
     """
     scorer: a fitted isolation_forest.AnomalyScorer.
     reference_timestamps: the timestamps of the rows actually used to fit
@@ -52,6 +85,11 @@ def save_artifacts(scorer, feature_columns: list, reference_timestamps=None):
         validate.py's overfitting check can test the model that was
         actually trained, instead of re-deriving its own idea of what the
         reference set should have been.
+    reference_rows: optional machine-aware identities for the selected
+        training rows. Each item contains machine_id and timestamp.
+    machine_calibrations: optional per-machine health anchors computed
+        after fitting the one shared model.
+    metadata_extra: training-strategy provenance added to metadata.json.
     """
     os.makedirs(config.ARTIFACTS_DIR, exist_ok=True)
 
@@ -63,10 +101,22 @@ def save_artifacts(scorer, feature_columns: list, reference_timestamps=None):
     with open(os.path.join(config.ARTIFACTS_DIR, "calibration.json"), "w") as f:
         json.dump(scorer.calibration(), f, indent=2)
 
+    ts_list = None
     if reference_timestamps is not None:
         ts_list = [pd.Timestamp(t).isoformat() for t in reference_timestamps]
-        with open(os.path.join(config.ARTIFACTS_DIR, "reference_timestamps.json"), "w") as f:
-            json.dump(ts_list, f, indent=2)
+    _write_optional_json("reference_timestamps.json", ts_list)
+
+    normalized_reference_rows = None
+    if reference_rows is not None:
+        normalized_reference_rows = [
+            {
+                "machine_id": str(row["machine_id"]),
+                "timestamp": pd.Timestamp(row["timestamp"]).isoformat(),
+            }
+            for row in reference_rows
+        ]
+    wrote_reference_rows = _write_optional_json("reference_rows.json", normalized_reference_rows)
+    wrote_machine_calibrations = _write_optional_json("machine_calibrations.json", machine_calibrations)
 
     metadata = {
         "trained_at": datetime.datetime.utcnow().isoformat(),
@@ -80,10 +130,18 @@ def save_artifacts(scorer, feature_columns: list, reference_timestamps=None):
         "n_reference_rows": len(reference_timestamps) if reference_timestamps is not None else None,
         "has_reference_timestamps": reference_timestamps is not None,
     }
+    metadata.update(metadata_extra or {})
     with open(os.path.join(config.ARTIFACTS_DIR, "metadata.json"), "w") as f:
         json.dump(metadata, f, indent=2)
 
-    extra = ", reference_timestamps.json" if reference_timestamps is not None else ""
+    extras = []
+    if reference_timestamps is not None:
+        extras.append("reference_timestamps.json")
+    if wrote_reference_rows:
+        extras.append("reference_rows.json")
+    if wrote_machine_calibrations:
+        extras.append("machine_calibrations.json")
+    extra = f", {', '.join(extras)}" if extras else ""
     print(f"[save_artifacts] Saved isolation_forest.pkl, calibration.json, "
           f"feature_columns.json, metadata.json{extra} -> {config.ARTIFACTS_DIR}")
 
@@ -228,3 +286,21 @@ def load_reference_timestamps():
     with open(path) as f:
         ts_list = json.load(f)
     return pd.to_datetime(pd.Series(ts_list))
+
+
+def load_reference_rows():
+    """Return machine-aware training-row identities, or None for old bundles."""
+    path = os.path.join(config.ARTIFACTS_DIR, "reference_rows.json")
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
+def load_machine_calibrations():
+    """Return initial per-machine calibrations saved by pooled training."""
+    path = os.path.join(config.ARTIFACTS_DIR, "machine_calibrations.json")
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return json.load(f)

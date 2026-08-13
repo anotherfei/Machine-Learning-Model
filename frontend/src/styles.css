@@ -34,3 +34,6 @@
 .pagination-page{font-size:10px;color:#42536e;font-weight:700;padding:0 8px;white-space:nowrap}
 .flag-note{margin-top:12px}
 @media(max-width:560px){.pagination{justify-content:center;text-align:center}}
+.machine-picker{display:flex;align-items:center}.mobile-machine-picker{display:none}
+@media(max-width:850px){.mobile-machine-picker{display:flex;position:absolute;right:14px;top:11px;align-items:center;justify-content:flex-end}.mobile-machine-picker .select-wrap select{height:36px;min-width:110px;border-color:rgba(255,255,255,.25);background:rgba(255,255,255,.12);color:#fff}.mobile-machine-picker .select-wrap option{color:#162033;background:#fff}.mobile-machine-picker .select-wrap>span{color:#d8e6ff}}
+@media(max-width:560px){.mobile-machine-picker .select-wrap select{min-width:96px}}

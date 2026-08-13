@@ -22,6 +22,8 @@ Usage:
     python train_isolation_forest.py
     python train_isolation_forest.py --full
     python train_isolation_forest.py --source live --start 2026-01-05T00:00:00Z --end 2026-01-07T00:00:00Z
+    python train_isolation_forest.py --source live --all-machines --start 2026-01-05T00:00:00Z --end 2026-01-07T00:00:00Z
+    python train_isolation_forest.py --source live --machine-id MACHINE-001 --machine-id MACHINE-002 --start 2026-01-05T00:00:00Z --end 2026-01-07T00:00:00Z
     python train_isolation_forest.py --source csv
 """
 
@@ -63,10 +65,22 @@ def parse_args():
         help="Override config.REFERENCE_WINDOW_END for this run "
              "(only used when the resolved source is 'live')."
     )
+    machine_group = parser.add_mutually_exclusive_group()
+    machine_group.add_argument(
+        "--machine-id", action="append", default=None,
+        help="Machine to include in live training. Repeat this option (or use "
+             "a comma-separated value) to build one balanced shared model from "
+             "multiple machines. Defaults to DEFAULT_MACHINE_ID."
+    )
+    machine_group.add_argument(
+        "--all-machines", action="store_true",
+        help="Discover every machine ID in the live source and include all of "
+             "them in the balanced shared model."
+    )
     parser.add_argument(
-        "--machine-id", default=None,
-        help="Machine to use for a live commissioning window. Defaults to "
-             "DEFAULT_MACHINE_ID (VVB001 unless overridden)."
+        "--max-rows-per-machine", type=int, default=None,
+        help="Optional upper bound on healthy feature rows sampled from each "
+             "machine. All machines still contribute exactly the same number."
     )
     return parser.parse_args()
 
@@ -74,7 +88,16 @@ def parse_args():
 # ---------------------------------------------------------------------------
 # Shared: fit + save, given a feature table and a reference-row selection
 # ---------------------------------------------------------------------------
-def _fit_and_save(reference_df, feature_cols, health_check_df, health_check_label):
+def _fit_and_save(
+    reference_df,
+    feature_cols,
+    health_check_df,
+    health_check_label,
+    reference_rows=None,
+    machine_reference_frames=None,
+    machine_health_frames=None,
+    metadata_extra=None,
+):
     scorer = AnomalyScorer()
     scorer.fit(reference_df[feature_cols])
     print(f"[train] Calibration: {scorer.calibration()}")
@@ -88,7 +111,33 @@ def _fit_and_save(reference_df, feature_cols, health_check_df, health_check_labe
           f"min: {health.min():.1f}, max: {health.max():.1f}, "
           f"mean: {health.mean():.1f}")
 
-    artifact_utils.save_artifacts(scorer, feature_cols, reference_timestamps=reference_df[config.COL_TIMESTAMP])
+    machine_calibrations = None
+    if machine_reference_frames:
+        machine_calibrations = {}
+        for machine_id, machine_reference in machine_reference_frames.items():
+            local_scorer = AnomalyScorer()
+            local_scorer.model = scorer.model
+            local_scorer.calibrate(machine_reference[feature_cols])
+            machine_calibrations[machine_id] = {
+                "calibration": local_scorer.calibration(),
+                "source_rows": len(machine_reference),
+            }
+
+            machine_health = (machine_health_frames or {}).get(machine_id, machine_reference)
+            local_scores = local_scorer.score(machine_health[feature_cols])
+            local_health = local_scorer.health_from_score(local_scores)
+            print(f"[train] Machine {machine_id!r} local calibration health — "
+                  f"min: {local_health.min():.1f}, max: {local_health.max():.1f}, "
+                  f"mean: {local_health.mean():.1f}")
+
+    artifact_utils.save_artifacts(
+        scorer,
+        feature_cols,
+        reference_timestamps=reference_df[config.COL_TIMESTAMP],
+        reference_rows=reference_rows,
+        machine_calibrations=machine_calibrations,
+        metadata_extra=metadata_extra,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -142,39 +191,131 @@ def _load_live_raw(start, end, machine_id):
     return raw_df
 
 
-def _train_from_live(args):
-    start, end = _resolve_live_window(args)
-    raw_df = _load_live_raw(start, end, args.machine_id or db.DEFAULT_MACHINE_ID)
-
-    featured_df = feature_engineering.create_features(raw_df)
-    feature_cols = feature_engineering.get_feature_columns(featured_df)
-
-    if args.full:
-        # Trust the whole commissioning window as normal — no spec filter.
-        reference_df = featured_df.reset_index(drop=True)
-        print(f"[train] --full: using all {len(reference_df)} live rows as "
-              f"the reference set (spec filter skipped).")
+def _resolve_live_machine_ids(args):
+    if args.all_machines:
+        conn = db.get_connection()
+        try:
+            machine_ids = db.fetch_machine_ids(conn, db.get_table_name())
+        finally:
+            conn.close()
+    elif args.machine_id:
+        machine_ids = []
+        for value in args.machine_id:
+            machine_ids.extend(part.strip() for part in value.split(","))
     else:
-        # Spec-based row selection needs the raw sensor values, which don't
-        # survive feature_engineering.create_features() — filter on raw_df
-        # (already cleaned above), then map that selection onto featured_df
-        # by timestamp.
+        machine_ids = [db.DEFAULT_MACHINE_ID]
+
+    # Preserve command/source order while removing blanks and duplicates.
+    machine_ids = list(dict.fromkeys(machine_id for machine_id in machine_ids if machine_id))
+    if not machine_ids:
+        raise ValueError("No machine IDs were selected for live training.")
+    print(f"[train] Training machines ({len(machine_ids)}): {', '.join(machine_ids)}")
+    return machine_ids
+
+
+def _select_live_reference(raw_df, featured_df, use_full, machine_id):
+    if use_full:
+        reference_df = featured_df.reset_index(drop=True)
+        print(f"[train] Machine {machine_id!r}: --full uses all "
+              f"{len(reference_df)} feature rows (spec filter skipped).")
+    else:
+        # Filter raw rows first, but compute rolling features on the complete
+        # per-machine trajectory so gaps never corrupt a rolling window.
         normal_raw = preprocessing.select_spec_normal_rows(raw_df)
         is_reference = featured_df[config.COL_TIMESTAMP].isin(normal_raw[config.COL_TIMESTAMP])
         reference_df = featured_df[is_reference].reset_index(drop=True)
-        print(f"[train] Spec-based reference set: {len(reference_df)}/{len(featured_df)} "
-              f"live rows pass the spec filter.")
+        print(f"[train] Machine {machine_id!r}: {len(reference_df)}/{len(featured_df)} "
+              f"feature rows pass the spec filter.")
 
-    # There's no larger "full trajectory" to sanity-check against here —
-    # unlike the CSV path, the live pull IS the commissioning window, not
-    # a longer file that also contains later degradation. So this checks
-    # the reference window scoring itself: health should sit high/flat,
-    # since by definition this is the data the model calls "normal".
+    if reference_df.empty:
+        raise ValueError(
+            f"Machine {machine_id!r} has no usable healthy feature rows in the "
+            "selected commissioning window. Widen the window, verify the spec "
+            "bounds, or use --full only if the entire window is confirmed healthy."
+        )
+    return reference_df
+
+
+def _balanced_reference_pool(machine_reference_frames, max_rows_per_machine=None):
+    counts = {machine_id: len(frame) for machine_id, frame in machine_reference_frames.items()}
+    rows_per_machine = min(counts.values())
+    if max_rows_per_machine is not None:
+        if max_rows_per_machine < 1:
+            raise ValueError("--max-rows-per-machine must be at least 1.")
+        rows_per_machine = min(rows_per_machine, max_rows_per_machine)
+
+    balanced = {}
+    for machine_id, frame in machine_reference_frames.items():
+        if len(frame) > rows_per_machine:
+            selected = frame.sample(n=rows_per_machine, random_state=42)
+            selected = selected.sort_values(config.COL_TIMESTAMP).reset_index(drop=True)
+        else:
+            selected = frame.reset_index(drop=True)
+        balanced[machine_id] = selected
+
+    print(f"[train] Balanced pool: {rows_per_machine} healthy feature rows per "
+          f"machine, {rows_per_machine * len(balanced)} total. Available before "
+          f"balancing: {counts}.")
+    return balanced, counts, rows_per_machine
+
+
+def _train_from_live(args):
+    start, end = _resolve_live_window(args)
+    machine_ids = _resolve_live_machine_ids(args)
+    machine_reference_frames = {}
+    machine_health_frames = {}
+    feature_cols = None
+
+    # Build rolling features independently. Combining raw rows first would
+    # let windows cross machine boundaries and create impossible readings.
+    for machine_id in machine_ids:
+        raw_df = _load_live_raw(start, end, machine_id)
+        featured_df = feature_engineering.create_features(raw_df)
+        if featured_df.empty:
+            raise ValueError(
+                f"Machine {machine_id!r} produced no complete feature rows. "
+                f"Each machine needs at least {config.MIN_PERIODS} clean source rows."
+            )
+
+        current_feature_cols = feature_engineering.get_feature_columns(featured_df)
+        if feature_cols is None:
+            feature_cols = current_feature_cols
+        elif current_feature_cols != feature_cols:
+            raise ValueError(f"Feature columns differ for machine {machine_id!r}.")
+
+        machine_health_frames[machine_id] = featured_df
+        machine_reference_frames[machine_id] = _select_live_reference(
+            raw_df, featured_df, args.full, machine_id
+        )
+
+    balanced_frames, available_counts, rows_per_machine = _balanced_reference_pool(
+        machine_reference_frames, args.max_rows_per_machine
+    )
+    reference_df = pd.concat(balanced_frames.values(), ignore_index=True)
+    health_check_df = pd.concat(machine_health_frames.values(), ignore_index=True)
+    reference_rows = [
+        {"machine_id": machine_id, "timestamp": timestamp}
+        for machine_id, frame in balanced_frames.items()
+        for timestamp in frame[config.COL_TIMESTAMP]
+    ]
+
     _fit_and_save(
-        reference_df, feature_cols,
-        health_check_df=featured_df,
-        health_check_label="the commissioning window itself (expect high/flat — "
-                            "this isn't a healthy-to-failed trajectory, just the reference data)",
+        reference_df,
+        feature_cols,
+        health_check_df=health_check_df,
+        health_check_label="all selected commissioning windows",
+        reference_rows=reference_rows,
+        machine_reference_frames=machine_reference_frames,
+        machine_health_frames=machine_health_frames,
+        metadata_extra={
+            "training_mode": "balanced_pooled" if len(machine_ids) > 1 else "single_machine",
+            "training_machine_ids": machine_ids,
+            "available_reference_rows_per_machine": available_counts,
+            "model_fit_rows_per_machine": rows_per_machine,
+            "balance_method": "equal_rows_deterministic_sample",
+            "reference_window_start": start.isoformat(),
+            "reference_window_end": end.isoformat(),
+        },
     )
 
 

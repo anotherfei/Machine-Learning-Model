@@ -42,13 +42,21 @@ Then start again with `-Mock`.
 
 ## Production mode
 
-Configure `.env` with the real PostgreSQL connection, then train and place model artifacts under `artifacts/`:
+Configure `.env` with the real PostgreSQL connection, then train and place model artifacts under `artifacts/`. For a shared model, select every confirmed-healthy machine in the commissioning window:
 
 ```powershell
-python train_isolation_forest.py
+python train_isolation_forest.py --source live --all-machines --start 2026-01-05T00:00:00Z --end 2026-01-07T00:00:00Z
 ```
 
-By default this fits the model on a pinned commissioning window pulled from the same PostgreSQL table `worker.py` reads in production — set `REFERENCE_WINDOW_START`/`REFERENCE_WINDOW_END` in `config.py` (or pass `--start`/`--end`) first. See `architecture-notes.md` → "Initial model training" for the full picture, including the offline-CSV fallback (`--source csv`).
+This pulls a pinned commissioning window from the same PostgreSQL table `worker.py` reads. Features are built independently for every machine, each machine contributes the same number of healthy feature rows, and one Isolation Forest is fitted to the combined balanced pool. The trainer also creates a separate initial health calibration for each machine. On the first production startup, the API registers the shared model and activates those machine-specific calibrations automatically.
+
+`--all-machines` discovers IDs through `PG_COL_MACHINE_ID`. To train on an explicit subset instead, repeat `--machine-id`:
+
+```powershell
+python train_isolation_forest.py --source live --machine-id MACHINE-001 --machine-id MACHINE-002 --start 2026-01-05T00:00:00Z --end 2026-01-07T00:00:00Z
+```
+
+The selected period must be confirmed healthy for every included machine. The script intentionally does not invent a date range. Set `REFERENCE_WINDOW_START`/`REFERENCE_WINDOW_END` in `config.py` or pass `--start`/`--end`. See `architecture-notes.md` → "Initial model training" for the offline-CSV fallback (`--source csv`).
 
 Then run:
 
@@ -70,17 +78,19 @@ The sensor source may contain multiple machines in one table. Set these values i
 
 ```text
 PG_COL_MACHINE_ID=machine_id
-DEFAULT_MACHINE_ID=VVB001
+DEFAULT_MACHINE_ID=MACHINE-001
 ```
+
+`VVB001` is the shared ifm sensor model and continues to define the sensor channels and valid ranges. It is not used as a machine ID. `PG_COL_MACHINE_ID` must point to the separate source-table column containing asset identities such as `MACHINE-001`, `LINE-A-SPINDLE-02`, or your plant's own naming scheme; the website discovers its selector options from those values.
 
 Every `(timestamp, machine_id)` row is polled in order. The worker creates an independent rolling feature window, Kalman filter, trend history, and maintenance debouncer for each machine, while all machines use the active model bundle. Predictions, alerts, near-miss calculations, history, and live WebSocket messages are isolated by `machine_id`.
 
 Health-anchor recalibrations are also machine-specific: activating a recalibration for one machine does not change another machine's scorer.
 
-For an older source table without a machine column, leave `PG_COL_MACHINE_ID` unset; all rows are assigned to `DEFAULT_MACHINE_ID`. Live commissioning training targets one unit at a time with `--machine-id`:
+For an older source table without a machine column, leave `PG_COL_MACHINE_ID` unset; all rows are assigned to `DEFAULT_MACHINE_ID`. Omitting both `--all-machines` and `--machine-id` also preserves single-machine training with `DEFAULT_MACHINE_ID`:
 
 ```powershell
-python train_isolation_forest.py --source live --machine-id VVB002 --start 2026-01-05T00:00:00Z --end 2026-01-07T00:00:00Z
+python train_isolation_forest.py --source live --start 2026-01-05T00:00:00Z --end 2026-01-07T00:00:00Z
 ```
 
 ## Important separation
