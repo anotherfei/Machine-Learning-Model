@@ -130,22 +130,28 @@ def load_data(path: str = None) -> pd.DataFrame:
     return df
 
 
-def clean_data(df: pd.DataFrame) -> pd.DataFrame:
+def clean_data(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
     df = df.copy()
 
     df[config.COL_TIMESTAMP] = pd.to_datetime(df[config.COL_TIMESTAMP], errors="coerce")
     df = df.sort_values(config.COL_TIMESTAMP)
 
     before = len(df)
+    df = df.dropna(subset=[config.COL_TIMESTAMP])
+    dropped = before - len(df)
+    if dropped and verbose:
+        print(f"[clean_data] Dropped {dropped} rows with invalid timestamps.")
+
+    before = len(df)
     df = df.drop_duplicates(subset=[config.COL_TIMESTAMP])
     dropped = before - len(df)
-    if dropped:
+    if dropped and verbose:
         print(f"[clean_data] Dropped {dropped} duplicate timestamp rows.")
 
     before = len(df)
     df = df.dropna(subset=config.RAW_SENSOR_COLS)
     dropped = before - len(df)
-    if dropped:
+    if dropped and verbose:
         print(f"[clean_data] Dropped {dropped} rows with missing sensor values.")
 
     # Remove physically impossible readings, per the VVB001 datasheet's

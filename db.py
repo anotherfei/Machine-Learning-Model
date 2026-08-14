@@ -16,6 +16,7 @@ the old CSV replay behavior.
 """
 
 import argparse
+from datetime import timedelta
 import os
 
 import psycopg2
@@ -325,6 +326,115 @@ def fetch_rows_between(conn, table: str, start, end, limit: int | None = None, m
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(query, tuple(args))
         return cur.fetchall()
+
+
+def iter_row_chunks_between(
+    table: str,
+    start,
+    end,
+    *,
+    machine_id: str | None = None,
+    chunk_rows: int | None = None,
+    slice_hours: int | None = None,
+    statement_timeout_ms: int | None = None,
+):
+    """Yield an indexed source range without materializing it in memory.
+
+    A dedicated read-only connection and named server-side cursor keep both
+    libpq and Python memory bounded.  Short half-open time slices release old
+    MVCC snapshots regularly, provide visible progress to the caller, and make
+    cancellation reliable on Windows even when a very large range is selected.
+    """
+    chunk_rows = int(chunk_rows or config.TRAINING_DB_CHUNK_ROWS)
+    slice_hours = int(slice_hours or config.TRAINING_DB_SLICE_HOURS)
+    statement_timeout_ms = int(
+        statement_timeout_ms or config.TRAINING_DB_STATEMENT_TIMEOUT_MS
+    )
+    if chunk_rows < 1:
+        raise ValueError("chunk_rows must be positive")
+    if slice_hours < 1:
+        raise ValueError("slice_hours must be positive")
+    if statement_timeout_ms < 1:
+        raise ValueError("statement_timeout_ms must be positive")
+    if end <= start:
+        raise ValueError("end must be after start")
+
+    dbcols = get_db_columns()
+    cols = [dbcols["timestamp"]] + (
+        [dbcols["machine_id"]] if dbcols["machine_id"] else []
+    ) + dbcols["sensor_cols"]
+    col_ident = sql.SQL(", ").join(sql.Identifier(column) for column in cols)
+    table_ident = sql.Identifier(table)
+    ts_ident = sql.Identifier(dbcols["timestamp"])
+    machine_column = dbcols["machine_id"]
+    if machine_id and not machine_column and machine_id != DEFAULT_MACHINE_ID:
+        return
+
+    conn = get_connection()
+    try:
+        conn.set_session(readonly=True, autocommit=False)
+        slice_start = start
+        slice_number = 0
+        while slice_start < end:
+            slice_end = min(end, slice_start + timedelta(hours=slice_hours))
+            slice_number += 1
+            try:
+                with conn.cursor() as settings_cursor:
+                    settings_cursor.execute(
+                        "SELECT set_config('statement_timeout', %s, true)",
+                        (f"{statement_timeout_ms}ms",),
+                    )
+
+                cursor_name = f"training_source_{os.getpid()}_{slice_number}"
+                with conn.cursor(
+                    name=cursor_name,
+                    cursor_factory=psycopg2.extras.RealDictCursor,
+                ) as cur:
+                    cur.itersize = chunk_rows
+                    if machine_id and machine_column:
+                        query = sql.SQL(
+                            "SELECT {cols} FROM {table} "
+                            "WHERE {machine} = %s AND {ts} >= %s AND {ts} < %s "
+                            "ORDER BY {ts} ASC"
+                        ).format(
+                            cols=col_ident,
+                            table=table_ident,
+                            machine=sql.Identifier(machine_column),
+                            ts=ts_ident,
+                        )
+                        args = (machine_id, slice_start, slice_end)
+                    else:
+                        query = sql.SQL(
+                            "SELECT {cols} FROM {table} "
+                            "WHERE {ts} >= %s AND {ts} < %s ORDER BY {ts} ASC"
+                        ).format(cols=col_ident, table=table_ident, ts=ts_ident)
+                        args = (slice_start, slice_end)
+                    cur.execute(query, args)
+                    while True:
+                        rows = cur.fetchmany(chunk_rows)
+                        if not rows:
+                            break
+                        yield rows
+                conn.rollback()
+            except KeyboardInterrupt:
+                try:
+                    conn.cancel()
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise
+            except psycopg2.errors.QueryCanceled as exc:
+                conn.rollback()
+                raise TimeoutError(
+                    f"PostgreSQL training read timed out for machine "
+                    f"{machine_id or DEFAULT_MACHINE_ID!r} in slice "
+                    f"[{slice_start}, {slice_end}). Verify the composite "
+                    "(machine_id, timestamp) source index or increase "
+                    "TRAINING_DB_STATEMENT_TIMEOUT_MS."
+                ) from exc
+            slice_start = slice_end
+    finally:
+        conn.close()
 
 
 def fetch_rows_before(conn, table: str, before, limit: int, machine_id: str | None = None):

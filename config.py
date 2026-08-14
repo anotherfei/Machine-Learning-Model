@@ -114,8 +114,11 @@ SPEC_MAX = {
 # ---------------------------------------------------------------------------
 # Feature engineering
 # ---------------------------------------------------------------------------
-WINDOW_SIZE = 10          # rolling window, in rows (1 row = 1 minute in this data)
-SAMPLING_RATE_HZ = 1 / 60
+# PostgreSQL production evidence is approximately one source row per second.
+# Rolling windows are row based, so WINDOW_SIZE=10 represents roughly ten
+# seconds at that cadence (not ten minutes).
+WINDOW_SIZE = 10
+SAMPLING_RATE_HZ = 1.0
 MIN_PERIODS = WINDOW_SIZE
 
 # Every engineered feature is centered/scaled against that machine's own
@@ -188,14 +191,32 @@ REFERENCE_SOURCE = "live"
 REFERENCE_WINDOW_START = None
 REFERENCE_WINDOW_END = None
 
+# Large commissioning ranges are scanned automatically in bounded PostgreSQL
+# chunks.  Every clean source row is considered, while only a deterministic,
+# balanced reservoir is retained for the in-memory Isolation Forest fit and
+# forward validation artifacts.  These are implementation/resource controls,
+# not live monitoring thresholds and therefore are intentionally not editable
+# from the website.
+TRAINING_DB_CHUNK_ROWS = 50_000
+TRAINING_DB_SLICE_HOURS = 24
+TRAINING_DB_STATEMENT_TIMEOUT_MS = 120_000
+TRAINING_STATE_PROFILE_ROWS = 200_000
+TRAINING_MAX_ROWS_PER_MACHINE = 100_000
+TRAINING_RESERVOIR_SEED = 42
+
 # ---------------------------------------------------------------------------
 # Isolation Forest
 # ---------------------------------------------------------------------------
 ISOLATION_FOREST_PARAMS = {
     "n_estimators": 200,
-    "max_samples": "auto",
+    # A larger per-tree sample gives the shared model more opportunity to
+    # represent distinct machine-relative operating patterns.  Isolation
+    # Forest still samples by design; it never needs every retained row in
+    # every tree.
+    "max_samples": 4096,
     "contamination": "auto",
     "random_state": 42,
+    "n_jobs": -1,
 }
 
 # ---------------------------------------------------------------------------

@@ -80,7 +80,13 @@ class OperatingStateDetector:
         if self._validate(reading) is None:
             self._scores.append(self.activity_score(reading))
 
-    def fit_history(self) -> bool:
+    def observe_activity_score(self, score: float) -> None:
+        """Add an already validated activity score to an offline profile."""
+        score = float(score)
+        if math.isfinite(score):
+            self._scores.append(score)
+
+    def fit_history(self, *, require_sustained_low: bool = True) -> bool:
         """Fit conservative low/high regimes; return whether they are usable."""
         self._valid_since_fit_attempt = 0
         values = np.asarray(self._scores, dtype=float)
@@ -121,10 +127,10 @@ class OperatingStateDetector:
         )
         separation = high - low
         if (len(low_group) < minimum_cluster or len(high_group) < minimum_cluster or
-                longest_low_run < runtime_config.get(
+                (require_sustained_low and longest_low_run < runtime_config.get(
                     "OPERATING_STATE_STOP_CONFIRM_TICKS",
                     config.OPERATING_STATE_STOP_CONFIRM_TICKS,
-                ) or
+                )) or
                 separation < config.OPERATING_STATE_MIN_LOG_SEPARATION):
             return False
 

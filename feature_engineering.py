@@ -49,14 +49,32 @@ def _safe_skew(values) -> float:
 
 def _rolling_stats(series: pd.Series, window: int, min_periods: int, prefix: str) -> pd.DataFrame:
     roll = series.rolling(window=window, min_periods=min_periods)
+    ready = roll.count() >= min_periods
+    rolling_skew = roll.skew().replace([np.inf, -np.inf], np.nan)
+    rolling_kurtosis = roll.kurt().replace([np.inf, -np.inf], np.nan)
+    rolling_range = roll.max() - roll.min()
+    rolling_scale = series.abs().rolling(
+        window=window, min_periods=min_periods
+    ).max().clip(lower=1.0)
+    effectively_constant = (
+        rolling_range <= np.finfo(float).eps * rolling_scale * 100
+    )
+    # pandas' rolling moment implementations are vectorized and return NaN
+    # for a constant window.  Preserve NaN while history is incomplete, but
+    # represent a ready constant window as zero (the same policy as the scalar
+    # safety helpers above) without invoking a Python callback per source row.
+    rolling_skew = rolling_skew.where(rolling_skew.notna(), 0.0).where(ready)
+    rolling_kurtosis = rolling_kurtosis.where(rolling_kurtosis.notna(), 0.0).where(ready)
+    rolling_skew = rolling_skew.where(~effectively_constant, 0.0).where(ready)
+    rolling_kurtosis = rolling_kurtosis.where(~effectively_constant, 0.0).where(ready)
     out = pd.DataFrame({
         f"{prefix}_mean": roll.mean(),
         f"{prefix}_std": roll.std(),
         f"{prefix}_max": roll.max(),
         f"{prefix}_min": roll.min(),
-        f"{prefix}_rms": roll.apply(lambda x: np.sqrt(np.mean(np.square(x))), raw=True),
-        f"{prefix}_kurtosis": roll.apply(_safe_kurtosis, raw=True),
-        f"{prefix}_skew": roll.apply(_safe_skew, raw=True),
+        f"{prefix}_rms": np.sqrt(series.square().rolling(window=window, min_periods=min_periods).mean()),
+        f"{prefix}_kurtosis": rolling_kurtosis,
+        f"{prefix}_skew": rolling_skew,
     })
     # crest factor = peak / rms — classic early-defect vibration indicator
     rms = out[f"{prefix}_rms"]
@@ -65,15 +83,70 @@ def _rolling_stats(series: pd.Series, window: int, min_periods: int, prefix: str
 
 
 def _trend_slope(series: pd.Series, window: int, min_periods: int) -> pd.Series:
-    def _slope(x):
-        if len(x) < 2:
-            return np.nan
-        if _effectively_constant(x):
-            return 0.0
-        idx = np.arange(len(x))
-        return np.polyfit(idx, x, 1)[0]
+    """Vectorized least-squares slope over a fixed row window.
 
-    return series.rolling(window=window, min_periods=min_periods).apply(_slope, raw=True)
+    The previous rolling.apply(np.polyfit) executed Python once per source row
+    and made multi-million-row commissioning scans impractical.  This is the
+    algebraically equivalent ordinary-least-squares slope for complete fixed
+    windows, using rolling sums implemented by pandas.
+    """
+    if min_periods != window:
+        # The production configuration uses complete windows.  Keep the
+        # general fallback correct for offline experiments that deliberately
+        # choose a different min_periods value.
+        def _slope(values):
+            if len(values) < 2 or _effectively_constant(values):
+                return 0.0 if len(values) >= 2 else np.nan
+            return float(np.polyfit(np.arange(len(values)), values, 1)[0])
+        return series.rolling(window=window, min_periods=min_periods).apply(_slope, raw=True)
+
+    positions = pd.Series(np.arange(len(series), dtype=float), index=series.index)
+    rolling = series.rolling(window=window, min_periods=min_periods)
+    sum_y = rolling.sum()
+    sum_xy_global = (series * positions).rolling(
+        window=window, min_periods=min_periods
+    ).sum()
+    window_start = positions - (window - 1)
+    sum_xy_local = sum_xy_global - window_start * sum_y
+    sum_x = window * (window - 1) / 2.0
+    sum_x2 = window * (window - 1) * (2 * window - 1) / 6.0
+    denominator = window * sum_x2 - sum_x * sum_x
+    slope = (window * sum_xy_local - sum_x * sum_y) / denominator
+    ready = rolling.count() >= min_periods
+    rolling_range = rolling.max() - rolling.min()
+    rolling_scale = series.abs().rolling(
+        window=window, min_periods=min_periods
+    ).max().clip(lower=1.0)
+    effectively_constant = (
+        rolling_range <= np.finfo(float).eps * rolling_scale * 100
+    )
+    return slope.where(~effectively_constant, 0.0).where(ready)
+
+
+def create_features_chunk(
+    clean_rows: pd.DataFrame,
+    carry_rows: pd.DataFrame | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Engineer one clean chronological chunk with exact rolling continuity.
+
+    Only the final WINDOW_SIZE-1 clean source rows are carried between chunks.
+    Returned features belong exclusively to ``clean_rows``; carry rows are
+    context and are never emitted twice.
+    """
+    clean_rows = clean_rows.sort_values(config.COL_TIMESTAMP).reset_index(drop=True)
+    carry_rows = carry_rows if carry_rows is not None else clean_rows.iloc[0:0]
+    combined = pd.concat([carry_rows, clean_rows], ignore_index=True)
+    featured = create_features(combined, verbose=False)
+    if len(clean_rows):
+        current_timestamps = set(clean_rows[config.COL_TIMESTAMP])
+        featured = featured[
+            featured[config.COL_TIMESTAMP].isin(current_timestamps)
+        ].reset_index(drop=True)
+    else:
+        featured = featured.iloc[0:0].copy()
+    carry_count = max(0, config.WINDOW_SIZE - 1)
+    next_carry = combined.tail(carry_count).copy().reset_index(drop=True)
+    return featured, next_carry
 
 
 def create_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:

@@ -17,12 +17,16 @@ commissioning window. Where that window comes from is `config.REFERENCE_SOURCE`:
   different, unreproducible reference set. Pin them once you've
   identified a confirmed-healthy commissioning stretch in the live data.
   Use `--all-machines` to discover all source machine IDs, or repeat
-  `--machine-id` to select an explicit subset. Rolling features are built
-  separately per machine and healthy feature rows are sampled down to the
-  same count per machine before they are combined. This prevents the
-  highest-volume machine from dominating the one shared Isolation Forest.
-  Sampling is deterministic (`random_state=42`) so rerunning against the
-  same pinned source rows produces the same balanced reference selection.
+  `--machine-id` to select an explicit subset. Large ranges use two bounded
+  streaming passes per machine. The first considers every clean source row
+  while learning a bounded motion profile. The second preserves the previous
+  `WINDOW_SIZE-1` clean rows across database chunks, so rolling features are
+  identical to full-trajectory feature construction, then automatically gates
+  invalid/non-running/spec-ineligible rows. Every eligible row receives a
+  deterministic random priority; the bounded per-machine reservoir therefore
+  remains representative without loading the source range into memory. The
+  retained pools are balanced to the same count before they are combined,
+  preventing the highest-volume machine from dominating the shared forest.
   The newest balanced 20% (at least 20 rows per machine) is reserved as a
   forward validation holdout before normalizer, tree, or condition-anchor
   fitting. `artifact_utils.save_artifacts()` records the fit and validation
@@ -32,13 +36,14 @@ commissioning window. Where that window comes from is `config.REFERENCE_SOURCE`:
   `config.RAW_DATA_PATH`. Kept for offline experimentation and for CI/test
   fixtures that shouldn't need a reachable database.
 
-For live training, a machine-local operating-state pass first excludes
+For live training, the automatic machine-local operating-state pass excludes
 `STOPPED` and `STARTING` rows without removing them before rolling feature
-construction. `preprocessing.select_spec_normal_rows()` (or `--full` to skip
-the spec test) then decides which confirmed-running rows are accepted as
-healthy. Only use `--full` when every running portion of the window is
-independently confirmed healthy. `--include-non-running` is an explicit
-manual override for a window independently known to contain running data only.
+construction. The configured `SPEC_MAX` bounds (or `--full` to skip that test)
+then decide which confirmed-running rows are accepted as healthy. The user
+does not manually filter individual readings. Only use `--full` when every
+running portion of the window is independently confirmed healthy.
+`--include-non-running` is an explicit manual override for a window
+independently known to contain running data only.
 
 Before fitting the shared tree, every engineered feature is normalized with
 that machine's confirmed-healthy median and robust IQR/MAD scale. The fitted

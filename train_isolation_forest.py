@@ -40,6 +40,7 @@ import feature_engineering
 import artifact_utils
 import operating_state
 import machine_normalization
+import streaming_training
 from isolation_forest import AnomalyScorer
 
 
@@ -90,8 +91,10 @@ def parse_args():
     )
     parser.add_argument(
         "--max-rows-per-machine", type=int, default=None,
-        help="Optional upper bound on healthy feature rows sampled from each "
-             "machine. All machines still contribute exactly the same number."
+        help="Override the automatic bounded model/validation reservoir per "
+             "machine (default: config.TRAINING_MAX_ROWS_PER_MACHINE). Every "
+             "source row is still scanned and eligible; this controls only "
+             "how many engineered rows are retained in memory."
     )
     parser.add_argument(
         "--preview-reference", action="store_true",
@@ -185,43 +188,103 @@ def _resolve_live_window(args):
     return start, end
 
 
-def _load_live_raw(start, end, machine_id):
-    print(
-        f"[train] Querying PostgreSQL for machine {machine_id!r} between "
-        f"{start} and {end}...",
-        flush=True,
+def _clean_stream_chunk(rows, dbcols, previous_source_timestamp):
+    """Canonicalize one ordered DB chunk and deduplicate across boundaries."""
+    frame = db.canonical_sensor_frame(rows, dbcols)
+    frame[config.COL_TIMESTAMP] = pd.to_datetime(
+        frame[config.COL_TIMESTAMP], errors="coerce"
     )
-    print(
-        "[train] If this query remains here for more than about a minute, "
-        "cancel with Ctrl+C and install the composite source index documented "
-        "in database/create_training_source_index.sql.",
-        flush=True,
+    frame = frame.dropna(subset=[config.COL_TIMESTAMP]).sort_values(
+        config.COL_TIMESTAMP
     )
-    query_started = time.perf_counter()
-    conn = db.get_connection()
-    try:
-        table = db.get_table_name()
-        # .to_pydatetime(): same conversion backfill.py uses before handing
-        # a pd.Timestamp to psycopg2, so tz-aware/naive comparisons against
-        # the DB column behave the same way here as they do there.
-        rows = db.fetch_rows_between(conn, table, start.to_pydatetime(), end.to_pydatetime(), machine_id=machine_id)
-    finally:
-        conn.close()
+    if previous_source_timestamp is not None:
+        frame = frame[frame[config.COL_TIMESTAMP] > previous_source_timestamp]
+    next_source_timestamp = previous_source_timestamp
+    if not frame.empty:
+        # Advance on source timestamps before sensor-value cleaning. This
+        # exactly prevents a valid duplicate in the next DB chunk replacing an
+        # invalid first row that full-frame clean_data() would have kept then
+        # rejected.
+        next_source_timestamp = frame[config.COL_TIMESTAMP].max()
+    return preprocessing.clean_data(frame, verbose=False), next_source_timestamp
 
-    if not rows:
-        raise ValueError(
-            f"No rows found for machine {machine_id!r} in table {table!r} between {start} and {end}. "
-            f"Check REFERENCE_WINDOW_START/END and the PG_* connection "
-            f"settings in .env."
+
+def _activity_frame(clean_rows):
+    motion = clean_rows[list(operating_state.MOTION_COLS)].to_numpy(dtype=float)
+    scores = np.median(np.log10(np.maximum(np.abs(motion), 1e-12)), axis=1)
+    return pd.DataFrame({"activity_score": scores})
+
+
+def _progress(machine_id, pass_label, scanned, clean, started, force=False):
+    if force or scanned % 500_000 < config.TRAINING_DB_CHUNK_ROWS:
+        print(
+            f"[train] Machine {machine_id!r} {pass_label}: "
+            f"scanned={scanned:,}, clean={clean:,}, "
+            f"elapsed={time.perf_counter() - started:.1f}s",
+            flush=True,
         )
 
+
+def _learn_streaming_operating_state(start, end, machine_id):
+    """First bounded pass: every clean row can enter the motion profile."""
+    print(
+        f"[train] Machine {machine_id!r}: pass 1/2 learning motion regimes "
+        f"from the complete selected range...",
+        flush=True,
+    )
+    profile = streaming_training.PriorityReservoir(
+        config.TRAINING_STATE_PROFILE_ROWS,
+        streaming_training.machine_seed(
+            config.TRAINING_RESERVOIR_SEED, machine_id, "operating-state"
+        ),
+    )
+    scanned = clean = 0
+    previous_timestamp = None
+    started = time.perf_counter()
     dbcols = db.get_db_columns()
-    raw_df = db.canonical_sensor_frame(rows, dbcols)
-    raw_df = preprocessing.clean_data(raw_df)
-    print(f"[train] Pulled {len(raw_df)} live rows for machine {machine_id!r} from {table!r} "
-          f"between {start} and {end} in {time.perf_counter()-query_started:.1f}s "
-          "(after cleaning).")
-    return raw_df
+    for rows in db.iter_row_chunks_between(
+        db.get_table_name(),
+        start.to_pydatetime(),
+        end.to_pydatetime(),
+        machine_id=machine_id,
+    ):
+        scanned += len(rows)
+        clean_rows, previous_timestamp = _clean_stream_chunk(
+            rows, dbcols, previous_timestamp
+        )
+        clean += len(clean_rows)
+        profile.offer(_activity_frame(clean_rows))
+        _progress(machine_id, "motion profile", scanned, clean, started)
+
+    profile_frame = profile.result()
+    if profile_frame.empty:
+        raise ValueError(
+            f"No clean rows found for machine {machine_id!r} between {start} and {end}."
+        )
+    detector = operating_state.OperatingStateDetector(
+        history_rows=len(profile_frame)
+    )
+    for score in profile_frame["activity_score"].to_numpy(dtype=float):
+        detector.observe_activity_score(score)
+    if not detector.fit_history(require_sustained_low=False):
+        raise ValueError(
+            f"Machine {machine_id!r} has no clearly separable stationary and "
+            "rotating vibration regimes in the selected window. Choose a "
+            "window containing both regimes, or use --include-non-running "
+            "only when the entire range is independently confirmed running."
+        )
+    _progress(machine_id, "motion profile complete", scanned, clean, started, force=True)
+    print(
+        f"[train] Machine {machine_id!r}: learned activity thresholds "
+        f"stop={detector.stop_threshold:.6g}, run={detector.run_threshold:.6g} "
+        f"from {len(profile_frame):,}/{clean:,} profiled clean rows.",
+        flush=True,
+    )
+    return detector, {
+        "motion_profile_source_rows": scanned,
+        "motion_profile_clean_rows": clean,
+        "motion_profile_retained_rows": len(profile_frame),
+    }
 
 
 def _resolve_live_machine_ids(args):
@@ -246,71 +309,144 @@ def _resolve_live_machine_ids(args):
     return machine_ids
 
 
-def _running_feature_rows(raw_df, featured_df, machine_id, include_non_running=False):
-    """Select model-applicable rows without breaking contiguous windows."""
-    if include_non_running:
-        print(f"[train] Machine {machine_id!r}: --include-non-running keeps all "
-              f"{len(featured_df)} complete feature rows.")
-        return featured_df.reset_index(drop=True)
-
-    detector = operating_state.OperatingStateDetector(history_rows=len(raw_df))
-    readings = raw_df[config.RAW_SENSOR_COLS].to_dict("records")
-    for reading in readings:
-        detector.observe_history(reading)
-    if not detector.fit_history():
-        raise ValueError(
-            f"Machine {machine_id!r} has no clearly separable stationary and "
-            "rotating regimes in the selected window. Choose a window containing "
-            "both regimes, or use --include-non-running only if the whole window "
-            "is independently confirmed to contain running data."
-        )
-
-    running_timestamps = []
-    state_counts = {state: 0 for state in operating_state.VALID_STATES}
-    for timestamp, reading in zip(raw_df[config.COL_TIMESTAMP], readings):
-        state = detector.update(reading)
-        state_counts[state.state] = state_counts.get(state.state, 0) + 1
-        if state.state == "RUNNING" and not state.low_motion:
-            running_timestamps.append(timestamp)
-
-    selected = featured_df[
-        featured_df[config.COL_TIMESTAMP].isin(running_timestamps)
-    ].reset_index(drop=True)
+def _stream_live_machine(
+    start,
+    end,
+    machine_id,
+    *,
+    detector,
+    include_non_running,
+    use_full,
+    retained_capacity,
+):
+    """Second bounded pass: exact rolling features and automatic eligibility."""
     print(
-        f"[train] Machine {machine_id!r}: operating-state filter kept "
-        f"{len(selected)}/{len(featured_df)} feature rows; states={state_counts}; "
-        f"activity thresholds stop={detector.stop_threshold:.6g}, "
-        f"run={detector.run_threshold:.6g}."
+        f"[train] Machine {machine_id!r}: pass 2/2 building rolling features; "
+        f"automatic retained capacity={retained_capacity:,}...",
+        flush=True,
     )
-    if selected.empty:
-        raise ValueError(
-            f"Machine {machine_id!r} produced no confirmed-RUNNING feature rows."
+    sampler = streaming_training.ForwardHoldoutReservoir(
+        capacity=retained_capacity,
+        holdout_fraction=artifact_utils.VALIDATION_HOLDOUT_FRACTION,
+        minimum_holdout=artifact_utils.VALIDATION_HOLDOUT_MIN_ROWS,
+        seed=streaming_training.machine_seed(
+            config.TRAINING_RESERVOIR_SEED, machine_id, "reference-features"
+        ),
+    )
+    state_counts = {state: 0 for state in operating_state.VALID_STATES}
+    if include_non_running:
+        state_counts["BYPASSED"] = 0
+    stats = {
+        "source_rows_scanned": 0,
+        "clean_rows": 0,
+        "complete_feature_rows": 0,
+        "applicable_rows": 0,
+        "reference_rows_considered": 0,
+    }
+    previous_timestamp = None
+    carry_rows = None
+    feature_cols = None
+    dbcols = db.get_db_columns()
+    started = time.perf_counter()
+
+    for rows in db.iter_row_chunks_between(
+        db.get_table_name(),
+        start.to_pydatetime(),
+        end.to_pydatetime(),
+        machine_id=machine_id,
+    ):
+        stats["source_rows_scanned"] += len(rows)
+        clean_rows, previous_timestamp = _clean_stream_chunk(
+            rows, dbcols, previous_timestamp
         )
-    return selected
+        stats["clean_rows"] += len(clean_rows)
+        if clean_rows.empty:
+            continue
 
-
-def _select_live_reference(raw_df, applicable_df, use_full, machine_id):
-    if use_full:
-        reference_df = applicable_df.reset_index(drop=True)
-        print(f"[train] Machine {machine_id!r}: --full uses all "
-              f"{len(reference_df)} confirmed-applicable feature rows "
-              "(spec filter skipped).")
-    else:
-        # Filter raw rows first, but compute rolling features on the complete
-        # per-machine trajectory so gaps never corrupt a rolling window.
-        normal_raw = preprocessing.select_spec_normal_rows(raw_df)
-        is_reference = applicable_df[config.COL_TIMESTAMP].isin(normal_raw[config.COL_TIMESTAMP])
-        reference_df = applicable_df[is_reference].reset_index(drop=True)
-        print(f"[train] Machine {machine_id!r}: {len(reference_df)}/{len(applicable_df)} "
-              f"applicable feature rows pass the spec filter.")
-
-    if reference_df.empty:
-        raise ValueError(
-            f"Machine {machine_id!r} has no usable healthy feature rows in the "
-            "selected commissioning window. Widen the window, verify the spec "
-            "bounds, or use --full only if every selected running row is confirmed healthy."
+        featured, carry_rows = feature_engineering.create_features_chunk(
+            clean_rows, carry_rows
         )
-    return reference_df
+        if featured.empty:
+            continue
+        current_feature_cols = feature_engineering.get_feature_columns(featured)
+        if feature_cols is None:
+            feature_cols = current_feature_cols
+        elif feature_cols != current_feature_cols:
+            raise ValueError(f"Feature columns changed while streaming machine {machine_id!r}.")
+        stats["complete_feature_rows"] += len(featured)
+
+        if include_non_running:
+            applicable = np.ones(len(clean_rows), dtype=bool)
+            state_counts["BYPASSED"] += len(clean_rows)
+        else:
+            applicable_values = []
+            for reading in clean_rows[config.RAW_SENSOR_COLS].to_dict("records"):
+                state = detector.update(reading)
+                state_counts[state.state] = state_counts.get(state.state, 0) + 1
+                applicable_values.append(
+                    state.state == "RUNNING" and not state.low_motion
+                )
+            applicable = np.asarray(applicable_values, dtype=bool)
+
+        if use_full:
+            within_spec = np.ones(len(clean_rows), dtype=bool)
+        else:
+            within_spec = np.ones(len(clean_rows), dtype=bool)
+            for column, bound in config.SPEC_MAX.items():
+                if bound is not None:
+                    within_spec &= clean_rows[column].to_numpy(dtype=float) <= float(bound)
+
+        eligibility = clean_rows[[config.COL_TIMESTAMP]].copy()
+        eligibility["__applicable"] = applicable
+        eligibility["__reference"] = applicable & within_spec
+        selected = featured.merge(
+            eligibility, on=config.COL_TIMESTAMP, how="inner", validate="one_to_one"
+        )
+        stats["applicable_rows"] += int(selected["__applicable"].sum())
+        reference_chunk = selected[selected["__reference"]][
+            [config.COL_TIMESTAMP, *feature_cols]
+        ].reset_index(drop=True)
+        stats["reference_rows_considered"] += len(reference_chunk)
+        sampler.offer(reference_chunk)
+        _progress(
+            machine_id,
+            "feature scan",
+            stats["source_rows_scanned"],
+            stats["clean_rows"],
+            started,
+        )
+
+    retained = sampler.result(config.COL_TIMESTAMP)
+    if retained.empty or feature_cols is None:
+        raise ValueError(
+            f"Machine {machine_id!r} produced no usable healthy feature rows. "
+            "Verify the selected range and operating-state/spec assumptions."
+        )
+    stats["retained_rows_before_fleet_balance"] = len(retained)
+    stats["state_counts"] = state_counts
+    stats["operating_state_stop_threshold"] = (
+        None if detector is None else detector.stop_threshold
+    )
+    stats["operating_state_run_threshold"] = (
+        None if detector is None else detector.run_threshold
+    )
+    _progress(
+        machine_id,
+        "feature scan complete",
+        stats["source_rows_scanned"],
+        stats["clean_rows"],
+        started,
+        force=True,
+    )
+    filter_description = "spec filter skipped (--full)" if use_full else "spec filter applied"
+    print(
+        f"[train] Machine {machine_id!r}: considered "
+        f"{stats['reference_rows_considered']:,} eligible feature rows "
+        f"({filter_description}); retained {len(retained):,} for balanced "
+        f"fit/validation; states={state_counts}.",
+        flush=True,
+    )
+    return retained, feature_cols, stats
 
 
 def _balanced_reference_pool(machine_reference_frames, max_rows_per_machine=None):
@@ -373,39 +509,52 @@ def _train_from_live(args):
     start, end = _resolve_live_window(args)
     machine_ids = _resolve_live_machine_ids(args)
     machine_reference_frames = {}
-    machine_health_frames = {}
+    streaming_stats = {}
     feature_cols = None
+    retained_capacity = (
+        args.max_rows_per_machine
+        if args.max_rows_per_machine is not None
+        else config.TRAINING_MAX_ROWS_PER_MACHINE
+    )
+    if retained_capacity < 100:
+        raise ValueError(
+            "--max-rows-per-machine must be at least 100 so model fitting and "
+            "forward validation both retain enough evidence."
+        )
 
-    # Build rolling features independently. Combining raw rows first would
-    # let windows cross machine boundaries and create impossible readings.
+    # Each machine is scanned independently so rolling windows, operating
+    # state, normalization, and validation can never cross asset boundaries.
     for machine_id in machine_ids:
-        raw_df = _load_live_raw(start, end, machine_id)
-        featured_df = feature_engineering.create_features(raw_df)
-        if featured_df.empty:
-            raise ValueError(
-                f"Machine {machine_id!r} produced no complete feature rows. "
-                f"Each machine needs at least {config.MIN_PERIODS} clean source rows."
+        if args.include_non_running:
+            detector = None
+            profile_stats = {
+                "motion_profile_source_rows": 0,
+                "motion_profile_clean_rows": 0,
+                "motion_profile_retained_rows": 0,
+                "motion_profile_bypassed": True,
+            }
+        else:
+            detector, profile_stats = _learn_streaming_operating_state(
+                start, end, machine_id
             )
-
-        current_feature_cols = feature_engineering.get_feature_columns(featured_df)
+        retained, current_feature_cols, machine_stats = _stream_live_machine(
+            start,
+            end,
+            machine_id,
+            detector=detector,
+            include_non_running=args.include_non_running,
+            use_full=args.full,
+            retained_capacity=retained_capacity,
+        )
         if feature_cols is None:
             feature_cols = current_feature_cols
         elif current_feature_cols != feature_cols:
             raise ValueError(f"Feature columns differ for machine {machine_id!r}.")
+        machine_reference_frames[machine_id] = retained
+        streaming_stats[machine_id] = {**profile_stats, **machine_stats}
 
-        applicable_df = _running_feature_rows(
-            raw_df,
-            featured_df,
-            machine_id,
-            include_non_running=args.include_non_running,
-        )
-        machine_health_frames[machine_id] = applicable_df
-        machine_reference_frames[machine_id] = _select_live_reference(
-            raw_df, applicable_df, args.full, machine_id
-        )
-
-    balanced_frames, available_counts, rows_per_machine = _balanced_reference_pool(
-        machine_reference_frames, args.max_rows_per_machine
+    balanced_frames, retained_counts, rows_per_machine = _balanced_reference_pool(
+        machine_reference_frames, retained_capacity
     )
     training_frames, validation_frames = _split_validation_holdout(
         balanced_frames, feature_cols
@@ -423,7 +572,7 @@ def _train_from_live(args):
         machine_id: machine_normalization.transform(
             frame, feature_cols, machine_feature_normalizers[machine_id], machine_id
         )
-        for machine_id, frame in machine_health_frames.items()
+        for machine_id, frame in balanced_frames.items()
     }
     reference_df = pd.concat(normalized_training_frames.values(), ignore_index=True)
     health_check_df = pd.concat(normalized_health_frames.values(), ignore_index=True)
@@ -462,7 +611,11 @@ def _train_from_live(args):
         metadata_extra={
             "training_mode": "balanced_pooled" if len(machine_ids) > 1 else "single_machine",
             "training_machine_ids": machine_ids,
-            "available_reference_rows_per_machine": available_counts,
+            "available_reference_rows_per_machine": {
+                machine_id: values["reference_rows_considered"]
+                for machine_id, values in streaming_stats.items()
+            },
+            "streaming_retained_rows_per_machine": retained_counts,
             "balanced_rows_per_machine_before_holdout": rows_per_machine,
             "model_fit_rows_per_machine": {
                 machine_id: len(frame) for machine_id, frame in training_frames.items()
@@ -472,7 +625,13 @@ def _train_from_live(args):
             },
             "validation_holdout_fraction": artifact_utils.VALIDATION_HOLDOUT_FRACTION,
             "validation_holdout_lineage": "commissioning_forward_holdout",
-            "balance_method": "equal_rows_deterministic_sample",
+            "balance_method": "equal_rows_deterministic_priority_reservoir_with_forward_holdout",
+            "streaming_source_scan": streaming_stats,
+            "training_db_chunk_rows": config.TRAINING_DB_CHUNK_ROWS,
+            "training_db_slice_hours": config.TRAINING_DB_SLICE_HOURS,
+            "training_reservoir_capacity_per_machine": retained_capacity,
+            "training_reservoir_seed": config.TRAINING_RESERVOIR_SEED,
+            "isolation_forest_params": config.ISOLATION_FOREST_PARAMS,
             "model_feature_space": machine_normalization.METHOD,
             "reference_window_start": start.isoformat(),
             "reference_window_end": end.isoformat(),
