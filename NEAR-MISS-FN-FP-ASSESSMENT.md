@@ -39,10 +39,13 @@ had no effect on retraining at all.
 ## What was implemented
 The narrow, low-risk piece: **flagging a near-miss now creates a `regression_tests` row**
 (`POST /api/near-miss/{id}/review` with `decision=flagged`, in both `api/main.py` and
-`api/mock_main.py`). The window is ±`NEAR_MISS_REGRESSION_WINDOW_HOURS` (new runtime-config key,
-default 1 hour) around the flagged tick, and the risk floor is the record's own `anomaly_score` at
-flag time (clamped to `[0.05, 0.95]`) — i.e. "a future model must not become *less* sensitive than
-the current model already was to this case." This reuses the exact machinery Gate 2 already runs on
+`Demo/mock_main.py`). The saved context window is ±`NEAR_MISS_REGRESSION_WINDOW_HOURS`
+(runtime-config key, default 1 hour), but automatic validation is pinned to the exact flagged
+prediction timestamp so an unrelated anomalous tick elsewhere in that range cannot pass it. The
+risk floor is derived from the record's calibrated
+condition score as `1 - health_state / 100` (clamped to `[0.05, 0.95]`) — i.e. "a future model must
+not become *less* sensitive than the current model already was to this case." The raw Isolation
+Forest `anomaly_score` is deliberately not used as a probability. This reuses Gate 2, which runs on
 every retrain, so a flagged near-miss now has a real, enforced effect on what's allowed to ship,
 which is the thing that was actually missing.
 

@@ -6,10 +6,17 @@ import bcrypt
 import jwt
 from fastapi import Depends, HTTPException, Request, Response
 
-SECRET = os.getenv("APP_SECRET_KEY", "change-me-before-production")
 COOKIE = "spindle_session"
 ALGORITHM = "HS256"
-SESSION_SECONDS = int(os.getenv("APP_SESSION_SECONDS", "28800"))
+
+def _secret() -> str:
+    value = os.getenv("APP_SECRET_KEY")
+    if not value:
+        raise RuntimeError("APP_SECRET_KEY is not configured")
+    return value
+
+def _session_seconds() -> int:
+    return int(os.getenv("APP_SESSION_SECONDS", "28800"))
 
 @dataclass
 class User:
@@ -30,19 +37,30 @@ def verify_password(password: str, password_hash: str) -> bool:
 
 def issue_cookie(response: Response, username: str, role: str) -> None:
     now = int(time.time())
-    token = jwt.encode({"sub": username, "role": role, "iat": now, "exp": now + SESSION_SECONDS}, SECRET, algorithm=ALGORITHM)
-    response.set_cookie(COOKIE, token, httponly=True, samesite="strict", secure=os.getenv("COOKIE_SECURE", "false").lower()=="true", max_age=SESSION_SECONDS)
+    session_seconds = _session_seconds()
+    token = jwt.encode({"sub": username, "role": role, "iat": now, "exp": now + session_seconds}, _secret(), algorithm=ALGORITHM)
+    response.set_cookie(COOKIE, token, httponly=True, samesite="strict", secure=os.getenv("COOKIE_SECURE", "false").lower()=="true", max_age=session_seconds)
 
 
-def current_user(request: Request) -> User:
-    token = request.cookies.get(COOKIE)
+def session_user(token: str | None) -> User:
+    """Validate a signed session token for HTTP or WebSocket transport."""
     if not token:
         raise HTTPException(401, "Login required")
     try:
-        payload = jwt.decode(token, SECRET, algorithms=[ALGORITHM])
-        return User(payload["sub"], payload["role"])
+        payload = jwt.decode(token, _secret(), algorithms=[ALGORITHM])
+        username = payload.get("sub")
+        role = payload.get("role")
+        if not isinstance(username, str) or not username or role not in ("viewer", "admin"):
+            raise HTTPException(401, "Invalid or expired session")
+        return User(username, role)
+    except HTTPException:
+        raise
     except Exception:
         raise HTTPException(401, "Invalid or expired session")
+
+
+def current_user(request: Request) -> User:
+    return session_user(request.cookies.get(COOKIE))
 
 
 def require_admin(user: User = Depends(current_user)) -> User:

@@ -3,3 +3,5 @@ data/processed/*.csv
 .env
 .venv
 __pycache__
+Demo/mock_demo.db-wal
+Demo/mock_demo.db-shm

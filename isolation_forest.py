@@ -19,6 +19,7 @@ import pandas as pd
 from sklearn.ensemble import IsolationForest
 
 import config
+import runtime_config
 
 
 class AnomalyScorer:
@@ -28,6 +29,7 @@ class AnomalyScorer:
         self.baseline_std = None
         self.baseline_feature_mean = None  # pd.Series, indexed by feature name
         self.baseline_feature_std = None   # pd.Series, indexed by feature name
+        self.calibration_method = "robust_median_scale_floor_v2"
 
     def fit(self, X_reference):
         """Fit on the reference/baseline window only, then calibrate the
@@ -49,44 +51,74 @@ class AnomalyScorer:
         large pooled "normal" corpus so it generalizes) and the health%
         anchor (see calibrate()) can come from different data.
         """
+        self._require_finite(X_reference, "fit_model")
         self.model.fit(X_reference)
         return self
 
     def calibrate(self, X_reference):
         """
-        Sets baseline_mean/baseline_std (and the per-feature diagnostics)
-        from X_reference's own score distribution — this is what
-        health_from_score() anchors "100%" and "0%" to. Callable
-        separately from fit_model() and re-callable later.
-
-        Why this needs to be separable, confirmed not theorized: fitting
-        the tree on a large pooled training file (config.RAW_DATA_PATH)
-        and ALSO calibrating from that same pooled file transfers well for
-        RELATIVE ranking (held-out AUC=0.997 across a genuinely different
-        trajectory) but not for the ABSOLUTE percentage scale — measured
-        directly: genuinely-normal rows in a different held-out trajectory
-        had a z-score distribution (relative to the pooled file's
-        baseline_mean/std) that OVERLAPPED with that same held-out
-        trajectory's own genuinely-bad rows (normal 75th-99th percentile
-        z=4.9-6.0 sits inside bad rows' min-50th percentile z=4.3-5.2). No
-        single HEALTH_SENSITIVITY_STD value can be correct for both
-        populations simultaneously when the anchor itself doesn't match
-        the deployment. Recalibrating baseline_mean/std from THIS
-        deployment's own short known-healthy window (while keeping the
-        tree fit on the broad pooled corpus) fixes the anchor without
-        losing what the pooled training bought.
+        Sets the backward-compatible baseline_mean/baseline_std fields to the
+        reference score median and a robust MAD/IQR-derived spread (plus the
+        per-feature diagnostics) — this is what health_from_score() anchors
+        "100%" and "0%" to. It remains separate from fit_model() because one
+        shared tree learns from the balanced normalized fleet corpus, while
+        each commissioned machine receives an automatic anchor from its own
+        confirmed-healthy normalized score distribution. Robust estimators
+        limit the influence of a small number of contaminated commissioning
+        rows. Operators cannot reset this anchor from model predictions;
+        training or validated shadow retraining is the only supported way to
+        replace it.
         """
+        self._require_finite(X_reference, "calibrate")
         scores = self.model.score_samples(X_reference)
-        self.baseline_mean = float(np.mean(scores))
-        self.baseline_std = float(np.std(scores)) or 1e-6
+        self.baseline_mean, self.baseline_std = self._robust_center_scale(scores)
 
         # Per-feature baseline, used only for diagnosis (which raw
         # feature(s) drove a given anomalous reading), never for the
         # score/health/status decision itself — that stays the single
         # combined score above.
-        self.baseline_feature_mean = X_reference.mean(axis=0)
-        self.baseline_feature_std = X_reference.std(axis=0).replace(0, np.nan)
+        self.baseline_feature_mean = X_reference.median(axis=0)
+        deviations = X_reference.subtract(self.baseline_feature_mean).abs()
+        robust_std = deviations.median(axis=0) * 1.4826
+        iqr_std = (X_reference.quantile(0.75) - X_reference.quantile(0.25)) / 1.349
+        ordinary_std = X_reference.std(axis=0)
+        self.baseline_feature_std = robust_std.where(robust_std > 1e-12, iqr_std)
+        self.baseline_feature_std = self.baseline_feature_std.where(
+            self.baseline_feature_std > 1e-12, ordinary_std
+        ).where(lambda values: values > 1e-12, 1.0).fillna(1.0)
         return self
+
+    @staticmethod
+    def _robust_center_scale(values) -> tuple[float, float]:
+        """Median + robust spread, resistant to a few contaminated rows."""
+        array = np.asarray(values, dtype=float)
+        center = float(np.median(array))
+        mad_scale = float(np.median(np.abs(array - center)) * 1.4826)
+        q25, q75 = np.quantile(array, [0.25, 0.75])
+        iqr_scale = float((q75 - q25) / 1.349)
+        ordinary = float(np.std(array))
+        scale = next(
+            (candidate for candidate in (mad_scale, iqr_scale, ordinary)
+             if np.isfinite(candidate) and candidate > 1e-12),
+            config.CONDITION_SCORE_MIN_SPREAD,
+        )
+        return center, max(scale, float(config.CONDITION_SCORE_MIN_SPREAD))
+
+    @staticmethod
+    def _require_finite(X, operation: str) -> None:
+        X_arr = X.values if hasattr(X, "values") else np.asarray(X)
+        finite_mask = np.isfinite(X_arr.astype(float))
+        if finite_mask.all():
+            return
+        if hasattr(X, "columns"):
+            bad_cols = [c for i, c in enumerate(X.columns) if not finite_mask[:, i].all()]
+        else:
+            bad_cols = "input array (no column names available)"
+        raise ValueError(
+            f"AnomalyScorer.{operation}() received non-finite (NaN/Inf) "
+            f"values in {bad_cols} — refusing to continue. Handle or exclude "
+            "the invalid source window before using the model."
+        )
 
     def score(self, X) -> np.ndarray:
         """
@@ -102,20 +134,7 @@ class AnomalyScorer:
         should fail loudly here, not produce a number nothing downstream
         knows to distrust.
         """
-        X_arr = X.values if hasattr(X, "values") else np.asarray(X)
-        finite_mask = np.isfinite(X_arr.astype(float))
-        if not finite_mask.all():
-            if hasattr(X, "columns"):
-                bad_cols = [c for i, c in enumerate(X.columns) if not finite_mask[:, i].all()]
-            else:
-                bad_cols = "input array (no column names available)"
-            raise ValueError(
-                f"AnomalyScorer.score() received non-finite (NaN/Inf) values in "
-                f"{bad_cols} — refusing to score. This means a sensor dropout or "
-                f"an upstream feature-engineering bug reached the model; it should "
-                f"be handled (or the reading skipped) before scoring, not scored "
-                f"through silently."
-            )
+        self._require_finite(X, "score")
         return self.model.score_samples(X)
 
     def feature_z_scores(self, X) -> "pd.Series":
@@ -137,9 +156,9 @@ class AnomalyScorer:
 
     def health_from_score(self, scores) -> np.ndarray:
         """
-        Maps raw anomaly score -> health percentage [0, 100], calibrated
-        against the reference window: 100 at or above the baseline mean,
-        linearly down to 0 at HEALTH_SENSITIVITY_STD standard deviations
+        Maps raw anomaly score -> relative condition score [0, 100], calibrated
+        against the reference window: 100 at or above the robust baseline
+        center, linearly down to 0 at HEALTH_SENSITIVITY_STD robust spreads
         below it. This mapping is fixed at fit() time from the baseline
         window only — it does not adapt as new (possibly degraded) data
         arrives, which is the correct behavior: health should read low
@@ -150,12 +169,16 @@ class AnomalyScorer:
         if self.baseline_mean is None:
             raise RuntimeError("AnomalyScorer.fit() must be called before health_from_score().")
 
-        z = (self.baseline_mean - np.asarray(scores)) / (config.HEALTH_SENSITIVITY_STD * self.baseline_std)
+        sensitivity = runtime_config.get(
+            "HEALTH_SENSITIVITY_STD", config.HEALTH_SENSITIVITY_STD
+        )
+        z = (self.baseline_mean - np.asarray(scores)) / (sensitivity * self.baseline_std)
         health = 100.0 * (1.0 - np.clip(z, 0.0, 1.0))
         return health
 
     def calibration(self) -> dict:
         return {
+            "method": self.calibration_method,
             "baseline_mean": self.baseline_mean,
             "baseline_std": self.baseline_std,
             "baseline_feature_mean": self.baseline_feature_mean.to_dict(),
@@ -168,6 +191,7 @@ class AnomalyScorer:
         obj.model = model
         obj.baseline_mean = calibration["baseline_mean"]
         obj.baseline_std = calibration["baseline_std"]
+        obj.calibration_method = calibration.get("method", "legacy_mean_std")
         # Older calibration.json files predate per-feature attribution —
         # fall back to None so feature_z_scores() fails loudly (via its
         # own check) rather than attribution silently reporting nothing.

@@ -23,36 +23,50 @@ commissioning window. Where that window comes from is `config.REFERENCE_SOURCE`:
   highest-volume machine from dominating the one shared Isolation Forest.
   Sampling is deterministic (`random_state=42`) so rerunning against the
   same pinned source rows produces the same balanced reference selection.
-  `artifact_utils.save_artifacts()` records machine-aware reference rows,
-  machine counts, and the exact training selection for auditability.
+  The newest balanced 20% (at least 20 rows per machine) is reserved as a
+  forward validation holdout before normalizer, tree, or condition-anchor
+  fitting. `artifact_utils.save_artifacts()` records the fit and validation
+  feature tables separately, plus machine counts and row identities, for
+  auditability.
 - **`"csv"`** — the original offline-file behavior, reading
   `config.RAW_DATA_PATH`. Kept for offline experimentation and for CI/test
   fixtures that shouldn't need a reachable database.
 
-Either way, `preprocessing.select_spec_normal_rows()` (or `--full` to skip
-it) decides which rows within that window are accepted as healthy. Only use
-`--full` when the entire window is independently confirmed healthy.
+For live training, a machine-local operating-state pass first excludes
+`STOPPED` and `STARTING` rows without removing them before rolling feature
+construction. `preprocessing.select_spec_normal_rows()` (or `--full` to skip
+the spec test) then decides which confirmed-running rows are accepted as
+healthy. Only use `--full` when every running portion of the window is
+independently confirmed healthy. `--include-non-running` is an explicit
+manual override for a window independently known to contain running data only.
 
-After the shared tree is fitted, the live trainer separately calibrates its
-health-percentage anchor against each machine's complete healthy reference
-set. Those calibrations are bundled with the model and imported into
-`machine_model_calibrations` when production registers its first model, so
-machines share the anomaly model but do not share a health baseline.
+Before fitting the shared tree, every engineered feature is normalized with
+that machine's confirmed-healthy median and robust IQR/MAD scale. The fitted
+normalizers are part of the model bundle and are mandatory at inference; a
+new machine cannot be scored until commissioning training includes it. Raw
+reference features remain stored in physical units so a shadow retrain can
+fit its own proposed normalizers without compounding an older transform.
 
-`recalibrate.py` is a separate, later step: re-anchoring the health%
-scale for one specific machine without refitting the tree. It is useful
-when a new machine joins after initial training or a serviced machine's
-healthy operating baseline has materially changed.
+After the shared tree is fitted, the trainer creates a robust residual
+condition-score anchor for each machine from its normalized fit-row score
+distribution. These anchors are automatic and switch with the model. Manual
+web/CLI recalibration is deliberately unsupported because selecting data from
+the current model's own `OK` decisions creates a circular, drifting baseline.
 
 ## Shared-model retraining
 
 The active bundle carries `reference_features.csv`: the exact balanced,
-machine-aware feature corpus used to fit its tree. Shadow retraining starts
-from this artifact instead of trying to recover pooled features from a
-timestamp-only CSV lookup.
+machine-aware feature corpus used to fit its tree, and
+`validation_features.csv`: equal per-machine confirmed-normal evidence that
+was excluded from fitting and calibration. Shadow retraining starts from these
+artifacts instead of trying to recover pooled features from a timestamp-only
+CSV lookup. Legacy bundles create this separation on their first upgraded
+retrain; newly commissioned bundles have it from initial training.
 
 Only alerts that an operator marks `confirmed_normal` become retraining
 candidates. The scheduler evaluates the batch and age thresholds per machine.
+Its evaluation interval and the regression-test window created from a flagged
+near miss are runtime policy stored in PostgreSQL and editable by an admin.
 Candidates are cosine-deduplicated only against candidates from the same
 machine, then merged into that machine's reference. Rebalancing gives every
 machine the same row count and prioritizes new confirmed-normal rows when old
@@ -63,11 +77,24 @@ commissioning window.
 
 Each shadow model must pass the confirmed-normal false-positive gate for every
 machine independently. Permanent false-negative regression windows are rebuilt
-from the matching machine's live raw rows and scored with that machine's
-proposed calibration. A shadow is promotable only if every machine-level gate
-and every regression test passes. Promotable shadows already contain and have
-database assignments for fresh per-machine calibrations, so promotion switches
-the shared tree and its machine health anchors together.
+from the matching machine's live raw rows, transformed with that machine's
+proposed normalizer, and scored with its proposed automatic anchor. A shadow
+is promotable only if every machine-level holdout gate and every regression test
+passes. Promotion switches the shared tree, machine normalizers, and condition
+anchors together.
+
+The scheduler and manual web action enqueue `retrain_jobs`; training does not
+run inside the HTTP request. A PostgreSQL advisory lock plus the active-job
+index enforce one fleet training process at a time. A passed shadow stages the
+candidate IDs in `model_version_candidates`. They remain pending until an
+administrator promotes that exact shadow, when they are consumed in the same
+database transaction as activation. Deleting the shadow releases them. Only
+one shadow can await a decision, so multiple proposals cannot reserve disjoint
+candidate sets. Automatic retries suppress an unchanged validation rejection;
+unexpected failures use the configured cooldown. Candidate IDs, active model,
+material policy, pipeline hash, retraining-protocol source hash, and active
+regression tests form the attempt fingerprint, so genuinely new evidence or
+deployed validation logic is not blocked by an older result.
 
 ## Production
 
@@ -77,7 +104,7 @@ The production worker runs separately and owns `SpindleMonitor`, feature enginee
 
 ## Temporary mock mode
 
-`React/Vite -> FastAPI mock API -> SQLite mock_demo.db`.
+`React/Vite -> FastAPI Demo/mock_main.py -> SQLite Demo/mock_demo.db`.
 
 The production worker is not started. The mock API exposes the same frontend-facing endpoints and generates synthetic live ticks for multiple machine IDs so the web UI can be verified without a PostgreSQL server or trained artifacts.
 

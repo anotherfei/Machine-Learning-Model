@@ -102,12 +102,22 @@ def create_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
     for col_a, col_b in itertools.combinations(sensor_cols, 2):
         rolling_a = df[col_a].rolling(window=w, min_periods=mp)
         rolling_b = df[col_b].rolling(window=w, min_periods=mp)
-        correlation = rolling_a.corr(df[col_b])
+        correlation = rolling_a.corr(df[col_b]).replace([np.inf, -np.inf], np.nan)
         ready = (rolling_a.count() >= mp) & (rolling_b.count() >= mp)
-        # Correlation is undefined when either complete window is constant.
-        # Treat that as no measured linear relationship rather than dropping
-        # an otherwise valid production tick from the feature table.
-        correlation = correlation.mask(ready & correlation.isna(), 0.0)
+        std_a = rolling_a.std()
+        std_b = rolling_b.std()
+        scale_a = df[col_a].abs().rolling(window=w, min_periods=mp).max().clip(lower=1.0)
+        scale_b = df[col_b].abs().rolling(window=w, min_periods=mp).max().clip(lower=1.0)
+        tolerance_a = np.finfo(float).eps * scale_a * 100
+        tolerance_b = np.finfo(float).eps * scale_b * 100
+        stable = ready & (std_a > tolerance_a) & (std_b > tolerance_b)
+
+        # Pearson correlation is undefined for constant windows and can become
+        # +/-Inf through catastrophic cancellation for almost-flat industrial
+        # channels.  Zero means "no measurable linear relationship" here; the
+        # separate std/range features still retain the important flatness
+        # signal.  Clip tiny numerical overshoots back to the legal range.
+        correlation = correlation.where(stable, 0.0).fillna(0.0).clip(-1.0, 1.0)
         corr_frame[f"{col_a}_{col_b}_corr"] = correlation
     feat_frames.append(pd.DataFrame(corr_frame))
 
@@ -119,6 +129,20 @@ def create_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
     if n_dropped and verbose:
         print(f"[create_features] Dropped {n_dropped} rows with incomplete rolling windows "
               f"(insufficient history at trajectory start).")
+
+    feature_columns = [column for column in result.columns if column != config.COL_TIMESTAMP]
+    if feature_columns:
+        values = result[feature_columns].to_numpy(dtype=float)
+        finite = np.isfinite(values)
+        if not finite.all():
+            bad_columns = [
+                column for index, column in enumerate(feature_columns)
+                if not finite[:, index].all()
+            ]
+            raise ValueError(
+                "create_features() produced non-finite values in "
+                f"{bad_columns}. Refusing to pass invalid features downstream."
+            )
 
     return result
 

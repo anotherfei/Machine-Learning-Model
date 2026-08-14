@@ -134,6 +134,40 @@ def row_machine_id(row, dbcols=None) -> str:
     return value or DEFAULT_MACHINE_ID
 
 
+def canonical_sensor_reading(row, dbcols=None) -> dict:
+    """Map one PostgreSQL source row into config.py's canonical units.
+
+    PostgreSQL remains an immutable source of truth.  Unit conversion belongs
+    here so training, realtime inference, backfill, retraining, and the API
+    cannot accidentally interpret the same source column differently.
+    Missing values are preserved for preprocessing/state validation to handle.
+    """
+    dbcols = dbcols or get_db_columns()
+    reading = {}
+    for config_name, db_name in dbcols["by_config_name"].items():
+        value = row[db_name]
+        reading[config_name] = (
+            None if value is None
+            else float(value) * float(config.POSTGRES_SENSOR_SCALES.get(config_name, 1.0))
+        )
+    return reading
+
+
+def canonical_sensor_frame(rows, dbcols=None):
+    """Return PostgreSQL rows as a canonical timestamp + sensor DataFrame."""
+    import pandas as pd
+
+    dbcols = dbcols or get_db_columns()
+    records = [
+        {
+            config.COL_TIMESTAMP: row[dbcols["timestamp"]],
+            **canonical_sensor_reading(row, dbcols),
+        }
+        for row in rows
+    ]
+    return pd.DataFrame(records, columns=[config.COL_TIMESTAMP, *config.RAW_SENSOR_COLS])
+
+
 def fetch_machine_ids(conn, table: str, limit: int = 1000) -> list[str]:
     """Discover asset IDs from the sensor source table.
 
@@ -148,7 +182,10 @@ def fetch_machine_ids(conn, table: str, limit: int = 1000) -> list[str]:
     query = sql.SQL(
         "SELECT DISTINCT {machine} FROM {table} WHERE {machine} IS NOT NULL "
         "ORDER BY {machine} LIMIT %s"
-    ).format(machine=sql.Identifier(machine_column), table=sql.Identifier(table))
+    ).format(
+        machine=sql.Identifier(machine_column),
+        table=sql.Identifier(table),
+    )
     with conn.cursor() as cur:
         cur.execute(query, (max(1, min(limit, 10000)),))
         return [str(row[0]).strip() for row in cur.fetchall() if str(row[0]).strip()]
@@ -210,7 +247,10 @@ def fetch_new_rows(conn, table: str, since=None, limit: int = 5000):
 
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         if since is None:
-            order = sql.SQL("{ts}, {machine}").format(ts=ts_ident, machine=sql.Identifier(dbcols["machine_id"])) if dbcols["machine_id"] else ts_ident
+            order = sql.SQL("{ts}, {machine}").format(
+                ts=ts_ident,
+                machine=sql.Identifier(dbcols["machine_id"]),
+            ) if dbcols["machine_id"] else ts_ident
             query = sql.SQL("SELECT {cols} FROM {table} ORDER BY {order} ASC LIMIT %s").format(
                 cols=col_ident, table=table_ident, order=order
             )
@@ -233,7 +273,7 @@ def fetch_new_rows(conn, table: str, since=None, limit: int = 5000):
         return cur.fetchall()
 
 
-def fetch_rows_between(conn, table: str, start, end, limit: int = 200000, machine_id: str | None = None):
+def fetch_rows_between(conn, table: str, start, end, limit: int | None = None, machine_id: str | None = None):
     """
     Returns rows with start <= timestamp < end, ordered ascending, as a
     list of dicts keyed by the Postgres column names from
@@ -249,10 +289,10 @@ def fetch_rows_between(conn, table: str, start, end, limit: int = 200000, machin
     the range itself is what makes a live-sourced training run
     reproducible, the same way a static CSV file's fixed content used to.
 
-    limit is high (200k, vs fetch_new_rows()'s 5k poll-sized default)
-    because this is meant to read an entire commissioning window in one
-    call, not incrementally page through it — a multi-day window at
-    1 row/minute is still well under this.
+    The default is intentionally uncapped. A previous 200,000-row default
+    silently truncated dense commissioning windows; several machines could
+    then train on different incomplete time spans. Callers may still provide
+    an explicit positive limit for diagnostic use.
     """
     dbcols = get_db_columns()
     cols = [dbcols["timestamp"]] + ([dbcols["machine_id"]] if dbcols["machine_id"] else []) + dbcols["sensor_cols"]
@@ -263,20 +303,64 @@ def fetch_rows_between(conn, table: str, start, end, limit: int = 200000, machin
     machine_column = dbcols["machine_id"]
     if machine_id and machine_column:
         query = sql.SQL(
-            "SELECT {cols} FROM {table} WHERE {ts} >= %s AND {ts} < %s AND {machine} = %s ORDER BY {ts} ASC LIMIT %s"
-        ).format(cols=col_ident, table=table_ident, ts=ts_ident, machine=sql.Identifier(machine_column))
-        args = (start, end, machine_id, limit)
+            "SELECT {cols} FROM {table} WHERE {ts} >= %s AND {ts} < %s "
+            "AND {machine} = %s ORDER BY {ts} ASC"
+        ).format(
+            cols=col_ident, table=table_ident, ts=ts_ident,
+            machine=sql.Identifier(machine_column),
+        )
+        args = [start, end, machine_id]
     elif machine_id and machine_id != DEFAULT_MACHINE_ID:
         return []
     else:
         query = sql.SQL(
-            "SELECT {cols} FROM {table} WHERE {ts} >= %s AND {ts} < %s ORDER BY {ts} ASC LIMIT %s"
+            "SELECT {cols} FROM {table} WHERE {ts} >= %s AND {ts} < %s ORDER BY {ts} ASC"
         ).format(cols=col_ident, table=table_ident, ts=ts_ident)
-        args = (start, end, limit)
+        args = [start, end]
+    if limit is not None:
+        if int(limit) < 1:
+            raise ValueError("limit must be positive when provided")
+        query += sql.SQL(" LIMIT %s")
+        args.append(int(limit))
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute(query, args)
+        cur.execute(query, tuple(args))
         return cur.fetchall()
 
+
+def fetch_rows_before(conn, table: str, before, limit: int, machine_id: str | None = None):
+    """Return the exact preceding source rows in chronological order.
+
+    Rolling features need a row-count warm-up, not an elapsed-time estimate:
+    real industrial feeds can be delayed or sparse even when a nominal sample
+    rate is configured.
+    """
+    limit = int(limit)
+    if limit < 1:
+        raise ValueError("limit must be positive")
+    dbcols = get_db_columns()
+    cols = [dbcols["timestamp"]] + ([dbcols["machine_id"]] if dbcols["machine_id"] else []) + dbcols["sensor_cols"]
+    col_ident = sql.SQL(", ").join(sql.Identifier(column) for column in cols)
+    table_ident = sql.Identifier(table)
+    ts_ident = sql.Identifier(dbcols["timestamp"])
+    if machine_id and dbcols["machine_id"]:
+        query = sql.SQL(
+            "SELECT {cols} FROM {table} WHERE {ts}<%s AND {machine}=%s "
+            "ORDER BY {ts} DESC LIMIT %s"
+        ).format(
+            cols=col_ident, table=table_ident, ts=ts_ident,
+            machine=sql.Identifier(dbcols["machine_id"]),
+        )
+        args = (before, machine_id, limit)
+    elif machine_id and machine_id != DEFAULT_MACHINE_ID:
+        return []
+    else:
+        query = sql.SQL(
+            "SELECT {cols} FROM {table} WHERE {ts}<%s ORDER BY {ts} DESC LIMIT %s"
+        ).format(cols=col_ident, table=table_ident, ts=ts_ident)
+        args = (before, limit)
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(query, args)
+        return list(reversed(cur.fetchall()))
 
 def fetch_recent_rows(conn, table: str, rows_per_machine: int = 30):
     """Return a recent warm-up tail for every machine in chronological order.
@@ -316,29 +400,4 @@ def fetch_recent_rows(conn, table: str, rows_per_machine: int = 30):
         cur.execute(query, (rows_per_machine,))
         return cur.fetchall()
 
-
-def fetch_ok_prediction_timestamps(conn, start, end, limit: int = 200000, machine_id: str = DEFAULT_MACHINE_ID):
-    """
-    Returns tick_timestamp values (ascending) from spindle_predictions
-    where maintenance_level='OK', for start <= tick_timestamp < end.
-
-    This is the *threshold-based* alternative to select_spec_normal_rows()
-    (see preprocessing.py): instead of judging "normal" from fixed raw
-    sensor spec bounds (config.SPEC_*), it reads the label the live
-    pipeline already assigned each tick — which itself comes from the
-    runtime-editable maintenance thresholds (MAINTENANCE_HEALTH_INSPECT /
-    FAILURE_HEALTH_THRESHOLD / MAINTENANCE_PROB_*, see runtime_config.py
-    and maintenance.py), not a static config value. Only timestamps come
-    back (not raw_reading) because recalibrate_service still needs the
-    *full* contiguous window from the production sensor table to compute
-    correct rolling features before filtering down to these rows — same
-    reasoning as select_spec_normal_rows()'s docstring: filtering the raw
-    readings first and feature-engineering the resulting gaps afterward
-    would corrupt the rolling window around every skipped row.
-    """
-    query = """SELECT tick_timestamp FROM spindle_predictions
-               WHERE tick_timestamp >= %s AND tick_timestamp < %s AND maintenance_level='OK' AND machine_id=%s
-               ORDER BY tick_timestamp ASC LIMIT %s"""
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute(query, (start, end, machine_id, limit))
-        return [r["tick_timestamp"] for r in cur.fetchall()]
+# End of database helpers.

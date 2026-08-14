@@ -154,7 +154,10 @@ def replay_production(raw: pd.DataFrame) -> pd.DataFrame:
     for row in raw.itertuples(index=False):
         processed_rows += 1
         reading = {col: float(getattr(row, col)) for col in config.RAW_SENSOR_COLS}
-        result = monitor.update(reading)
+        result = monitor.update(
+            reading,
+            timestamp=pd.Timestamp(getattr(row, config.COL_TIMESTAMP)),
+        )
         if result is None:
             continue
 

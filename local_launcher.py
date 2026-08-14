@@ -77,7 +77,7 @@ def main() -> int:
 
     processes: list[tuple[str, subprocess.Popen]] = []
     try:
-        api_module = "api.mock_main:app" if args.mock else "api.main:app"
+        api_module = "Demo.mock_main:app" if args.mock else "api.main:app"
         api_proc = _start("API", [sys.executable, "-m", "uvicorn", api_module, "--host", "127.0.0.1", "--port", str(args.api_port)], ROOT)
         processes.append(api_proc)
         _wait_for_api(args.api_port, api_proc[1])
@@ -88,6 +88,8 @@ def main() -> int:
             npm = _npm_command()
             if npm is None: raise RuntimeError("npm was not found. Install Node.js or run with -NoFrontend.")
             if not (FRONTEND / "node_modules").exists(): raise RuntimeError("frontend/node_modules is missing. Run setup_local.ps1 first.")
+            if not (FRONTEND / "node_modules" / "@phosphor-icons" / "react").exists():
+                raise RuntimeError("Frontend dependencies changed. Run `npm install` inside the frontend directory.")
             env = os.environ.copy(); env["SPINDLE_API_PORT"] = str(args.api_port)
             processes.append(_start("frontend", [npm, "run", "dev"], FRONTEND, env))
 

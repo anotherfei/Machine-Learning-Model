@@ -32,9 +32,10 @@ def recommend(health_percent: float, remaining_days: int, failure_prob_table: di
     remaining_days no longer independently triggers WARN/CRITICAL — only
     failure_prob_table does. remaining_days is a bare point-estimate
     extrapolation (see trend_forecast.remaining_days()) with no
-    uncertainty accounting; failure_prob_table uses the SAME slope
-    estimate plus the fit's residual_std through a proper random-walk
-    model (failure_probability.py), so it's strictly more informative —
+    uncertainty accounting; failure_prob_table uses the same slope
+    estimate plus a diffusion scale estimated from detrended condition
+    innovations and real timestamp gaps in a first-passage model
+    (failure_probability.py), so it is strictly more informative —
     a noisy tick can floor remaining_days at 1 day while
     failure_prob_table correctly stays low because it accounts for that
     same noise as uncertainty. Keeping both as independent triggers meant
@@ -48,10 +49,13 @@ def recommend(health_percent: float, remaining_days: int, failure_prob_table: di
     already the Kalman-smoothed signal), "trend_probability" (needs
     debounce — see MaintenanceDebouncer), or "none" (OK).
     """
-    prob_at_horizon = failure_prob_table.get(config.MAINTENANCE_HORIZON_DAYS)
+    horizon_days = runtime_config.get(
+        "MAINTENANCE_HORIZON_DAYS", config.MAINTENANCE_HORIZON_DAYS
+    )
+    prob_at_horizon = failure_prob_table.get(horizon_days)
     if prob_at_horizon is None:
         # horizon not in the table — use the closest available one
-        closest = min(failure_prob_table, key=lambda h: abs(h - config.MAINTENANCE_HORIZON_DAYS))
+        closest = min(failure_prob_table, key=lambda h: abs(h - horizon_days))
         prob_at_horizon = failure_prob_table[closest]
 
     if health_percent <= runtime_config.get("FAILURE_HEALTH_THRESHOLD", config.FAILURE_HEALTH_THRESHOLD):
@@ -60,13 +64,13 @@ def recommend(health_percent: float, remaining_days: int, failure_prob_table: di
 
     if trend_trusted and prob_at_horizon >= runtime_config.get("MAINTENANCE_PROB_URGENT", config.MAINTENANCE_PROB_URGENT):
         return {"level": "CRITICAL", "reason": (
-            f"Failure probability within {config.MAINTENANCE_HORIZON_DAYS}d is "
+            f"Forecast boundary-crossing risk within {horizon_days}d is "
             f"{prob_at_horizon:.0%} (est. {remaining_days}d remaining at current trend)."
         ), "trigger": "trend_probability"}
 
     if trend_trusted and prob_at_horizon >= runtime_config.get("MAINTENANCE_PROB_PLAN", config.MAINTENANCE_PROB_PLAN):
         return {"level": "WARN", "reason": (
-            f"Failure probability within {config.MAINTENANCE_HORIZON_DAYS}d is "
+            f"Forecast boundary-crossing risk within {horizon_days}d is "
             f"{prob_at_horizon:.0%} (est. {remaining_days}d remaining at current trend) — "
             f"schedule maintenance."
         ), "trigger": "trend_probability"}
@@ -133,8 +137,17 @@ class MaintenanceDebouncer:
             self._candidate_count = 1
 
         escalating = _SEVERITY[level] > _SEVERITY[self._reported_trend_level]
-        required = (config.MAINTENANCE_TREND_DEBOUNCE_TICKS if escalating
-                    else config.MAINTENANCE_TREND_RECOVERY_TICKS)
+        required = (
+            runtime_config.get(
+                "MAINTENANCE_TREND_DEBOUNCE_TICKS",
+                config.MAINTENANCE_TREND_DEBOUNCE_TICKS,
+            )
+            if escalating else
+            runtime_config.get(
+                "MAINTENANCE_TREND_RECOVERY_TICKS",
+                config.MAINTENANCE_TREND_RECOVERY_TICKS,
+            )
+        )
         if self._candidate_count >= required:
             self._reported_trend_level = level
 

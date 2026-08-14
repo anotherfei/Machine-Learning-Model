@@ -50,12 +50,26 @@ PREDICT_DATA_PATH = os.path.join(RAW_DATA_DIR, "spindle_given.csv")
 COL_TIMESTAMP = "timestamp"
 COL_A_RMS = "a_rms_mps2"          # acceleration RMS, m/s^2 — same physical
                                    # quantity the old vibration_mps2 held
-COL_V_RMS = "v_rms_mms"           # velocity RMS, mm/s
+COL_V_RMS = "v_rms_mms"           # canonical velocity RMS, mm/s
 COL_A_PEAK = "a_peak_mps2"        # peak acceleration, m/s^2
 COL_CREST_FACTOR = "crest_factor" # a_peak / a_rms, dimensionless
 COL_TEMPERATURE = "temperature_c"
 
 RAW_SENSOR_COLS = [COL_A_RMS, COL_V_RMS, COL_A_PEAK, COL_CREST_FACTOR, COL_TEMPERATURE]
+
+# PostgreSQL source values are normalized into the canonical units above at
+# one boundary in db.canonical_sensor_reading().  The VVB001 IO-Link process
+# value for v-RMS is transmitted in SI m/s with 0.0001 m/s resolution, while
+# this application deliberately uses the more conventional display/threshold
+# unit mm/s.  Do not apply these scales to the offline CSV path: CSV fixtures
+# already use the canonical config.py column units.
+POSTGRES_SENSOR_SCALES = {
+    COL_A_RMS: 1.0,
+    COL_V_RMS: 1000.0,  # m/s -> mm/s
+    COL_A_PEAK: 1.0,
+    COL_CREST_FACTOR: 1.0,
+    COL_TEMPERATURE: 1.0,
+}
 
 # ---------------------------------------------------------------------------
 # Spec-based "normal operation" bounds (alternative to a time-window-based
@@ -77,8 +91,11 @@ RAW_SENSOR_COLS = [COL_A_RMS, COL_V_RMS, COL_A_PEAK, COL_CREST_FACTOR, COL_TEMPE
 # this column" rather than silently guessing one. Fill these in once
 # you've determined the right operating range for this spindle; until
 # then the reference-window approach (see below) doesn't depend on them.
-SPEC_A_RMS_MAX = 3.0
-SPEC_TEMPERATURE_MAX = 50.0
+
+# SPEC_A_RMS_MAX = 3.0
+# SPEC_TEMPERATURE_MAX = 50.0
+SPEC_A_RMS_MAX = None
+SPEC_TEMPERATURE_MAX = None
 SPEC_V_RMS_MAX = None
 SPEC_A_PEAK_MAX = None
 SPEC_CREST_FACTOR_MAX = None
@@ -101,11 +118,22 @@ WINDOW_SIZE = 10          # rolling window, in rows (1 row = 1 minute in this da
 SAMPLING_RATE_HZ = 1 / 60
 MIN_PERIODS = WINDOW_SIZE
 
+# Every engineered feature is centered/scaled against that machine's own
+# confirmed-healthy commissioning baseline before it enters the shared model.
+# Extreme relative deviations are clipped only to bound numeric leverage.
+MACHINE_NORMALIZATION_METHOD = "per_machine_median_iqr_v1"
+MACHINE_NORMALIZATION_CLIP = 20.0
+CONDITION_SCORE_MIN_SPREAD = 0.005
+
 FEATURE_CONFIG = {
     "window_size": WINDOW_SIZE,
     "min_periods": MIN_PERIODS,
     "sampling_rate_hz": SAMPLING_RATE_HZ,
     "sensor_cols": RAW_SENSOR_COLS,
+    "postgres_sensor_scales": POSTGRES_SENSOR_SCALES,
+    "machine_normalization_method": MACHINE_NORMALIZATION_METHOD,
+    "machine_normalization_clip": MACHINE_NORMALIZATION_CLIP,
+    "condition_score_min_spread": CONDITION_SCORE_MIN_SPREAD,
 }
 
 # ---------------------------------------------------------------------------
@@ -173,11 +201,17 @@ ISOLATION_FOREST_PARAMS = {
 # ---------------------------------------------------------------------------
 # Anomaly score -> health percentage mapping
 # ---------------------------------------------------------------------------
-# health = 100 when score is at or above the reference window's mean
-# (as normal as the baseline), degrading linearly to 0 at
-# HEALTH_SENSITIVITY_STD standard deviations below the baseline mean.
-# Tune this if health hits 0% too early/late relative to visible wear.
+# condition score = 100 when the anomaly score is at or above the healthy
+# reference median, degrading linearly to 0 at HEALTH_SENSITIVITY_STD robust
+# spreads below it. This is a relative condition index, not physical remaining
+# life. The minimum spread prevents a nearly constant commissioning score from
+# turning harmless floating-point noise into a severe condition change. Tune
+# either value only against reviewed faults/maintenance outcomes.
 HEALTH_SENSITIVITY_STD = 4.0
+
+# How often the production worker checks PostgreSQL for newly ingested rows.
+# This is independent of the sensor's own sample cadence.
+WORKER_POLL_SECONDS = 60
 
 # ---------------------------------------------------------------------------
 # Kalman filter — denoises the raw health-percentage signal into a
@@ -272,32 +306,32 @@ REMAINING_DAYS_CAP = 90
 # ---------------------------------------------------------------------------
 # Failure probability
 # ---------------------------------------------------------------------------
-# Degradation modeled as a random walk with drift (standard assumption in
-# RUL literature): forecast uncertainty grows with sqrt(horizon), using
-# the trend fit's residual std as the per-step noise estimate.
+# Degradation is modeled as Brownian motion with drift. The first-passage
+# calculation estimates the chance of crossing the critical condition boundary
+# at any point within the horizon. Diffusion is estimated from detrended
+# consecutive condition innovations using their real timestamp intervals; the
+# regression residual level is deliberately not reused as per-step noise.
 #
-# Horizons restricted to <=1 day. validate.py's calibration check measured
-# actual Brier scores against health_status: 0.5d=0.164, 1d=0.215 (both
-# beat the uninformative baseline of 0.25) but 2d=0.311, 3d=0.325 (WORSE
-# than guessing 50/50 — not just unproven, actively misleading). An
-# earlier version of this list went out to 35 days, copied from an
-# illustrative example without checking it against this dataset's own
-# ~6.9-day span or measured calibration — don't extend this list past 1
-# day without rerunning validate.py and confirming the Brier score still
-# beats 0.25 at whatever horizon you add.
+# Horizons remain conservatively restricted to <=1 day. The current
+# first-passage forecast replaced an older terminal-state calculation, so
+# historical calibration claims from that old formulation do not transfer.
+# Do not extend the horizon or interpret these values as empirical failure
+# frequencies until they are validated against timestamped maintenance/failure
+# outcomes from the real fleet.
 FAILURE_PROB_HORIZONS_DAYS = [0.25, 0.5, 0.75, 1]
 
 # ---------------------------------------------------------------------------
 # Maintenance recommendation rules
 # ---------------------------------------------------------------------------
-MAINTENANCE_HORIZON_DAYS = 1          # "how soon" horizon the rules check against — kept within the <=1 day range validated above
-MAINTENANCE_PROB_URGENT = 0.80       # failure probability within horizon -> urgent
+MAINTENANCE_HORIZON_DAYS = 1          # "how soon" horizon the rules check against — kept within the conservative <=1 day range above
+MAINTENANCE_PROB_URGENT = 0.80       # model-estimated boundary-crossing risk -> urgent
 MAINTENANCE_PROB_PLAN = 0.60         # -> plan maintenance
 # MAINTENANCE_REMAINING_DAYS_URGENT removed as an independent CRITICAL
 # trigger (see maintenance.py) — remaining_days is a bare point-estimate
 # extrapolation with no uncertainty accounting, while MAINTENANCE_PROB_URGENT
-# uses the same slope estimate PLUS residual_std through a proper
-# random-walk model (failure_probability.py). Confirmed directly: on
+# uses the same slope estimate plus diffusion estimated from detrended
+# condition innovations in a first-passage model (failure_probability.py).
+# Confirmed directly for the earlier point-estimate trigger design: on
 # data/raw/spindle_train.csv (43,176 rows, 100% health_status=='normal' —
 # should never report CRITICAL), the two-trigger version fired CRITICAL on
 # 13,880 rows (~32%) — a noisy per-tick slope estimate could floor
@@ -308,6 +342,26 @@ MAINTENANCE_PROB_PLAN = 0.60         # -> plan maintenance
 
 MAINTENANCE_HEALTH_INSPECT = 30      # health % below this -> inspect regardless
 FAILURE_HEALTH_THRESHOLD = 20  # health % at which the asset is considered failed
+
+# ---------------------------------------------------------------------------
+# Automatic operating-state gate (no PLC/run-status signal required)
+# ---------------------------------------------------------------------------
+# The worker learns stationary/running vibration regimes independently for
+# each machine. It only enables STOPPED suppression when the two regimes are
+# clearly separated; otherwise state stays UNKNOWN and ML remains active.
+OPERATING_STATE_HISTORY_ROWS = 1440
+OPERATING_STATE_MIN_HISTORY_ROWS = 120
+OPERATING_STATE_MIN_CLUSTER_ROWS = 10
+OPERATING_STATE_MIN_CLUSTER_FRACTION = 0.005
+OPERATING_STATE_MIN_LOG_SEPARATION = 0.45
+OPERATING_STATE_MIN_SEPARATION_QUALITY = 2.5
+OPERATING_STATE_REFIT_TICKS = 5
+OPERATING_STATE_STOP_CONFIRM_TICKS = 5
+OPERATING_STATE_START_CONFIRM_TICKS = 3
+# Restart warm-up is derived at runtime from WINDOW_SIZE plus the editable
+# KALMAN_INIT_SAMPLES value so the state gate and condition monitor agree.
+# The API reports NO_DATA when the newest source row is older than this.
+SOURCE_STALE_SECONDS = 3 * 60
 
 # Hysteresis on the trend/failure-probability trigger only — NOT on
 # health_percent-based triggers (FAILURE_HEALTH_THRESHOLD,

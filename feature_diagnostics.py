@@ -29,40 +29,35 @@ human decision (e.g. whether to prune a redundant feature or accept the
 imbalance), not something the pipeline acts on automatically.
 """
 
-import os
-
 import numpy as np
 import pandas as pd
 
 import config
 import artifact_utils
 import attribution
+import machine_normalization
 
 N_PERMUTATIONS = 20         # repeats per feature, averaged for stability
 CORR_REDUNDANCY_THRESHOLD = 0.95
 RANDOM_STATE = 42
 
 
-def _load_reference_features() -> pd.DataFrame:
-    if not os.path.exists(config.FEATURES_DATA_PATH):
-        raise FileNotFoundError(
-            f"{config.FEATURES_DATA_PATH} not found — run feature_engineering.py "
-            f"(or train_isolation_forest.py) first."
-        )
-    features_df = pd.read_csv(config.FEATURES_DATA_PATH, parse_dates=[config.COL_TIMESTAMP])
-
-    ref_timestamps = artifact_utils.load_reference_timestamps()
-    if ref_timestamps is None:
+def _load_reference_features(feature_cols: list[str]) -> pd.DataFrame:
+    reference_df = artifact_utils.load_reference_features()
+    if reference_df is None or reference_df.empty:
         raise RuntimeError(
-            "No reference_timestamps.json in artifacts/ — retrain with the current "
-            "train_isolation_forest.py so the reference set used to fit the model is "
-            "recorded, then rerun this diagnostic against that same set."
+            "No machine-aware reference_features.csv is bundled. Retrain with the "
+            "current trainer before running model-space diagnostics."
         )
-    is_reference = features_df[config.COL_TIMESTAMP].isin(ref_timestamps)
-    reference_df = features_df[is_reference].reset_index(drop=True)
-    if reference_df.empty:
-        raise RuntimeError("Reference timestamps didn't match any rows in features.csv.")
-    return reference_df
+    normalizers = artifact_utils.load_machine_feature_normalizers()
+    normalized = []
+    for machine_id, frame in reference_df.groupby("machine_id", sort=True):
+        machine_id = str(machine_id)
+        normalizer = machine_normalization.for_machine(normalizers, machine_id)
+        normalized.append(
+            machine_normalization.transform(frame, feature_cols, normalizer, machine_id)
+        )
+    return pd.concat(normalized, ignore_index=True)
 
 
 def permutation_importance(scorer, X: pd.DataFrame, feature_cols: list) -> pd.Series:
@@ -109,7 +104,7 @@ def find_redundant_pairs(X: pd.DataFrame, feature_cols: list, threshold: float) 
 def main():
     print("[feature_diagnostics] Loading model and reference set...")
     scorer, feature_cols, metadata = artifact_utils.load_artifacts()
-    reference_df = _load_reference_features()
+    reference_df = _load_reference_features(feature_cols)
     print(f"[feature_diagnostics] {len(reference_df)} reference rows, {len(feature_cols)} features.")
 
     print(f"[feature_diagnostics] Computing permutation importance "

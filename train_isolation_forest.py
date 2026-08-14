@@ -28,7 +28,9 @@ Usage:
 """
 
 import argparse
+import time
 
+import numpy as np
 import pandas as pd
 
 import config
@@ -36,6 +38,8 @@ import db
 import preprocessing
 import feature_engineering
 import artifact_utils
+import operating_state
+import machine_normalization
 from isolation_forest import AnomalyScorer
 
 
@@ -43,11 +47,18 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--full", action="store_true",
-        help="Treat the ENTIRE reference window as normal instead of "
+        help="Treat every confirmed-RUNNING row in the reference window as "
+             "normal instead of "
              "spec-filtering it (preprocessing.select_spec_normal_rows()). "
-             "Only use this when you're sure every row in the window is "
-             "genuinely normal operation — with --full, nothing checks "
-             "that for you; every row is trusted as-is."
+             "Only use this when you're sure the running portions are "
+             "genuinely healthy. STOPPED and STARTING rows remain excluded "
+             "unless --include-non-running is also supplied."
+    )
+    parser.add_argument(
+        "--include-non-running", action="store_true",
+        help="Explicit unsafe override that disables the sensor-derived "
+             "RUNNING gate for live training. Use only when the selected "
+             "window is independently confirmed to contain running data only."
     )
     parser.add_argument(
         "--source", choices=["live", "csv"], default=None,
@@ -82,6 +93,12 @@ def parse_args():
         help="Optional upper bound on healthy feature rows sampled from each "
              "machine. All machines still contribute exactly the same number."
     )
+    parser.add_argument(
+        "--preview-reference", action="store_true",
+        help="Load, normalize, feature-engineer, operating-state filter, and "
+             "balance the live reference selection, then stop before fitting "
+             "or writing model artifacts."
+    )
     return parser.parse_args()
 
 
@@ -96,7 +113,9 @@ def _fit_and_save(
     reference_rows=None,
     machine_reference_frames=None,
     machine_health_frames=None,
+    machine_feature_normalizers=None,
     reference_features=None,
+    validation_features=None,
     metadata_extra=None,
 ):
     scorer = AnomalyScorer()
@@ -108,7 +127,7 @@ def _fit_and_save(
     # rather than sitting flat at 100 or crashing to 0 everywhere.
     scores = scorer.score(health_check_df[feature_cols])
     health = scorer.health_from_score(scores)
-    print(f"[train] Health over {health_check_label} — "
+    print(f"[train] Condition score over {health_check_label} — "
           f"min: {health.min():.1f}, max: {health.max():.1f}, "
           f"mean: {health.mean():.1f}")
 
@@ -127,7 +146,7 @@ def _fit_and_save(
             machine_health = (machine_health_frames or {}).get(machine_id, machine_reference)
             local_scores = local_scorer.score(machine_health[feature_cols])
             local_health = local_scorer.health_from_score(local_scores)
-            print(f"[train] Machine {machine_id!r} local calibration health — "
+            print(f"[train] Machine {machine_id!r} automatic condition anchor — "
                   f"min: {local_health.min():.1f}, max: {local_health.max():.1f}, "
                   f"mean: {local_health.mean():.1f}")
 
@@ -137,7 +156,9 @@ def _fit_and_save(
         reference_timestamps=reference_df[config.COL_TIMESTAMP],
         reference_rows=reference_rows,
         reference_features=reference_features,
+        validation_features=validation_features,
         machine_calibrations=machine_calibrations,
+        machine_feature_normalizers=machine_feature_normalizers,
         metadata_extra=metadata_extra,
     )
 
@@ -165,6 +186,18 @@ def _resolve_live_window(args):
 
 
 def _load_live_raw(start, end, machine_id):
+    print(
+        f"[train] Querying PostgreSQL for machine {machine_id!r} between "
+        f"{start} and {end}...",
+        flush=True,
+    )
+    print(
+        "[train] If this query remains here for more than about a minute, "
+        "cancel with Ctrl+C and install the composite source index documented "
+        "in database/create_training_source_index.sql.",
+        flush=True,
+    )
+    query_started = time.perf_counter()
     conn = db.get_connection()
     try:
         table = db.get_table_name()
@@ -183,13 +216,11 @@ def _load_live_raw(start, end, machine_id):
         )
 
     dbcols = db.get_db_columns()
-    rename = {dbcols["timestamp"]: config.COL_TIMESTAMP}
-    rename.update({db_name: cfg_name for cfg_name, db_name in dbcols["by_config_name"].items()})
-
-    raw_df = pd.DataFrame(rows).rename(columns=rename)
+    raw_df = db.canonical_sensor_frame(rows, dbcols)
     raw_df = preprocessing.clean_data(raw_df)
     print(f"[train] Pulled {len(raw_df)} live rows for machine {machine_id!r} from {table!r} "
-          f"between {start} and {end} (after cleaning).")
+          f"between {start} and {end} in {time.perf_counter()-query_started:.1f}s "
+          "(after cleaning).")
     return raw_df
 
 
@@ -215,25 +246,69 @@ def _resolve_live_machine_ids(args):
     return machine_ids
 
 
-def _select_live_reference(raw_df, featured_df, use_full, machine_id):
+def _running_feature_rows(raw_df, featured_df, machine_id, include_non_running=False):
+    """Select model-applicable rows without breaking contiguous windows."""
+    if include_non_running:
+        print(f"[train] Machine {machine_id!r}: --include-non-running keeps all "
+              f"{len(featured_df)} complete feature rows.")
+        return featured_df.reset_index(drop=True)
+
+    detector = operating_state.OperatingStateDetector(history_rows=len(raw_df))
+    readings = raw_df[config.RAW_SENSOR_COLS].to_dict("records")
+    for reading in readings:
+        detector.observe_history(reading)
+    if not detector.fit_history():
+        raise ValueError(
+            f"Machine {machine_id!r} has no clearly separable stationary and "
+            "rotating regimes in the selected window. Choose a window containing "
+            "both regimes, or use --include-non-running only if the whole window "
+            "is independently confirmed to contain running data."
+        )
+
+    running_timestamps = []
+    state_counts = {state: 0 for state in operating_state.VALID_STATES}
+    for timestamp, reading in zip(raw_df[config.COL_TIMESTAMP], readings):
+        state = detector.update(reading)
+        state_counts[state.state] = state_counts.get(state.state, 0) + 1
+        if state.state == "RUNNING" and not state.low_motion:
+            running_timestamps.append(timestamp)
+
+    selected = featured_df[
+        featured_df[config.COL_TIMESTAMP].isin(running_timestamps)
+    ].reset_index(drop=True)
+    print(
+        f"[train] Machine {machine_id!r}: operating-state filter kept "
+        f"{len(selected)}/{len(featured_df)} feature rows; states={state_counts}; "
+        f"activity thresholds stop={detector.stop_threshold:.6g}, "
+        f"run={detector.run_threshold:.6g}."
+    )
+    if selected.empty:
+        raise ValueError(
+            f"Machine {machine_id!r} produced no confirmed-RUNNING feature rows."
+        )
+    return selected
+
+
+def _select_live_reference(raw_df, applicable_df, use_full, machine_id):
     if use_full:
-        reference_df = featured_df.reset_index(drop=True)
+        reference_df = applicable_df.reset_index(drop=True)
         print(f"[train] Machine {machine_id!r}: --full uses all "
-              f"{len(reference_df)} feature rows (spec filter skipped).")
+              f"{len(reference_df)} confirmed-applicable feature rows "
+              "(spec filter skipped).")
     else:
         # Filter raw rows first, but compute rolling features on the complete
         # per-machine trajectory so gaps never corrupt a rolling window.
         normal_raw = preprocessing.select_spec_normal_rows(raw_df)
-        is_reference = featured_df[config.COL_TIMESTAMP].isin(normal_raw[config.COL_TIMESTAMP])
-        reference_df = featured_df[is_reference].reset_index(drop=True)
-        print(f"[train] Machine {machine_id!r}: {len(reference_df)}/{len(featured_df)} "
-              f"feature rows pass the spec filter.")
+        is_reference = applicable_df[config.COL_TIMESTAMP].isin(normal_raw[config.COL_TIMESTAMP])
+        reference_df = applicable_df[is_reference].reset_index(drop=True)
+        print(f"[train] Machine {machine_id!r}: {len(reference_df)}/{len(applicable_df)} "
+              f"applicable feature rows pass the spec filter.")
 
     if reference_df.empty:
         raise ValueError(
             f"Machine {machine_id!r} has no usable healthy feature rows in the "
             "selected commissioning window. Widen the window, verify the spec "
-            "bounds, or use --full only if the entire window is confirmed healthy."
+            "bounds, or use --full only if every selected running row is confirmed healthy."
         )
     return reference_df
 
@@ -248,17 +323,50 @@ def _balanced_reference_pool(machine_reference_frames, max_rows_per_machine=None
 
     balanced = {}
     for machine_id, frame in machine_reference_frames.items():
+        ordered = frame.sort_values(config.COL_TIMESTAMP).reset_index(drop=True)
         if len(frame) > rows_per_machine:
-            selected = frame.sample(n=rows_per_machine, random_state=42)
+            holdout_rows = min(
+                rows_per_machine,
+                max(
+                    artifact_utils.VALIDATION_HOLDOUT_MIN_ROWS,
+                    int(np.ceil(rows_per_machine * artifact_utils.VALIDATION_HOLDOUT_FRACTION)),
+                ),
+            )
+            newest = ordered.tail(holdout_rows)
+            fit_rows = rows_per_machine - holdout_rows
+            fit_pool = ordered.iloc[:-holdout_rows]
+            sampled_fit = fit_pool.sample(n=fit_rows, random_state=42)
+            selected = pd.concat([sampled_fit, newest], ignore_index=True)
             selected = selected.sort_values(config.COL_TIMESTAMP).reset_index(drop=True)
         else:
-            selected = frame.reset_index(drop=True)
+            selected = ordered
         balanced[machine_id] = selected
 
-    print(f"[train] Balanced pool: {rows_per_machine} healthy feature rows per "
-          f"machine, {rows_per_machine * len(balanced)} total. Available before "
-          f"balancing: {counts}.")
+    print(f"[train] Balanced pool before validation holdout: {rows_per_machine} "
+          f"healthy feature rows per machine, {rows_per_machine * len(balanced)} "
+          f"total. Available before balancing: {counts}.")
     return balanced, counts, rows_per_machine
+
+
+def _split_validation_holdout(balanced_frames, feature_cols):
+    """Create equal, forward-looking per-machine commissioning holdouts."""
+    fraction = artifact_utils.VALIDATION_HOLDOUT_FRACTION
+    minimum_holdout = artifact_utils.VALIDATION_HOLDOUT_MIN_ROWS
+    minimum_fit = max(20, len(feature_cols) + 1)
+    training_frames = {}
+    validation_frames = {}
+    for machine_id, frame in balanced_frames.items():
+        ordered = frame.sort_values(config.COL_TIMESTAMP).reset_index(drop=True)
+        holdout_rows = max(minimum_holdout, int(np.ceil(len(ordered) * fraction)))
+        if len(ordered) < holdout_rows + minimum_fit:
+            raise ValueError(
+                f"Machine {machine_id!r} needs at least {holdout_rows + minimum_fit} "
+                f"balanced healthy feature rows to keep {holdout_rows} for validation "
+                f"and {minimum_fit} for model fitting; only {len(ordered)} are available."
+            )
+        validation_frames[machine_id] = ordered.tail(holdout_rows).reset_index(drop=True)
+        training_frames[machine_id] = ordered.iloc[:-holdout_rows].reset_index(drop=True)
+    return training_frames, validation_frames
 
 
 def _train_from_live(args):
@@ -285,25 +393,60 @@ def _train_from_live(args):
         elif current_feature_cols != feature_cols:
             raise ValueError(f"Feature columns differ for machine {machine_id!r}.")
 
-        machine_health_frames[machine_id] = featured_df
+        applicable_df = _running_feature_rows(
+            raw_df,
+            featured_df,
+            machine_id,
+            include_non_running=args.include_non_running,
+        )
+        machine_health_frames[machine_id] = applicable_df
         machine_reference_frames[machine_id] = _select_live_reference(
-            raw_df, featured_df, args.full, machine_id
+            raw_df, applicable_df, args.full, machine_id
         )
 
     balanced_frames, available_counts, rows_per_machine = _balanced_reference_pool(
         machine_reference_frames, args.max_rows_per_machine
     )
-    reference_df = pd.concat(balanced_frames.values(), ignore_index=True)
-    health_check_df = pd.concat(machine_health_frames.values(), ignore_index=True)
+    training_frames, validation_frames = _split_validation_holdout(
+        balanced_frames, feature_cols
+    )
+    machine_feature_normalizers = machine_normalization.fit_normalizers(
+        training_frames, feature_cols
+    )
+    normalized_training_frames = {
+        machine_id: machine_normalization.transform(
+            frame, feature_cols, machine_feature_normalizers[machine_id], machine_id
+        )
+        for machine_id, frame in training_frames.items()
+    }
+    normalized_health_frames = {
+        machine_id: machine_normalization.transform(
+            frame, feature_cols, machine_feature_normalizers[machine_id], machine_id
+        )
+        for machine_id, frame in machine_health_frames.items()
+    }
+    reference_df = pd.concat(normalized_training_frames.values(), ignore_index=True)
+    health_check_df = pd.concat(normalized_health_frames.values(), ignore_index=True)
     reference_rows = [
         {"machine_id": machine_id, "timestamp": timestamp}
-        for machine_id, frame in balanced_frames.items()
+        for machine_id, frame in training_frames.items()
         for timestamp in frame[config.COL_TIMESTAMP]
     ]
     reference_features = pd.concat(
-        [frame.assign(machine_id=machine_id) for machine_id, frame in balanced_frames.items()],
+        [frame.assign(machine_id=machine_id) for machine_id, frame in training_frames.items()],
         ignore_index=True,
     )[["machine_id", config.COL_TIMESTAMP, *feature_cols]]
+    validation_features = pd.concat(
+        [frame.assign(machine_id=machine_id) for machine_id, frame in validation_frames.items()],
+        ignore_index=True,
+    )[["machine_id", config.COL_TIMESTAMP, *feature_cols]]
+
+    if args.preview_reference:
+        print(
+            "[train] Reference preview complete; no model was fitted and no "
+            "artifacts were written."
+        )
+        return
 
     _fit_and_save(
         reference_df,
@@ -312,16 +455,32 @@ def _train_from_live(args):
         health_check_label="all selected commissioning windows",
         reference_rows=reference_rows,
         reference_features=reference_features,
-        machine_reference_frames=machine_reference_frames,
-        machine_health_frames=machine_health_frames,
+        validation_features=validation_features,
+        machine_reference_frames=normalized_training_frames,
+        machine_health_frames=normalized_health_frames,
+        machine_feature_normalizers=machine_feature_normalizers,
         metadata_extra={
             "training_mode": "balanced_pooled" if len(machine_ids) > 1 else "single_machine",
             "training_machine_ids": machine_ids,
             "available_reference_rows_per_machine": available_counts,
-            "model_fit_rows_per_machine": rows_per_machine,
+            "balanced_rows_per_machine_before_holdout": rows_per_machine,
+            "model_fit_rows_per_machine": {
+                machine_id: len(frame) for machine_id, frame in training_frames.items()
+            },
+            "validation_rows_per_machine": {
+                machine_id: len(frame) for machine_id, frame in validation_frames.items()
+            },
+            "validation_holdout_fraction": artifact_utils.VALIDATION_HOLDOUT_FRACTION,
+            "validation_holdout_lineage": "commissioning_forward_holdout",
             "balance_method": "equal_rows_deterministic_sample",
+            "model_feature_space": machine_normalization.METHOD,
             "reference_window_start": start.isoformat(),
             "reference_window_end": end.isoformat(),
+            "postgres_sensor_scales": config.POSTGRES_SENSOR_SCALES,
+            "operating_state_filter": (
+                "disabled_explicitly" if args.include_non_running
+                else "confirmed_running_per_machine"
+            ),
         },
     )
 
@@ -365,10 +524,52 @@ def _train_from_csv(args):
         print(f"[train] Spec-based reference set: {len(reference_df)} rows, "
               f"rest of trajectory: {len(rest_df)} rows.")
 
+    machine_id = db.DEFAULT_MACHINE_ID
+    training_frames, validation_frames = _split_validation_holdout(
+        {machine_id: reference_df}, feature_cols
+    )
+    training_reference = training_frames[machine_id]
+    validation_reference = validation_frames[machine_id]
+    machine_feature_normalizers = machine_normalization.fit_normalizers(
+        training_frames, feature_cols
+    )
+    normalizer = machine_feature_normalizers[machine_id]
+    normalized_reference = machine_normalization.transform(
+        training_reference, feature_cols, normalizer, machine_id
+    )
+    normalized_full = machine_normalization.transform(
+        df, feature_cols, normalizer, machine_id
+    )
+    reference_features = training_reference.assign(machine_id=machine_id)[
+        ["machine_id", config.COL_TIMESTAMP, *feature_cols]
+    ]
+    validation_features = validation_reference.assign(machine_id=machine_id)[
+        ["machine_id", config.COL_TIMESTAMP, *feature_cols]
+    ]
+    reference_rows = [
+        {"machine_id": machine_id, "timestamp": timestamp}
+        for timestamp in training_reference[config.COL_TIMESTAMP]
+    ]
+
     _fit_and_save(
-        reference_df, feature_cols,
-        health_check_df=df,
+        normalized_reference, feature_cols,
+        health_check_df=normalized_full,
         health_check_label="full trajectory",
+        reference_rows=reference_rows,
+        reference_features=reference_features,
+        validation_features=validation_features,
+        machine_reference_frames={machine_id: normalized_reference},
+        machine_health_frames={machine_id: normalized_full},
+        machine_feature_normalizers=machine_feature_normalizers,
+        metadata_extra={
+            "training_mode": "single_machine_csv",
+            "training_machine_ids": [machine_id],
+            "model_feature_space": machine_normalization.METHOD,
+            "model_fit_rows_per_machine": {machine_id: len(training_reference)},
+            "validation_rows_per_machine": {machine_id: len(validation_reference)},
+            "validation_holdout_fraction": artifact_utils.VALIDATION_HOLDOUT_FRACTION,
+            "validation_holdout_lineage": "commissioning_forward_holdout",
+        },
     )
 
 
@@ -377,6 +578,11 @@ def main():
     source = args.source or config.REFERENCE_SOURCE
     print(f"[train] REFERENCE_SOURCE = {source!r}"
           f"{' (overridden via --source)' if args.source else ' (from config.py)'}")
+
+    if source != "live" and (args.include_non_running or args.preview_reference):
+        raise ValueError(
+            "--include-non-running and --preview-reference are live-source options."
+        )
 
     if source == "live":
         _train_from_live(args)

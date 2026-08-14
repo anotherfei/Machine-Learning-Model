@@ -8,13 +8,14 @@ Linear degradation is the simplest reasonable default (this matches how
 the article's walkthrough frames it) and is what config.py documents as
 the assumption in use. If a given asset's real degradation is closer to
 exponential/accelerating wear, swap fit_trend()'s model — the rest of the
-pipeline (failure_probability.py, maintenance.py) only depends on
-(slope, intercept, residual_std), not on linear regression specifically.
+pipeline (failure_probability.py, maintenance.py) depends on the fitted
+slope/intercept plus a condition-diffusion estimate derived here.
 """
 
 import numpy as np
 
 import config
+import runtime_config
 
 
 def fit_trend(minutes_since_start: np.ndarray, health_values: np.ndarray):
@@ -23,7 +24,8 @@ def fit_trend(minutes_since_start: np.ndarray, health_values: np.ndarray):
     Returns (slope_per_minute, intercept, residual_std) or None if there
     aren't enough points yet (see config.TREND_MIN_POINTS).
     """
-    if len(minutes_since_start) < config.TREND_MIN_POINTS:
+    minimum_points = runtime_config.get("TREND_MIN_POINTS", config.TREND_MIN_POINTS)
+    if len(minutes_since_start) < minimum_points:
         return None
 
     slope, intercept = np.polyfit(minutes_since_start, health_values, 1)
@@ -68,7 +70,10 @@ def slope_is_significant(minutes_since_start: np.ndarray, slope: float, residual
     treat "not trusted" as the safe default via maintenance.recommend()'s
     trend_trusted parameter.
     """
-    z_threshold = config.TREND_SLOPE_Z_THRESHOLD if z_threshold is None else z_threshold
+    z_threshold = (
+        runtime_config.get("TREND_SLOPE_Z_THRESHOLD", config.TREND_SLOPE_Z_THRESHOLD)
+        if z_threshold is None else z_threshold
+    )
     n = len(minutes_since_start)
     if n <= 2:
         return False
@@ -86,6 +91,33 @@ def slope_is_significant(minutes_since_start: np.ndarray, slope: float, residual
     return abs(slope / slope_se) >= z_threshold
 
 
+def estimate_diffusion(minutes_since_start: np.ndarray, health_values: np.ndarray,
+                       slope: float, intercept: float) -> float:
+    """Estimate condition innovation scale in health points / sqrt(minute).
+
+    Regression residual level is not a per-step random-walk noise parameter.
+    Estimate diffusion from consecutive detrended residual innovations and
+    their actual timestamp gaps instead. A robust MAD estimate limits the
+    influence of isolated spikes; RMS is a fallback for quantized series.
+    """
+    times = np.asarray(minutes_since_start, dtype=float)
+    values = np.asarray(health_values, dtype=float)
+    if len(times) < 3 or len(times) != len(values):
+        return 1e-6
+    residuals = values - (float(slope) * times + float(intercept))
+    intervals = np.diff(times)
+    innovations = np.diff(residuals)
+    valid = np.isfinite(intervals) & np.isfinite(innovations) & (intervals > 0)
+    if not valid.any():
+        return 1e-6
+    standardized = innovations[valid] / np.sqrt(intervals[valid])
+    center = float(np.median(standardized))
+    robust = float(np.median(np.abs(standardized - center)) * 1.4826)
+    rms = float(np.sqrt(np.mean(np.square(standardized))))
+    estimate = robust if np.isfinite(robust) and robust > 1e-12 else rms
+    return max(float(estimate) if np.isfinite(estimate) else 0.0, 1e-6)
+
+
 def remaining_days(current_minute: float, current_health: float, slope_per_minute: float) -> int:
     """
     At the current (linear) rate of change, how many days until health
@@ -93,9 +125,12 @@ def remaining_days(current_minute: float, current_health: float, slope_per_minut
     earlier sensor-trend version: a flat or improving trend reports the
     cap, not infinity.
     """
-    if slope_per_minute >= -1e-6 or current_health <= config.FAILURE_HEALTH_THRESHOLD:
-        return 0 if current_health <= config.FAILURE_HEALTH_THRESHOLD else config.REMAINING_DAYS_CAP
+    failure_threshold = runtime_config.get(
+        "FAILURE_HEALTH_THRESHOLD", config.FAILURE_HEALTH_THRESHOLD
+    )
+    if slope_per_minute >= -1e-6 or current_health <= failure_threshold:
+        return 0 if current_health <= failure_threshold else config.REMAINING_DAYS_CAP
 
-    minutes_to_threshold = (config.FAILURE_HEALTH_THRESHOLD - current_health) / slope_per_minute
+    minutes_to_threshold = (failure_threshold - current_health) / slope_per_minute
     days = minutes_to_threshold / (24 * 60)
     return int(np.clip(days, 1, config.REMAINING_DAYS_CAP))
