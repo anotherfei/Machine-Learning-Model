@@ -1,7 +1,8 @@
-data/processed/*.csv
-
 .env
 .venv
 __pycache__
+frontend/node_modules/
 Demo/mock_demo.db-wal
 Demo/mock_demo.db-shm
+artifacts/*
+!artifacts/.gitkeep

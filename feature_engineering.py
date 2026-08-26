@@ -13,7 +13,6 @@ import itertools
 
 import pandas as pd
 import numpy as np
-from scipy.stats import kurtosis, skew
 
 import config
 
@@ -31,20 +30,6 @@ def _effectively_constant(values) -> bool:
     scale = max(1.0, float(np.max(np.abs(values))))
     tolerance = np.finfo(float).eps * scale * 100
     return float(np.ptp(values)) <= tolerance
-
-
-def _safe_kurtosis(values) -> float:
-    if len(values) <= 3 or _effectively_constant(values):
-        return 0.0
-    value = float(kurtosis(values, bias=False))
-    return value if np.isfinite(value) else 0.0
-
-
-def _safe_skew(values) -> float:
-    if len(values) <= 2 or _effectively_constant(values):
-        return 0.0
-    value = float(skew(values, bias=False))
-    return value if np.isfinite(value) else 0.0
 
 
 def _rolling_stats(series: pd.Series, window: int, min_periods: int, prefix: str) -> pd.DataFrame:
@@ -72,7 +57,7 @@ def _rolling_stats(series: pd.Series, window: int, min_periods: int, prefix: str
         f"{prefix}_std": roll.std(),
         f"{prefix}_max": roll.max(),
         f"{prefix}_min": roll.min(),
-        f"{prefix}_rms": np.sqrt(series.square().rolling(window=window, min_periods=min_periods).mean()),
+        f"{prefix}_rms": np.sqrt(series.pow(2).rolling(window=window, min_periods=min_periods).mean()),
         f"{prefix}_kurtosis": rolling_kurtosis,
         f"{prefix}_skew": rolling_skew,
     })

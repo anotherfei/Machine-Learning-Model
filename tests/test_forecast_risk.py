@@ -36,6 +36,25 @@ class ForecastRiskTests(unittest.TestCase):
         self.assertTrue(np.isfinite(diffusion))
         self.assertGreater(diffusion, 0)
 
+    def test_incremental_trend_matches_array_fit_over_same_elapsed_window(self):
+        window = trend_forecast.RollingTrendWindow(90.0)
+        times = np.cumsum(np.resize(np.array([0.5, 1.0, 2.0, 0.75]), 180))
+        values = 92.0 - 0.015 * times + 0.2 * np.sin(times / 7.0)
+        for minute, health in zip(times, values):
+            window.append(minute, health)
+
+        cutoff = times[-1] - 90.0
+        retained = times >= cutoff
+        expected = trend_forecast.fit_trend(times[retained], values[retained])
+        actual = window.fit()
+        self.assertIsNotNone(expected)
+        self.assertIsNotNone(actual)
+        np.testing.assert_allclose(actual, expected, rtol=1e-9, atol=1e-9)
+        self.assertEqual(
+            window.slope_is_significant(actual[0], actual[2]),
+            trend_forecast.slope_is_significant(times[retained], expected[0], expected[2]),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

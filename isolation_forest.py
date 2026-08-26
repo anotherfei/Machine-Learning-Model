@@ -16,6 +16,7 @@ health_from_score() and config.HEALTH_SENSITIVITY_STD.
 
 import numpy as np
 import pandas as pd
+from joblib import parallel_backend
 from sklearn.ensemble import IsolationForest
 
 import config
@@ -135,6 +136,13 @@ class AnomalyScorer:
         knows to distrust.
         """
         self._require_finite(X, "score")
+        # sklearn intentionally keeps single-row inference lightweight and
+        # does not apply IsolationForest.n_jobs to score_samples(). Historical
+        # replay supplies large batches, where tree-level threading avoids a
+        # long serial forest walk without changing the estimator or inputs.
+        if len(X) >= 1024:
+            with parallel_backend("threading", n_jobs=-1):
+                return self.model.score_samples(X)
         return self.model.score_samples(X)
 
     def feature_z_scores(self, X) -> "pd.Series":

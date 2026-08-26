@@ -8,7 +8,6 @@ import os
 import shutil
 from pathlib import Path
 
-import joblib
 import numpy as np
 import pandas as pd
 
@@ -20,6 +19,7 @@ import machine_normalization
 import model_registry
 import preprocessing
 import runtime_config
+import simulation_jobs
 from isolation_forest import AnomalyScorer
 
 
@@ -104,26 +104,23 @@ def _current_validation_frames(feature_cols: list[str]) -> dict[str, pd.DataFram
 
 
 def _candidate_rows(conn, feature_cols: list[str]) -> list[dict]:
-    months = int(runtime_config.get("REFERENCE_WINDOW_MONTHS", 6))
+    months = int(runtime_config.get("REFERENCE_WINDOW_MONTHS"))
+    active_version = model_registry.active_version()
+    if not active_version:
+        return []
     with conn.cursor() as cur:
         cur.execute(
-            """SELECT rc.id, a.machine_id, rc.tick_timestamp, a.feature_vector
-               FROM reference_candidates rc
-               JOIN alerts a ON a.id=rc.alert_id
-               WHERE rc.added_to_reference_at IS NULL
-                 AND rc.tick_timestamp >= now() - (%s || ' months')::interval
-                 AND a.status='confirmed_normal'
-                  AND a.model_version=(
-                     SELECT version_id FROM model_versions
-                     WHERE status='active' ORDER BY promoted_at DESC NULLS LAST LIMIT 1
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM model_version_candidates mvc
-                      JOIN model_versions staged ON staged.version_id=mvc.version_id
-                      WHERE mvc.candidate_id=rc.id AND staged.status='shadow'
-                  )
-               ORDER BY a.machine_id, rc.tick_timestamp""",
-            (months,),
+            """SELECT prediction.id,prediction.machine_id,prediction.tick_timestamp,
+                      prediction.feature_vector
+               FROM spindle_predictions prediction
+               WHERE prediction.reference_candidate_at IS NOT NULL
+                 AND prediction.added_to_reference_at IS NULL
+                 AND prediction.candidate_model_version IS NULL
+                 AND prediction.tick_timestamp >= now() - (%s || ' months')::interval
+                 AND prediction.alert_status='confirmed_normal'
+                 AND prediction.model_version=%s
+               ORDER BY prediction.machine_id,prediction.tick_timestamp""",
+            (months,active_version),
         )
         rows = cur.fetchall()
 
@@ -151,8 +148,8 @@ def _dedup_within_machine(rows: list[dict], feature_cols: list[str], normalizers
     """Cosine-deduplicate in current machine-relative model space."""
     if not rows:
         return []
-    threshold = float(runtime_config.get("REFERENCE_COSINE_SIMILARITY", 0.98))
-    hours = float(runtime_config.get("REFERENCE_DEDUP_WINDOW_HOURS", 24))
+    threshold = float(runtime_config.get("REFERENCE_COSINE_SIMILARITY"))
+    hours = float(runtime_config.get("REFERENCE_DEDUP_WINDOW_HOURS"))
     accepted_by_machine: dict[str, list[dict]] = {}
     accepted = []
     for item in rows:
@@ -303,73 +300,8 @@ def _training_holdout_split(selected_frames: dict[str, pd.DataFrame], feature_co
     return training_frames, holdout_frames
 
 
-def _risk(scorer, features):
-    if len(features) == 0:
-        return np.array([])
-    score = scorer.score(features)
-    health = scorer.health_from_score(score)
-    return np.clip(1.0 - health / 100.0, 0.0, 1.0)
-
-
-def _raw_feature_window(conn, machine_id, start, end, feature_cols):
-    # Fetch the exact preceding row count. An elapsed-time estimate can be too
-    # short when the production source has gaps or a lower real sample rate.
-    start_ts = pd.Timestamp(start).to_pydatetime()
-    rows = db.fetch_rows_before(
-        conn,
-        db.get_table_name(),
-        start_ts,
-        config.WINDOW_SIZE,
-        machine_id=machine_id,
-    )
-    rows += db.fetch_rows_between(
-        conn,
-        db.get_table_name(),
-        start_ts,
-        pd.Timestamp(end).to_pydatetime(),
-        machine_id=machine_id,
-    )
-    if not rows:
-        return pd.DataFrame(columns=feature_cols)
-
-    db_columns = db.get_db_columns()
-    raw = preprocessing.clean_data(db.canonical_sensor_frame(rows, db_columns))
-    featured = feature_engineering.create_features(raw, verbose=False)
-    timestamps = pd.to_datetime(featured[config.COL_TIMESTAMP], utc=True)
-    mask = (timestamps >= pd.Timestamp(start)) & (timestamps <= pd.Timestamp(end))
-    return featured.loc[mask, [config.COL_TIMESTAMP, *feature_cols]].reset_index(drop=True)
-
-
-def _regression_feature_windows(conn, feature_cols):
-    with conn.cursor() as cur:
-        cur.execute(
-            """SELECT id, machine_id, description, lower(timestamp_range), upper(timestamp_range),
-                      minimum_anomaly_risk,target_timestamp
-               FROM regression_tests WHERE disabled_at IS NULL ORDER BY id"""
-        )
-        tests = cur.fetchall()
-    windows = []
-    for regression_id, machine_id, description, start, end, minimum, target_timestamp in tests:
-        frame = _raw_feature_window(conn, str(machine_id), start, end, feature_cols)
-        evaluation = "window_peak"
-        if target_timestamp is not None and not frame.empty:
-            timestamps = pd.to_datetime(frame[config.COL_TIMESTAMP], utc=True)
-            target = pd.Timestamp(target_timestamp)
-            frame = frame.loc[timestamps == target]
-            evaluation = "exact_flagged_prediction"
-        windows.append((
-            regression_id,
-            str(machine_id),
-            description,
-            frame[feature_cols].reset_index(drop=True),
-            float(minimum),
-            evaluation,
-        ))
-    return windows
-
-
 def _active_training_machine_ids():
-    path = os.path.join(config.ARTIFACTS_DIR, "metadata.json")
+    path = os.path.join(artifact_utils.active_artifacts_dir(), "metadata.json")
     if not os.path.exists(path):
         return None
     with open(path) as handle:
@@ -379,44 +311,30 @@ def _active_training_machine_ids():
 
 def attempt_signature(conn) -> str:
     """Fingerprint the exact pending evidence and policy for retry suppression."""
-    months = int(runtime_config.get("REFERENCE_WINDOW_MONTHS", 6))
+    months = int(runtime_config.get("REFERENCE_WINDOW_MONTHS"))
+    active_version = model_registry.active_version()
     with conn.cursor() as cur:
         cur.execute(
-            """SELECT rc.id
-               FROM reference_candidates rc JOIN alerts a ON a.id=rc.alert_id
-               WHERE rc.added_to_reference_at IS NULL
-                 AND rc.tick_timestamp >= now() - (%s || ' months')::interval
-                 AND a.status='confirmed_normal'
-                 AND a.feature_vector IS NOT NULL
-                 AND a.model_version=(
-                     SELECT version_id FROM model_versions
-                     WHERE status='active' ORDER BY promoted_at DESC NULLS LAST LIMIT 1
-                 )
-                 AND NOT EXISTS (
-                     SELECT 1 FROM model_version_candidates mvc
-                     JOIN model_versions staged ON staged.version_id=mvc.version_id
-                     WHERE mvc.candidate_id=rc.id AND staged.status='shadow'
-                 )
-               ORDER BY rc.id""",
-            (months,),
+            """SELECT prediction.id
+               FROM spindle_predictions prediction
+               WHERE prediction.reference_candidate_at IS NOT NULL
+                 AND prediction.added_to_reference_at IS NULL
+                 AND prediction.candidate_model_version IS NULL
+                 AND prediction.tick_timestamp >= now() - (%s || ' months')::interval
+                 AND prediction.alert_status='confirmed_normal'
+                 AND prediction.feature_vector IS NOT NULL
+                 AND prediction.model_version=%s
+               ORDER BY prediction.id""",
+            (months,active_version),
         )
         candidate_ids = [int(row[0]) for row in cur.fetchall()]
-        cur.execute(
-            """SELECT id,machine_id,lower(timestamp_range),upper(timestamp_range),
-                      minimum_anomaly_risk,target_prediction_id,target_timestamp
-               FROM regression_tests
-               WHERE disabled_at IS NULL
-               ORDER BY id"""
-        )
-        regression_tests = [list(row) for row in cur.fetchall()]
     material_policy_keys = [
         key for key in runtime_config.TRAINING_KEYS
         if key not in {"RETRAIN_CHECK_INTERVAL_MINUTES", "RETRAIN_RETRY_COOLDOWN_HOURS"}
     ]
     payload = {
-        "active_version": model_registry.active_version(conn),
+        "active_version": active_version,
         "candidate_ids": candidate_ids,
-        "regression_tests": regression_tests,
         "training_policy": {
             key: runtime_config.get(key) for key in material_policy_keys
         },
@@ -430,30 +348,25 @@ def attempt_signature(conn) -> str:
 
 
 def should_retrain(conn) -> tuple[bool, dict]:
-    months = int(runtime_config.get("REFERENCE_WINDOW_MONTHS", 6))
+    months = int(runtime_config.get("REFERENCE_WINDOW_MONTHS"))
+    active_version = model_registry.active_version()
     with conn.cursor() as cur:
         cur.execute(
-            """SELECT a.machine_id, count(*), min(rc.created_at)
-               FROM reference_candidates rc JOIN alerts a ON a.id=rc.alert_id
-               WHERE rc.added_to_reference_at IS NULL
-                 AND rc.tick_timestamp >= now() - (%s || ' months')::interval
-                 AND a.status='confirmed_normal'
-                 AND a.feature_vector IS NOT NULL
-                  AND a.model_version=(
-                     SELECT version_id FROM model_versions
-                     WHERE status='active' ORDER BY promoted_at DESC NULLS LAST LIMIT 1
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM model_version_candidates mvc
-                      JOIN model_versions staged ON staged.version_id=mvc.version_id
-                      WHERE mvc.candidate_id=rc.id AND staged.status='shadow'
-                  )
-               GROUP BY a.machine_id ORDER BY a.machine_id""",
-            (months,),
+            """SELECT prediction.machine_id,count(*),min(prediction.reference_candidate_at)
+               FROM spindle_predictions prediction
+               WHERE prediction.reference_candidate_at IS NOT NULL
+                 AND prediction.added_to_reference_at IS NULL
+                 AND prediction.candidate_model_version IS NULL
+                 AND prediction.tick_timestamp >= now() - (%s || ' months')::interval
+                 AND prediction.alert_status='confirmed_normal'
+                 AND prediction.feature_vector IS NOT NULL
+                 AND prediction.model_version=%s
+               GROUP BY prediction.machine_id ORDER BY prediction.machine_id""",
+            (months,active_version),
         )
         rows = cur.fetchall()
-    batch = int(runtime_config.get("RETRAIN_BATCH_SIZE", 50))
-    cap = int(runtime_config.get("RETRAIN_TIME_CAP_DAYS", 30))
+    batch = int(runtime_config.get("RETRAIN_BATCH_SIZE"))
+    cap = int(runtime_config.get("RETRAIN_TIME_CAP_DAYS"))
     now = dt.datetime.now(dt.timezone.utc)
     trained_machine_ids = _active_training_machine_ids()
     by_machine = {}
@@ -505,12 +418,14 @@ def _populate_shadow_bundle(
     machine_calibrations,
     machine_feature_normalizers,
 ):
-    joblib.dump(shadow.model, target / "isolation_forest.pkl")
-    (target / "feature_columns.json").write_text(json.dumps(feature_cols, indent=2))
-    (target / "calibration.json").write_text(
-        json.dumps(artifact_utils.to_json_safe(shadow.calibration()), indent=2, allow_nan=False)
+    artifact_utils.write_core_bundle(
+        target,
+        shadow,
+        feature_cols,
+        metadata,
+        machine_calibrations,
+        machine_feature_normalizers,
     )
-    (target / "metadata.json").write_text(json.dumps(metadata, indent=2))
 
     clean_frames = {
         machine_id: frame[[MACHINE_COL, config.COL_TIMESTAMP, *feature_cols]].copy()
@@ -534,16 +449,6 @@ def _populate_shadow_bundle(
     (target / "reference_rows.json").write_text(json.dumps(reference_rows, indent=2))
     (target / "reference_timestamps.json").write_text(
         json.dumps([row["timestamp"] for row in reference_rows], indent=2)
-    )
-    (target / "machine_calibrations.json").write_text(
-        json.dumps(artifact_utils.to_json_safe(machine_calibrations), indent=2, allow_nan=False)
-    )
-    (target / "machine_feature_normalizers.json").write_text(
-        json.dumps(
-            artifact_utils.to_json_safe(machine_feature_normalizers),
-            indent=2,
-            allow_nan=False,
-        )
     )
     return reference_rows
 
@@ -583,8 +488,9 @@ def run_shadow_retrain(conn, force: bool = False) -> dict:
 
     active_scorer, feature_cols, active_meta = artifact_utils.load_artifacts()
     active_normalizers = artifact_utils.load_machine_feature_normalizers()
+    active_calibrations = artifact_utils.load_machine_calibrations() or {}
     has_machine_reference = os.path.exists(
-        os.path.join(config.ARTIFACTS_DIR, "reference_features.csv")
+        os.path.join(artifact_utils.active_artifacts_dir(), "reference_features.csv")
     )
     if not has_machine_reference and len(active_meta.get("training_machine_ids", [])) > 1:
         raise ValueError(
@@ -683,16 +589,14 @@ def run_shadow_retrain(conn, force: bool = False) -> dict:
     # Gate 1: each machine must independently preserve its confirmed-normal
     # false-positive behavior. A good aggregate cannot hide one bad machine.
     health_cut = float(runtime_config.get("MAINTENANCE_HEALTH_INSPECT", config.MAINTENANCE_HEALTH_INSPECT))
-    max_fp_increase = float(runtime_config.get("RETRAIN_MAX_FP_RATE_INCREASE", 0.02))
-    active_version = model_registry.active_version(conn)
+    max_fp_increase = float(runtime_config.get("RETRAIN_MAX_FP_RATE_INCREASE"))
+    active_version = model_registry.active_version()
     fp_by_machine = {}
     active_flags = []
     shadow_flags = []
     for machine_id, frame in holdout_frames.items():
-        active_calibration = (
-            model_registry.machine_calibration(conn, active_version, machine_id)
-            if active_version else None
-        )
+        active_item = active_calibrations.get(str(machine_id))
+        active_calibration = active_item.get("calibration") if active_item else None
         if active_calibration is None:
             raise ValueError(
                 f"Active model {active_version!r} has no automatic condition anchor "
@@ -724,53 +628,6 @@ def run_shadow_retrain(conn, force: bool = False) -> dict:
         shadow_flags.extend(proposed_flags.tolist())
     fp_pass = all(item["pass"] for item in fp_by_machine.values())
 
-    # Gate 2: reconstruct each permanent false-negative window from that
-    # machine's live raw data and score it with that machine's new calibration.
-    regression = []
-    regression_pass = True
-    for regression_id, machine_id, description, features, minimum, evaluation in _regression_feature_windows(conn, feature_cols):
-        if features.empty:
-            regression.append({
-                "id": regression_id,
-                MACHINE_COL: machine_id,
-                "description": description,
-                "evaluation": evaluation,
-                "pass": False,
-                "reason": "no matching machine feature rows",
-            })
-            regression_pass = False
-            continue
-        scorer = shadow_machine_scorers.get(machine_id)
-        if scorer is None:
-            regression.append({
-                "id": regression_id,
-                MACHINE_COL: machine_id,
-                "description": description,
-                "evaluation": evaluation,
-                "pass": False,
-                "reason": "machine is absent from the proposed balanced reference",
-            })
-            regression_pass = False
-            continue
-        normalized_features = machine_normalization.transform(
-            features,
-            feature_cols,
-            machine_normalization.for_machine(proposed_normalizers, machine_id),
-            machine_id,
-        )[feature_cols]
-        observed_risk = float(np.max(_risk(scorer, normalized_features)))
-        passed = observed_risk >= minimum
-        regression.append({
-            "id": regression_id,
-            MACHINE_COL: machine_id,
-            "description": description,
-            "evaluation": evaluation,
-            "observed_anomaly_risk": observed_risk,
-            "minimum": minimum,
-            "pass": passed,
-        })
-        regression_pass &= passed
-
     report = {
         "reference_rows": len(pooled),
         "holdout_rows": sum(len(frame) for frame in holdout_frames.values()),
@@ -792,11 +649,7 @@ def run_shadow_retrain(conn, force: bool = False) -> dict:
         "reference_fp_by_machine": fp_by_machine,
         "reference_fp_gate_pass": fp_pass,
         "maximum_fp_rate_increase": max_fp_increase,
-        "regression_tests": regression,
-        "regression_gate_pass": regression_pass,
     }
-    accepted = fp_pass and regression_pass
-    report["passed"] = accepted
     version_id = model_registry.new_version_id()
     metadata = dict(active_meta)
     metadata.update({
@@ -826,35 +679,29 @@ def run_shadow_retrain(conn, force: bool = False) -> dict:
         machine_calibrations,
         proposed_normalizers,
     )
+    simulation_gate = simulation_jobs.evaluate_validation_suite(conn, version_id)
+    report["labelled_simulation_evaluation"] = simulation_gate
+    report["labelled_simulation_is_advisory"] = True
+    # Validation is advisory: preserve every score for the administrator, but
+    # do not make the backend silently reject a technically complete shadow.
+    accepted = True
+    report["passed"] = fp_pass
+    report["heldout_score_passed"] = fp_pass
+    report["validation_is_advisory"] = True
     signature_source = [f"{row[MACHINE_COL]}\0{row['timestamp']}" for row in reference_rows]
     signature = model_registry.reference_signature(signature_source)
 
     with conn.cursor() as cur:
         cur.execute(
-            """INSERT INTO model_versions(version_id,artifact_path,reference_signature,status,validation_report)
-               VALUES(%s,%s,%s,%s,%s::jsonb)""",
-            (version_id, str(target), signature, "shadow" if accepted else "rejected", json.dumps(report)),
+            """INSERT INTO model_versions
+                 (version_id,display_name,artifact_path,reference_signature,status,validation_report)
+               VALUES(%s,%s,%s,%s,%s,%s::jsonb)""",
+            (
+                version_id,f"Retrained model {version_id[1:11]}",str(target),signature,"shadow" if accepted else "rejected",
+                json.dumps(report),
+            ),
         )
         if accepted:
-            for machine_id, item in machine_calibrations.items():
-                cur.execute(
-                    """INSERT INTO model_calibrations
-                       (version_id,machine_id,calibration,source_rows,source_description,created_by)
-                       VALUES(%s,%s,%s::jsonb,%s,%s,'auto-retrain') RETURNING id""",
-                    (
-                        version_id,
-                        machine_id,
-                        json.dumps(artifact_utils.to_json_safe(item["calibration"]), allow_nan=False),
-                        item["source_rows"],
-                        "Automatic robust machine condition anchor from shadow retraining",
-                    ),
-                )
-                calibration_id = cur.fetchone()[0]
-                cur.execute(
-                    """INSERT INTO machine_model_calibrations(machine_id,version_id,calibration_id)
-                       VALUES(%s,%s,%s)""",
-                    (machine_id, version_id, calibration_id),
-                )
             # Stage every processed candidate against this shadow. Promotion
             # consumes them atomically; deleting the shadow releases them.
             deduplicated_id_set = {int(item["id"]) for item in deduplicated_rows}
@@ -867,11 +714,13 @@ def run_shadow_retrain(conn, force: bool = False) -> dict:
             # Diverse candidates omitted only because another machine limited
             # the balanced pool remain pending for a future retrain.
             staged_ids = sorted(set(selected_ids + duplicate_ids))
-            for candidate_id in staged_ids:
+            if staged_ids:
                 cur.execute(
-                    """INSERT INTO model_version_candidates(version_id,candidate_id)
-                       VALUES(%s,%s) ON CONFLICT DO NOTHING""",
-                    (version_id, candidate_id),
+                    """UPDATE spindle_predictions SET candidate_model_version=%s
+                       WHERE id=ANY(%s) AND reference_candidate_at IS NOT NULL
+                         AND added_to_reference_at IS NULL
+                         AND candidate_model_version IS NULL""",
+                    (version_id,staged_ids),
                 )
     # The persistent job runner commits the model row, staged candidates, and
     # terminal job result together. Keeping this transaction open prevents a

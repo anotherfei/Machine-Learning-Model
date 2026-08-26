@@ -29,7 +29,7 @@ def enqueue(conn, trigger: str, requested_by: str | None, force: bool) -> dict:
         return {"queued": False, "reason": "shadow_awaiting_decision", "model": pending}
     signature = retrain_service.attempt_signature(conn)
     if not force:
-        cooldown = float(runtime_config.get("RETRAIN_RETRY_COOLDOWN_HOURS", 24))
+        cooldown = float(runtime_config.get("RETRAIN_RETRY_COOLDOWN_HOURS"))
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 """SELECT * FROM retrain_jobs

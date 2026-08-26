@@ -12,7 +12,6 @@ import json
 import math
 import os
 import random
-import re
 import secrets
 import sqlite3
 import threading
@@ -23,13 +22,18 @@ from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 
 import config
 import artifact_utils
 import env_manager
+import maintenance
 import runtime_config
 from api.auth import User, current_user, hash_password, issue_cookie, require_admin, session_user, verify_password, COOKIE
+from api.contracts import (
+    BackfillBody, EnvBody, LoginBody, ReviewBody, SimulationCaseBody,
+    SimulationRunBody, ThresholdBody, TrainingConfigBody, UserCreate,
+    ModelNameBody,
+)
 
 # Mock mode is bound to localhost, but it still receives a fresh non-placeholder
 # signing key for each process instead of using the production fallback.
@@ -69,18 +73,6 @@ def _iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _maintenance_for(health: float, forecast_risk: float) -> tuple[str, str, str]:
-    if health <= runtime_config.get("FAILURE_HEALTH_THRESHOLD", 20):
-        return "CRITICAL", "Health is below the failure threshold.", "health_threshold"
-    if health <= runtime_config.get("MAINTENANCE_HEALTH_INSPECT", 30):
-        return "WARN", "Health is below the inspection threshold.", "health_inspect"
-    if forecast_risk >= runtime_config.get("MAINTENANCE_PROB_URGENT", 0.80):
-        return "CRITICAL", "Mock forecast boundary-crossing risk is above the urgent threshold.", "trend_probability"
-    if forecast_risk >= runtime_config.get("MAINTENANCE_PROB_PLAN", 0.60):
-        return "WARN", "Mock forecast boundary-crossing risk indicates maintenance should be planned.", "trend_probability"
-    return "OK", "No maintenance action is currently required.", "none"
-
-
 def _sensor_values(i: int, machine_id: str) -> dict[str, float]:
     # Slowly wandering, deterministic demo signal with occasional stronger vibration.
     unit_offset = MACHINE_IDS.index(machine_id) if machine_id in MACHINE_IDS else 0
@@ -112,9 +104,10 @@ def _prediction(i: int, machine_id: str = "MACHINE-001", when: datetime | None =
         horizon: round(min(0.99, anomaly * (0.25 + 0.55 * float(horizon))), 4)
         for horizon in config.FAILURE_PROB_HORIZONS_DAYS
     }
-    horizon = float(runtime_config.get("MAINTENANCE_HORIZON_DAYS", config.MAINTENANCE_HORIZON_DAYS))
-    selected_horizon = min(probability, key=lambda value: abs(float(value) - horizon))
-    level, reason, trigger = _maintenance_for(health, probability[selected_horizon])
+    remaining_days = round(max(1.0, health / 3.5), 2)
+    decision = maintenance.recommend(
+        health, max(1, round(remaining_days)), probability, trend_trusted=True
+    )
     return {
         "machine_id": machine_id,
         "tick_timestamp": _iso(when),
@@ -124,12 +117,12 @@ def _prediction(i: int, machine_id: str = "MACHINE-001", when: datetime | None =
         "health_raw": round(health + _RNG.uniform(-2.0, 2.0), 3),
         "health_state": round(health, 3),
         "trend_slope_per_day": round(-0.08 * math.sin(i / 15.0), 5),
-        "remaining_days": round(max(1.0, health / 3.5), 2),
+        "remaining_days": remaining_days,
         "failure_probability": probability,
-        "maintenance_level": level,
-        "maintenance_reason": reason,
-        "maintenance_trigger": trigger,
-        "top_contributors": ["a_rms_mps2", "v_rms_mms"] if level != "OK" else ["temperature_c"],
+        "maintenance_level": decision["level"],
+        "maintenance_reason": decision["reason"],
+        "maintenance_trigger": decision["trigger"],
+        "top_contributors": ["a_rms_mps2", "v_rms_mms"] if decision["level"] != "OK" else ["temperature_c"],
     }
 
 
@@ -182,7 +175,7 @@ def initialize_mock_database(reset: bool = False) -> Path:
               added_to_reference_at TEXT
             );
             CREATE TABLE IF NOT EXISTS model_versions(
-              version_id TEXT PRIMARY KEY, artifact_path TEXT NOT NULL, reference_signature TEXT NOT NULL,
+              version_id TEXT PRIMARY KEY, display_name TEXT, artifact_path TEXT NOT NULL, reference_signature TEXT NOT NULL,
               status TEXT NOT NULL, validation_report TEXT, created_at TEXT NOT NULL, promoted_at TEXT, promoted_by TEXT
             );
             CREATE TABLE IF NOT EXISTS model_calibrations(
@@ -192,12 +185,6 @@ def initialize_mock_database(reset: bool = False) -> Path:
             CREATE TABLE IF NOT EXISTS machine_model_calibrations(
               machine_id TEXT NOT NULL, version_id TEXT NOT NULL, calibration_id INTEGER NOT NULL,
               updated_at TEXT NOT NULL, PRIMARY KEY(machine_id,version_id)
-            );
-            CREATE TABLE IF NOT EXISTS regression_tests(
-              id INTEGER PRIMARY KEY AUTOINCREMENT, machine_id TEXT NOT NULL DEFAULT 'MACHINE-001', description TEXT NOT NULL, start_ts TEXT NOT NULL, end_ts TEXT NOT NULL,
-              minimum_anomaly_risk REAL NOT NULL, source_alert_id INTEGER,
-              target_prediction_id INTEGER,target_timestamp TEXT,
-              created_at TEXT NOT NULL, created_by TEXT, disabled_at TEXT, disabled_by TEXT
             );
             CREATE TABLE IF NOT EXISTS model_version_candidates(
               version_id TEXT NOT NULL, candidate_id INTEGER NOT NULL,
@@ -230,6 +217,8 @@ def initialize_mock_database(reset: bool = False) -> Path:
         # calibration — same convention as model_registry.py's Postgres
         # column of the same name.
         existing_cols = {r[1] for r in c.execute("PRAGMA table_info(model_versions)").fetchall()}
+        if "display_name" not in existing_cols:
+            c.execute("ALTER TABLE model_versions ADD COLUMN display_name TEXT")
         if "active_calibration_id" not in existing_cols:
             c.execute("ALTER TABLE model_versions ADD COLUMN active_calibration_id INTEGER")
         calibration_cols = {r[1] for r in c.execute("PRAGMA table_info(model_calibrations)").fetchall()}
@@ -238,20 +227,7 @@ def initialize_mock_database(reset: bool = False) -> Path:
         candidate_cols = {r[1] for r in c.execute("PRAGMA table_info(reference_candidates)").fetchall()}
         if "added_to_reference_at" not in candidate_cols:
             c.execute("ALTER TABLE reference_candidates ADD COLUMN added_to_reference_at TEXT")
-        regression_cols = {r[1] for r in c.execute("PRAGMA table_info(regression_tests)").fetchall()}
-        if "disabled_at" not in regression_cols:
-            c.execute("ALTER TABLE regression_tests ADD COLUMN disabled_at TEXT")
-        if "disabled_by" not in regression_cols:
-            c.execute("ALTER TABLE regression_tests ADD COLUMN disabled_by TEXT")
-        if "source_alert_id" not in regression_cols:
-            c.execute("ALTER TABLE regression_tests ADD COLUMN source_alert_id INTEGER")
-        if "created_by" not in regression_cols:
-            c.execute("ALTER TABLE regression_tests ADD COLUMN created_by TEXT")
-        if "target_prediction_id" not in regression_cols:
-            c.execute("ALTER TABLE regression_tests ADD COLUMN target_prediction_id INTEGER")
-        if "target_timestamp" not in regression_cols:
-            c.execute("ALTER TABLE regression_tests ADD COLUMN target_timestamp TEXT")
-        for table_name in ("alerts", "regression_tests", "spindle_predictions"):
+        for table_name in ("alerts", "spindle_predictions"):
             table_cols = {r[1] for r in c.execute(f"PRAGMA table_info({table_name})").fetchall()}
             if "machine_id" not in table_cols:
                 c.execute(f"ALTER TABLE {table_name} ADD COLUMN machine_id TEXT NOT NULL DEFAULT 'MACHINE-001'")
@@ -259,7 +235,7 @@ def initialize_mock_database(reset: bool = False) -> Path:
         # asset ID. Relabel those demo rows while keeping VVB001 as sensor
         # specification metadata in config.py/preprocessing.py.
         for old_machine_id, new_machine_id in LEGACY_MACHINE_IDS.items():
-            for table_name in ("alerts", "regression_tests", "spindle_predictions", "model_calibrations"):
+            for table_name in ("alerts", "spindle_predictions", "model_calibrations"):
                 c.execute(f"UPDATE {table_name} SET machine_id=? WHERE machine_id=?", (new_machine_id, old_machine_id))
             c.execute("""INSERT OR IGNORE INTO machine_model_calibrations(machine_id,version_id,calibration_id,updated_at)
                          SELECT ?,version_id,calibration_id,updated_at FROM machine_model_calibrations WHERE machine_id=?""",
@@ -274,8 +250,18 @@ def initialize_mock_database(reset: bool = False) -> Path:
             username = os.getenv("BOOTSTRAP_ADMIN_USER", "admin")
             password = os.getenv("BOOTSTRAP_ADMIN_PASSWORD", "change-me-on-first-deployment")
             c.execute("INSERT INTO app_users(username,password_hash,role) VALUES(?,?,?)", (username, hash_password(password), "admin"))
+        introducing_split_horizons = c.execute(
+            "SELECT 1 FROM runtime_config WHERE key='MAINTENANCE_URGENT_HORIZON_DAYS'"
+        ).fetchone() is None
         for key, value in runtime_config.defaults().items():
             c.execute("INSERT OR IGNORE INTO runtime_config(key,value) VALUES(?,?)", (key, json.dumps(value)))
+        if introducing_split_horizons:
+            c.execute(
+                "UPDATE runtime_config SET value='7' WHERE key='MAINTENANCE_HORIZON_DAYS' AND value IN ('1','1.0')"
+            )
+        c.execute(
+            "UPDATE runtime_config SET value='7' WHERE key='MAINTENANCE_HORIZON_DAYS' AND value IN ('30','30.0')"
+        )
         if c.execute("SELECT count(*) FROM mock_env").fetchone()[0] == 0:
             vals = {
                 "PG_HOST": "localhost", "PG_PORT": "5432", "PG_DATABASE": "mock-demo",
@@ -308,35 +294,6 @@ def initialize_mock_database(reset: bool = False) -> Path:
                     _insert_prediction(c, row, create_alert=(row["maintenance_level"] != "OK" and i % 3 == 0))
                 count = 120
             _live_index[machine_id] = count
-        # Older Demo builds used sklearn's negative raw anomaly score as a
-        # probability and clamped almost every auto-created floor to 0.05.
-        # Repair only those recognizable generated rows.
-        for test in c.execute("SELECT id,description FROM regression_tests WHERE minimum_anomaly_risk=0.05 AND description LIKE 'Near-miss%prediction #%'").fetchall():
-            match = re.search(r"prediction #(\d+)$", test["description"])
-            if not match:
-                continue
-            prediction = c.execute("SELECT health_state FROM spindle_predictions WHERE id=?", (int(match.group(1)),)).fetchone()
-            if prediction:
-                floor = runtime_config.regression_risk_floor(prediction["health_state"])
-                c.execute("UPDATE regression_tests SET minimum_anomaly_risk=? WHERE id=?", (floor, test["id"]))
-        for test in c.execute(
-            """SELECT id,description FROM regression_tests
-               WHERE target_prediction_id IS NULL AND description LIKE 'Near-miss%prediction #%'
-            """
-        ).fetchall():
-            match = re.search(r"prediction #(\d+)$", test["description"])
-            if not match:
-                continue
-            prediction_id = int(match.group(1))
-            prediction = c.execute(
-                "SELECT tick_timestamp FROM spindle_predictions WHERE id=?", (prediction_id,)
-            ).fetchone()
-            if prediction:
-                c.execute(
-                    """UPDATE regression_tests SET target_prediction_id=?,target_timestamp=?
-                       WHERE id=?""",
-                    (prediction_id, prediction["tick_timestamp"], test["id"]),
-                )
         c.commit()
         c.close()
         _load_threshold_cache()
@@ -351,6 +308,7 @@ def _load_threshold_cache() -> None:
     for r in rows:
         try: vals[r["key"]] = json.loads(r["value"])
         except Exception: vals[r["key"]] = r["value"]
+    vals = runtime_config.normalize_loaded_values(vals)
     runtime_config.set_local(vals)
 
 
@@ -374,42 +332,9 @@ def health():
     return {"ok": True, "mode": "mock"}
 
 
-class LoginBody(BaseModel): username: str; password: str
-class ReviewBody(BaseModel): decision: str
-class ThresholdBody(BaseModel):
-    MAINTENANCE_PROB_URGENT: float
-    MAINTENANCE_PROB_PLAN: float
-    FAILURE_HEALTH_THRESHOLD: float
-    MAINTENANCE_HEALTH_INSPECT: float
-    MAINTENANCE_HORIZON_DAYS: float
-    TREND_MIN_POINTS: int
-    TREND_SLOPE_Z_THRESHOLD: float
-    TREND_SETTLE_TICKS: int
-    MAINTENANCE_TREND_DEBOUNCE_TICKS: int
-    MAINTENANCE_TREND_RECOVERY_TICKS: int
-    OPERATING_STATE_STOP_CONFIRM_TICKS: int
-    OPERATING_STATE_START_CONFIRM_TICKS: int
-    SOURCE_STALE_SECONDS: int
-    HEALTH_SENSITIVITY_STD: float
-    KALMAN_INIT_SAMPLES: int
-    TREND_LOOKBACK_MINUTES: int
-    WORKER_POLL_SECONDS: int
-    NEAR_MISS_TREND_WINDOW_HOURS: float
-class EnvBody(BaseModel): values: dict[str, str]
-class UserCreate(BaseModel): username: str; password: str; role: str = "viewer"
-class RegressionBody(BaseModel): description: str; start: str; end: str; machine_id: str = "MACHINE-001"; minimum_anomaly_risk: float = 0.6
-class BackfillBody(BaseModel): start: str; end: str; mode: str = "repredict"; machine_id: str | None = None
-class TrainingConfigBody(BaseModel):
-    RETRAIN_BATCH_SIZE: int
-    RETRAIN_TIME_CAP_DAYS: int
-    REFERENCE_WINDOW_MONTHS: int
-    REFERENCE_DEDUP_WINDOW_HOURS: float
-    REFERENCE_COSINE_SIMILARITY: float
-    NEAR_MISS_REGRESSION_WINDOW_HOURS: float
-    RETRAIN_CHECK_INTERVAL_MINUTES: int
-    RETRAIN_RETRY_COOLDOWN_HOURS: float
-    RETRAIN_MAX_FP_RATE_INCREASE: float
-    AUTO_RETRAIN_ENABLED: bool = True
+@app.get("/api/backfill/status")
+def backfill_status(user: User = Depends(current_user)):
+    return {"status": "idle", "progress": 0.0, "mock_mode": True}
 
 
 @app.post("/api/login")
@@ -447,8 +372,8 @@ def machines(user: User = Depends(current_user)):
 
 @app.get("/api/fleet/condition-trend")
 def fleet_condition_trend(days: int = 7, user: User = Depends(current_user)):
-    if not 1 <= days <= 31:
-        raise HTTPException(400, "days must be between 1 and 31")
+    if not 1 <= days <= 7:
+        raise HTTPException(400, "days must be between 1 and 7")
     end = _now()
     start = end - timedelta(days=days)
     c = _connect()
@@ -483,8 +408,23 @@ def fleet_condition_trend(days: int = 7, user: User = Depends(current_user)):
             "health_state": float(row["health_state"]),
             "samples": int(row["samples"]),
         })
+    display_start = start
+    display_end = end
+    if rows:
+        buckets = [datetime.fromisoformat(row["bucket"].replace("Z", "+00:00")) for row in rows]
+        first_bucket, last_bucket = min(buckets), max(buckets)
+        if first_bucket == last_bucket:
+            display_start = max(start, first_bucket - timedelta(minutes=30))
+            display_end = min(end, last_bucket + timedelta(minutes=30))
+        else:
+            display_start, display_end = first_bucket, last_bucket
+    coverage_seconds = max(0.0, (display_end - display_start).total_seconds())
     return {
-        "days": days, "metric": "hourly_average_condition", "start": _iso(start), "end": _iso(end),
+        "days": coverage_seconds / 86400.0,
+        "requested_days": days,
+        "coverage_seconds": coverage_seconds,
+        "metric": "hourly_average_condition",
+        "start": _iso(display_start), "end": _iso(display_end),
         "series": [{"machine_id": machine_id, "points": grouped.get(machine_id, [])} for machine_id in machine_ids],
     }
 
@@ -514,6 +454,9 @@ def latest_live(machine_id: str = MACHINE_IDS[0], user: User = Depends(current_u
             "trigger": row["maintenance_trigger"],
         },
         "prediction_available": True,
+        "prediction_matches_source": True,
+        "prediction_delayed": False,
+        "allowed_prediction_lag_seconds": float(runtime_config.get("SOURCE_STALE_SECONDS", config.SOURCE_STALE_SECONDS)),
         "prediction_lag_seconds": 0.0,
         "operating_state": "RUNNING",
         "operating_state_reason": "Synthetic vibration is in the running regime.",
@@ -522,6 +465,22 @@ def latest_live(machine_id: str = MACHINE_IDS[0], user: User = Depends(current_u
         "mock_mode": True,
         **raw,
     }
+
+
+@app.get("/api/fleet/latest")
+def fleet_latest(machine_ids: str, user: User = Depends(current_user)):
+    requested=[]
+    for value in machine_ids.split(","):
+        value=value.strip()
+        if value and value not in requested:
+            requested.append(value)
+    items=[];unavailable=[]
+    for machine_id in requested[:100]:
+        try:
+            items.append(latest_live(machine_id,user))
+        except HTTPException as exc:
+            unavailable.append({"machine_id":machine_id,"detail":exc.detail})
+    return {"items":items,"unavailable":unavailable}
 
 
 @app.post("/api/users")
@@ -660,39 +619,43 @@ def alert_context(alert_id: int, hours: float = 3, user: User = Depends(current_
     c.close(); return rows
 
 
-@app.get("/api/regression-tests")
-def regression_tests(user: User = Depends(current_user)):
-    c = _connect(); rows = [dict(r) for r in c.execute(
-        """SELECT id,machine_id,description,start_ts AS start,end_ts AS end,
-                  minimum_anomaly_risk,source_alert_id,target_prediction_id,target_timestamp,
-                  created_at,created_by,disabled_at,disabled_by
-           FROM regression_tests ORDER BY disabled_at IS NOT NULL,created_at DESC"""
-    ).fetchall()]; c.close(); return rows
+@app.get("/api/simulations")
+def simulations(limit: int = 25, user: User = Depends(current_user)):
+    return []
+
+@app.get("/api/simulation-templates")
+def simulation_templates(limit: int = 50, user: User = Depends(current_user)):
+    return []
+
+@app.post("/api/simulation-templates")
+def create_simulation_template(body: SimulationRunBody, admin: User = Depends(require_admin)):
+    raise HTTPException(409, "Reusable simulation lists are disabled in mock mode.")
+
+@app.put("/api/simulation-templates/{template_id}")
+def update_simulation_template(template_id: int, body: SimulationRunBody, admin: User = Depends(require_admin)):
+    raise HTTPException(409, "Reusable simulation lists are disabled in mock mode.")
+
+@app.delete("/api/simulation-templates/{template_id}")
+def delete_simulation_template(template_id: int, admin: User = Depends(require_admin)):
+    raise HTTPException(404, "Reusable simulation list not found in mock mode")
 
 
-@app.post("/api/regression-tests")
-def add_regression(body: RegressionBody, admin: User = Depends(require_admin)):
-    if not 0 <= body.minimum_anomaly_risk <= 1: raise HTTPException(400, "minimum_anomaly_risk must be in [0,1]")
-    description = body.description.strip()
-    if not description or len(description) > 500: raise HTTPException(400, "description must contain 1 to 500 characters")
-    try:
-        start = datetime.fromisoformat(body.start.replace("Z", "+00:00"))
-        end = datetime.fromisoformat(body.end.replace("Z", "+00:00"))
-    except ValueError: raise HTTPException(400, "start and end must be ISO-8601 timestamps")
-    if start >= end: raise HTTPException(400, "end must be later than start")
-    if body.machine_id not in MACHINE_IDS: raise HTTPException(400, "machine_id is not commissioned in the active model")
-    c = _connect(); cur = c.execute("INSERT INTO regression_tests(machine_id,description,start_ts,end_ts,minimum_anomaly_risk,created_at,created_by) VALUES(?,?,?,?,?,?,?)", (body.machine_id, description, _iso(start), _iso(end), body.minimum_anomaly_risk, _iso(_now()), admin.username)); c.commit(); rid = cur.lastrowid; c.close(); return {"id": rid}
+@app.get("/api/simulations/{run_id}")
+def simulation(run_id: int, user: User = Depends(current_user)):
+    raise HTTPException(404, "Simulation run not found in mock mode")
 
 
-@app.delete("/api/regression-tests/{regression_id}")
-def disable_regression(regression_id: int, admin: User = Depends(require_admin)):
-    c = _connect(); cur = c.execute(
-        "UPDATE regression_tests SET disabled_at=?,disabled_by=? WHERE id=? AND disabled_at IS NULL",
-        (_iso(_now()), admin.username, regression_id),
+@app.post("/api/simulations", status_code=202)
+def create_simulation(body: SimulationRunBody, admin: User = Depends(require_admin)):
+    raise HTTPException(
+        409,
+        "Historical accuracy simulation is disabled in mock mode because synthetic results would not measure real model accuracy.",
     )
-    if cur.rowcount != 1:
-        c.rollback(); c.close(); raise HTTPException(404, "Active regression test not found")
-    c.commit(); c.close(); return {"id": regression_id, "disabled": True}
+
+
+@app.delete("/api/simulations/{run_id}")
+def delete_simulation(run_id: int, admin: User = Depends(require_admin)):
+    raise HTTPException(404, "Simulation run not found in mock mode")
 
 
 @app.post("/api/backfill")
@@ -723,10 +686,10 @@ def retrain_status(user: User = Depends(current_user)):
     active = c.execute("SELECT * FROM retrain_jobs WHERE status IN ('queued','running') ORDER BY created_at DESC LIMIT 1").fetchone()
     latest = c.execute("SELECT * FROM retrain_jobs WHERE status NOT IN ('queued','running') ORDER BY finished_at DESC LIMIT 1").fetchone()
     pending_shadow = c.execute("SELECT version_id,created_at FROM model_versions WHERE status='shadow' ORDER BY created_at DESC LIMIT 1").fetchone()
-    c.close(); batch = int(runtime_config.get("RETRAIN_BATCH_SIZE", 50))
+    c.close(); batch = int(runtime_config.get("RETRAIN_BATCH_SIZE"))
     return {"pending": count, "candidate_count": count, "eligible_pending": count, "pending_by_machine": by_machine,
             "batch_size_per_machine": batch, "batch_size": batch,
-            "time_cap_days": runtime_config.get("RETRAIN_TIME_CAP_DAYS", 30),
+            "time_cap_days": runtime_config.get("RETRAIN_TIME_CAP_DAYS"),
             "due": any(item["pending"] >= batch for item in by_machine.values()),
             "active_job": _row_dict(active) if active else None,
             "last_job": _row_dict(latest) if latest else None,
@@ -762,12 +725,11 @@ def retrain_now(admin: User = Depends(require_admin)):
                 "holdout_rows": artifact_utils.VALIDATION_HOLDOUT_MIN_ROWS,
                 "active_reference_fp": 0.0,
                 "shadow_reference_fp": 0.0,
-                "maximum_allowed_increase": runtime_config.get("RETRAIN_MAX_FP_RATE_INCREASE", 0.02),
+                "maximum_allowed_increase": runtime_config.get("RETRAIN_MAX_FP_RATE_INCREASE"),
                 "pass": True,
             }
             for machine_id in MACHINE_IDS
         },
-        "regression_tests": [],
         "reference_fp_gate_pass": True,
         "regression_gate_pass": True,
     }
@@ -802,17 +764,30 @@ def models(user: User = Depends(current_user)):
     c = _connect(); rows = [_row_dict(r) for r in c.execute("SELECT * FROM model_versions ORDER BY created_at DESC").fetchall()]; c.close(); return rows
 
 
+@app.patch("/api/models/{version_id}/name")
+def rename_model(version_id: str, body: ModelNameBody, admin: User = Depends(require_admin)):
+    name = " ".join(body.name.strip().split())
+    if not 1 <= len(name) <= 80 or any(ord(character) < 32 for character in name):
+        raise HTTPException(400, "Model name must contain 1 to 80 printable characters")
+    c = _connect()
+    result = c.execute(
+        "UPDATE model_versions SET display_name=? WHERE version_id=?", (name, version_id)
+    )
+    if result.rowcount != 1:
+        c.close()
+        raise HTTPException(404, "Model version not found")
+    c.commit(); c.close()
+    return {"version_id": version_id, "display_name": name}
+
+
 @app.post("/api/models/{version_id}/promote")
 def promote(version_id: str, admin: User = Depends(require_admin)):
-    c = _connect(); row = c.execute("SELECT status,validation_report FROM model_versions WHERE version_id=?", (version_id,)).fetchone()
+    c = _connect(); row = c.execute("SELECT status FROM model_versions WHERE version_id=?", (version_id,)).fetchone()
     if not row: c.close(); raise HTTPException(404, "Model version not found")
-    if row["status"] == "rejected":
-        c.close(); raise HTTPException(400, "A rejected model cannot be promoted")
-    report = json.loads(row["validation_report"] or "{}")
-    if row["status"] == "shadow" and report.get("passed") is not True:
-        c.close(); raise HTTPException(400, "A shadow model must pass validation before promotion")
     c.execute("UPDATE model_versions SET status='retired' WHERE status='active' AND version_id<>?", (version_id,))
     c.execute("UPDATE model_versions SET status='active',promoted_at=?,promoted_by=? WHERE version_id=?", (_iso(_now()), admin.username, version_id))
+    c.execute("DELETE FROM alerts WHERE status='pending'")
+    c.execute("DELETE FROM near_miss_reviews WHERE status='pending'")
     c.execute(
         """UPDATE reference_candidates SET added_to_reference_at=?
            WHERE id IN (SELECT candidate_id FROM model_version_candidates WHERE version_id=?)""",
@@ -885,7 +860,7 @@ def history(limit: int = 50, offset: int = 0, level: str | None = None, machine_
         where += " AND maintenance_level=?"; args.append(level)
     c = _connect()
     near_miss_ids = _mock_near_miss_ids(
-        c, machine_id, float(runtime_config.get("NEAR_MISS_TREND_WINDOW_HOURS", 6))
+        c, machine_id, float(runtime_config.get("NEAR_MISS_TREND_WINDOW_HOURS"))
     )
     total = c.execute(f"SELECT count(*) FROM spindle_predictions{where}", args).fetchone()[0]
     rows = [_row_dict(r) for r in c.execute(f"SELECT * FROM spindle_predictions{where} ORDER BY tick_timestamp DESC LIMIT ? OFFSET ?", args + [limit, offset]).fetchall()]
@@ -920,7 +895,7 @@ def history(limit: int = 50, offset: int = 0, level: str | None = None, machine_
 @app.get("/api/near-miss")
 def near_miss(hours: float | None = None, limit: int = 50, offset: int = 0, status: str = "pending", machine_id: str = "MACHINE-001", user: User = Depends(current_user)):
     if status not in ("pending", "acknowledged", "flagged"): raise HTTPException(400, "status must be pending, acknowledged, or flagged")
-    hours = float(hours if hours is not None else runtime_config.get("NEAR_MISS_TREND_WINDOW_HOURS", 6))
+    hours = float(hours if hours is not None else runtime_config.get("NEAR_MISS_TREND_WINDOW_HOURS"))
     if not 0.25 <= hours <= 168: raise HTTPException(400, "hours must be between 0.25 and 168")
     limit = max(1, min(limit, 500)); offset = max(0, offset)
     c = _connect()
@@ -951,34 +926,8 @@ def review_near_miss(prediction_id: int, body: ReviewBody, user: User = Depends(
                ON CONFLICT(prediction_id) DO UPDATE SET status=excluded.status,reviewed_by=excluded.reviewed_by,reviewed_at=excluded.reviewed_at""",
             (prediction_id, body.decision, user.username),
         )
-        # See api/main.py review_near_miss for why: a "flagged" near-miss is
-        # a suspected false negative, so it feeds the same regression_tests
-        # gate that already guards Alert review's confirmed-normal path in
-        # the opposite direction. Mock mode has no real retraining pipeline
-        # to gate, but the record is still created so the reviewer workflow
-        # and the regression-tests list behave the same as production.
-        regression_test_id = None
-        if body.decision == "flagged":
-            hours = float(runtime_config.get("NEAR_MISS_REGRESSION_WINDOW_HOURS", 1))
-            center = datetime.fromisoformat(pred["tick_timestamp"].replace("Z", "+00:00"))
-            lo = _iso(center - timedelta(hours=hours)); hi = _iso(center + timedelta(hours=hours))
-            health_state = pred["health_state"]
-            min_risk = runtime_config.regression_risk_floor(health_state)
-            description = f"Near-miss prediction #{prediction_id}"
-            existing = c.execute("SELECT id FROM regression_tests WHERE description=? AND disabled_at IS NULL LIMIT 1", (description,)).fetchone()
-            if existing:
-                regression_test_id = existing["id"]
-            else:
-                cur = c.execute(
-                    """INSERT INTO regression_tests
-                       (machine_id,description,start_ts,end_ts,minimum_anomaly_risk,created_at,created_by,
-                        target_prediction_id,target_timestamp) VALUES(?,?,?,?,?,?,?,?,?)""",
-                    (pred["machine_id"], description, lo, hi, min_risk, _iso(_now()), user.username,
-                     prediction_id,pred["tick_timestamp"]),
-                )
-                regression_test_id = cur.lastrowid
         c.commit(); c.close()
-    return {"prediction_id": prediction_id, "status": body.decision, "regression_test_id": regression_test_id}
+    return {"prediction_id": prediction_id, "status": body.decision}
 
 
 @app.websocket("/ws/live")

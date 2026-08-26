@@ -12,10 +12,82 @@ pipeline (failure_probability.py, maintenance.py) depends on the fitted
 slope/intercept plus a condition-diffusion estimate derived here.
 """
 
+from collections import deque
+
 import numpy as np
 
 import config
 import runtime_config
+
+
+def _fit_from_moments(n, sum_x, sum_y, sum_x2, sum_xy, sum_y2):
+    """Fit OLS from sufficient statistics shared by array and rolling paths."""
+    minimum_points = runtime_config.get("TREND_MIN_POINTS", config.TREND_MIN_POINTS)
+    if n < minimum_points:
+        return None
+    centered_x2 = float(sum_x2) - float(sum_x) * float(sum_x) / n
+    if centered_x2 <= 0:
+        return None
+    centered_xy = float(sum_xy) - float(sum_x) * float(sum_y) / n
+    centered_y2 = max(0.0, float(sum_y2) - float(sum_y) * float(sum_y) / n)
+    slope = centered_xy / centered_x2
+    intercept = (float(sum_y) - slope * float(sum_x)) / n
+    residual_variance = max(0.0, (centered_y2 - slope * centered_xy) / n)
+    residual_std = float(np.sqrt(residual_variance)) or 1e-6
+    return slope, intercept, residual_std
+
+
+class RollingTrendWindow:
+    """Exact elapsed-time trend window with constant-time OLS updates."""
+
+    def __init__(self, lookback_minutes: float):
+        self.lookback_minutes = float(lookback_minutes)
+        self.minutes = deque()
+        self.health = deque()
+        self.sum_x = self.sum_y = 0.0
+        self.sum_x2 = self.sum_xy = self.sum_y2 = 0.0
+        self._updates = 0
+
+    def append(self, minute: float, health: float) -> None:
+        x, y = float(minute), float(health)
+        self.minutes.append(x); self.health.append(y)
+        self.sum_x += x; self.sum_y += y
+        self.sum_x2 += x*x; self.sum_xy += x*y; self.sum_y2 += y*y
+        cutoff = x - self.lookback_minutes
+        while self.minutes and self.minutes[0] < cutoff:
+            old_x = self.minutes.popleft(); old_y = self.health.popleft()
+            self.sum_x -= old_x; self.sum_y -= old_y
+            self.sum_x2 -= old_x*old_x
+            self.sum_xy -= old_x*old_y
+            self.sum_y2 -= old_y*old_y
+        self._updates += 1
+        # Bound floating-point accumulation drift during multi-million-row
+        # replay while keeping the normal update constant-time.
+        if self._updates % 100_000 == 0:
+            x, y = self.arrays()
+            self.sum_x=float(x.sum()); self.sum_y=float(y.sum())
+            self.sum_x2=float(np.dot(x,x)); self.sum_xy=float(np.dot(x,y))
+            self.sum_y2=float(np.dot(y,y))
+
+    def fit(self):
+        return _fit_from_moments(
+            len(self.minutes), self.sum_x, self.sum_y,
+            self.sum_x2, self.sum_xy, self.sum_y2,
+        )
+
+    def slope_is_significant(self, slope: float, residual_std: float,
+                             z_threshold: float = None) -> bool:
+        n = len(self.minutes)
+        centered_x2 = self.sum_x2 - self.sum_x*self.sum_x/n if n else 0.0
+        return _slope_is_significant_from_sxx(
+            n, centered_x2, slope, residual_std, z_threshold,
+        )
+
+    def arrays(self):
+        return (
+            np.fromiter(self.minutes, dtype=float, count=len(self.minutes)),
+            np.fromiter(self.health, dtype=float, count=len(self.health)),
+        )
 
 
 def fit_trend(minutes_since_start: np.ndarray, health_values: np.ndarray):
@@ -24,15 +96,25 @@ def fit_trend(minutes_since_start: np.ndarray, health_values: np.ndarray):
     Returns (slope_per_minute, intercept, residual_std) or None if there
     aren't enough points yet (see config.TREND_MIN_POINTS).
     """
-    minimum_points = runtime_config.get("TREND_MIN_POINTS", config.TREND_MIN_POINTS)
-    if len(minutes_since_start) < minimum_points:
-        return None
+    x = np.asarray(minutes_since_start, dtype=float)
+    y = np.asarray(health_values, dtype=float)
+    return _fit_from_moments(
+        len(x), x.sum(), y.sum(), np.dot(x, x), np.dot(x, y), np.dot(y, y),
+    )
 
-    slope, intercept = np.polyfit(minutes_since_start, health_values, 1)
-    predicted = slope * minutes_since_start + intercept
-    residual_std = float(np.std(health_values - predicted)) or 1e-6
 
-    return slope, intercept, residual_std
+def _slope_is_significant_from_sxx(
+    n, sxx, slope, residual_std, z_threshold=None,
+) -> bool:
+    z_threshold = (
+        runtime_config.get("TREND_SLOPE_Z_THRESHOLD", config.TREND_SLOPE_Z_THRESHOLD)
+        if z_threshold is None else z_threshold
+    )
+    if n <= 2 or sxx <= 0:
+        return False
+    residual_se = residual_std * np.sqrt(n / (n - 2))
+    slope_se = residual_se / np.sqrt(sxx)
+    return bool(slope_se > 0 and abs(slope / slope_se) >= z_threshold)
 
 
 def slope_is_significant(minutes_since_start: np.ndarray, slope: float, residual_std: float,
@@ -70,25 +152,14 @@ def slope_is_significant(minutes_since_start: np.ndarray, slope: float, residual
     treat "not trusted" as the safe default via maintenance.recommend()'s
     trend_trusted parameter.
     """
-    z_threshold = (
-        runtime_config.get("TREND_SLOPE_Z_THRESHOLD", config.TREND_SLOPE_Z_THRESHOLD)
-        if z_threshold is None else z_threshold
-    )
     n = len(minutes_since_start)
     if n <= 2:
         return False
-
     x = np.asarray(minutes_since_start, dtype=float)
     sxx = float(np.sum((x - x.mean()) ** 2))
-    if sxx <= 0:
-        return False
-
-    residual_se = residual_std * np.sqrt(n / (n - 2))  # ddof=0 -> ddof=2 correction
-    slope_se = residual_se / np.sqrt(sxx)
-    if slope_se <= 0:
-        return False
-
-    return abs(slope / slope_se) >= z_threshold
+    return _slope_is_significant_from_sxx(
+        n, sxx, slope, residual_std, z_threshold,
+    )
 
 
 def estimate_diffusion(minutes_since_start: np.ndarray, health_values: np.ndarray,

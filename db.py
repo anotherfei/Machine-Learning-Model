@@ -1,21 +1,5 @@
-"""
-Postgres connection + incremental ("watermark") row fetch for
-predict_realtime.py.
+"""PostgreSQL connection, source mapping, and ordered sensor-row access."""
 
-Reads connection info + table name from environment variables (.env,
-gitignored — see .env.example), with optional CLI flags as overrides.
-Never hardcode credentials here.
-
-Watermark strategy: the caller (predict_realtime.read_sensor) tracks the
-timestamp of the last row it has already yielded and passes it back in as
-`since`. Each call returns only rows strictly newer than that, ordered
-ascending, so the rolling-window / Kalman pipeline downstream keeps
-seeing ticks in order with no gaps or repeats. On the very first call
-(since=None) everything currently in the table is returned, mirroring
-the old CSV replay behavior.
-"""
-
-import argparse
 from datetime import timedelta
 import os
 
@@ -29,50 +13,19 @@ try:
     from dotenv import load_dotenv
     load_dotenv(override=True)
 except ImportError:
-    # python-dotenv not installed — fine if the env vars are already set
+    # python-dotenv not installed - fine if the env vars are already set
     # some other way (shell export, systemd EnvironmentFile, etc).
     pass
 
 DEFAULT_MACHINE_ID = os.environ.get("DEFAULT_MACHINE_ID", "MACHINE-001").strip() or "MACHINE-001"
 
 
-def parse_args():
-    """
-    CLI overrides for the env vars below. Anything not passed on the
-    command line falls back to the corresponding PG_* env var.
-    Usage: python predict_realtime.py --host ... --user ... --password ...
-    """
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--host")
-    parser.add_argument("--port")
-    parser.add_argument("--db", dest="database")
-    parser.add_argument("--user")
-    parser.add_argument("--password")
-    parser.add_argument("--table")
-    args, _unknown = parser.parse_known_args()
-    return args
-
-
-def _env_only_args():
-    """Return empty DB CLI overrides for library/server callers.
-
-    Uvicorn and other host processes have their own --port/--host flags.
-    Parsing sys.argv here would accidentally treat those as PostgreSQL
-    settings (for example uvicorn --port 8000 becoming PG_PORT=8000).
-    Only predict_realtime.py explicitly calls parse_args() and passes the
-    result into get_connection/get_table_name.
-    """
-    return argparse.Namespace(host=None, port=None, database=None, user=None, password=None, table=None)
-
-
-def get_connection(args=None):
-    args = args if args is not None else _env_only_args()
-
-    host = args.host or os.environ.get("PG_HOST")
-    port = args.port or os.environ.get("PG_PORT", "5432")
-    database = args.database or os.environ.get("PG_DATABASE")
-    user = args.user or os.environ.get("PG_USER")
-    password = args.password or os.environ.get("PG_PASSWORD")
+def get_connection():
+    host = os.environ.get("PG_HOST")
+    port = os.environ.get("PG_PORT", "5432")
+    database = os.environ.get("PG_DATABASE")
+    user = os.environ.get("PG_USER")
+    password = os.environ.get("PG_PASSWORD")
 
     missing = [name for name, val in [
         ("host", host), ("database", database), ("user", user), ("password", password)
@@ -80,18 +33,31 @@ def get_connection(args=None):
     if missing:
         raise ValueError(
             f"Missing Postgres connection info: {', '.join(missing)}. "
-            f"Set PG_HOST/PG_DATABASE/PG_USER/PG_PASSWORD in .env, or pass "
-            f"--host/--db/--user/--password."
+            "Set PG_HOST/PG_DATABASE/PG_USER/PG_PASSWORD in .env."
         )
 
-    return psycopg2.connect(host=host, port=port, dbname=database, user=user, password=password)
+    connection = psycopg2.connect(
+        host=host,
+        port=port,
+        dbname=database,
+        user=user,
+        password=password,
+        connect_timeout=10,
+    )
+    # Keep the application's compact control plane isolated from the existing
+    # production sensor schema. PostgreSQL accepts a not-yet-created schema in
+    # search_path, so the first connection can still run db_schema.migrate().
+    connection.autocommit = True
+    with connection.cursor() as cursor:
+        cursor.execute('SET search_path TO "ML", public')
+    connection.autocommit = False
+    return connection
 
 
-def get_table_name(args=None):
-    args = args if args is not None else _env_only_args()
-    table = args.table or os.environ.get("PG_TABLE")
+def get_table_name():
+    table = os.environ.get("PG_TABLE")
     if not table:
-        raise ValueError("Missing table name. Set PG_TABLE in .env, or pass --table.")
+        raise ValueError("Missing table name. Set PG_TABLE in .env.")
     return table
 
 
@@ -101,7 +67,7 @@ def get_db_columns():
     config.py's CSV column names for config.RAW_SENSOR_COLS (confirmed to
     match); override any individual one via an env var named
     PG_COL_<COLUMN_NAME_UPPERCASED> in .env if the DB table ever names a
-    column differently — e.g. config.COL_A_RMS = "a_rms_mps2" is
+    column differently - e.g. config.COL_A_RMS = "a_rms_mps2" is
     overridden by PG_COL_A_RMS_MPS2. Generic over however many/whatever
     raw sensor columns config.py currently defines, so a future sensor
     swap only means editing config.RAW_SENSOR_COLS, not this function.
@@ -180,9 +146,23 @@ def fetch_machine_ids(conn, table: str, limit: int = 1000) -> list[str]:
     machine_column = get_db_columns()["machine_id"]
     if not machine_column:
         return [DEFAULT_MACHINE_ID]
+    # PostgreSQL normally implements SELECT DISTINCT by walking every entry in
+    # the source index. On a tens-of-millions-row sensor table that can exceed
+    # the website timeout even when there are only four machines. This loose
+    # index scan repeatedly seeks to the first value greater than the previous
+    # one, so work scales with the number of machines rather than source rows.
     query = sql.SQL(
-        "SELECT DISTINCT {machine} FROM {table} WHERE {machine} IS NOT NULL "
-        "ORDER BY {machine} LIMIT %s"
+        "WITH RECURSIVE discovered(machine_id) AS ("
+        " (SELECT {machine} FROM {table} WHERE {machine} IS NOT NULL "
+        "  ORDER BY {machine} LIMIT 1)"
+        " UNION ALL"
+        " SELECT (SELECT {machine} FROM {table} "
+        "         WHERE {machine} > discovered.machine_id "
+        "           AND {machine} IS NOT NULL "
+        "         ORDER BY {machine} LIMIT 1)"
+        " FROM discovered WHERE discovered.machine_id IS NOT NULL"
+        ") SELECT machine_id FROM discovered "
+        "WHERE machine_id IS NOT NULL LIMIT %s"
     ).format(
         machine=sql.Identifier(machine_column),
         table=sql.Identifier(table),
@@ -237,7 +217,7 @@ def fetch_new_rows(conn, table: str, since=None, limit: int = 5000):
     `(timestamp, machine_id)` cursor; legacy sources use a timestamp cursor.
 
     limit caps how many rows come back in one poll (protects against a
-    huge backlog — e.g. after downtime — flooding memory in one go; the
+    huge backlog - e.g. after downtime - flooding memory in one go; the
     watermark just picks up where it left off on the next 60s poll).
     """
     dbcols = get_db_columns()
@@ -274,58 +254,32 @@ def fetch_new_rows(conn, table: str, since=None, limit: int = 5000):
         return cur.fetchall()
 
 
-def fetch_rows_between(conn, table: str, start, end, limit: int | None = None, machine_id: str | None = None):
-    """
-    Returns rows with start <= timestamp < end, ordered ascending, as a
-    list of dicts keyed by the Postgres column names from
-    get_db_columns() — same row shape as fetch_new_rows().
-
-    Used by train_isolation_forest.py to pull an explicit, pinned
-    commissioning/reference window directly from the same table +
-    connection worker.py polls in production, instead of a separate
-    offline CSV (see config.REFERENCE_SOURCE). Unlike fetch_new_rows()'s
-    open-ended "everything newer than since", this always takes a closed
-    [start, end) range, so re-running training reads exactly the same
-    rows every time regardless of how much the table has grown since —
-    the range itself is what makes a live-sourced training run
-    reproducible, the same way a static CSV file's fixed content used to.
-
-    The default is intentionally uncapped. A previous 200,000-row default
-    silently truncated dense commissioning windows; several machines could
-    then train on different incomplete time spans. Callers may still provide
-    an explicit positive limit for diagnostic use.
-    """
+def count_rows_between(conn, table: str, start, end, machine_ids=None) -> int:
+    """Count a bounded source range using the production source index."""
     dbcols = get_db_columns()
-    cols = [dbcols["timestamp"]] + ([dbcols["machine_id"]] if dbcols["machine_id"] else []) + dbcols["sensor_cols"]
-    col_ident = sql.SQL(", ").join(sql.Identifier(c) for c in cols)
     table_ident = sql.Identifier(table)
     ts_ident = sql.Identifier(dbcols["timestamp"])
-
     machine_column = dbcols["machine_id"]
-    if machine_id and machine_column:
+    if machine_ids and machine_column:
         query = sql.SQL(
-            "SELECT {cols} FROM {table} WHERE {ts} >= %s AND {ts} < %s "
-            "AND {machine} = %s ORDER BY {ts} ASC"
+            "SELECT count(*) FROM {table} "
+            "WHERE {machine}=ANY(%s) AND {ts}>=%s AND {ts}<%s"
         ).format(
-            cols=col_ident, table=table_ident, ts=ts_ident,
+            table=table_ident,
             machine=sql.Identifier(machine_column),
+            ts=ts_ident,
         )
-        args = [start, end, machine_id]
-    elif machine_id and machine_id != DEFAULT_MACHINE_ID:
-        return []
+        args = (list(machine_ids), start, end)
+    elif machine_ids and not machine_column and DEFAULT_MACHINE_ID not in machine_ids:
+        return 0
     else:
         query = sql.SQL(
-            "SELECT {cols} FROM {table} WHERE {ts} >= %s AND {ts} < %s ORDER BY {ts} ASC"
-        ).format(cols=col_ident, table=table_ident, ts=ts_ident)
-        args = [start, end]
-    if limit is not None:
-        if int(limit) < 1:
-            raise ValueError("limit must be positive when provided")
-        query += sql.SQL(" LIMIT %s")
-        args.append(int(limit))
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute(query, tuple(args))
-        return cur.fetchall()
+            "SELECT count(*) FROM {table} WHERE {ts}>=%s AND {ts}<%s"
+        ).format(table=table_ident, ts=ts_ident)
+        args = (start, end)
+    with conn.cursor() as cur:
+        cur.execute(query, args)
+        return int(cur.fetchone()[0])
 
 
 def iter_row_chunks_between(
@@ -478,6 +432,11 @@ def fetch_recent_rows(conn, table: str, rows_per_machine: int = 30):
     A production worker restart should synchronize to the current source, not
     replay the table from its oldest row. Each machine gets enough independent
     history to rebuild rolling/Kalman state before incremental polling resumes.
+    Multi-machine sources are queried one machine at a time so PostgreSQL can
+    stop after ``rows_per_machine`` entries in the existing
+    ``(machine_id, timestamp)`` index. A partitioned ``row_number()`` query
+    would rank the entire source table before filtering and can stall startup
+    for minutes on production tables containing tens of millions of rows.
     """
     rows_per_machine = max(1, min(int(rows_per_machine), 10000))
     dbcols = get_db_columns()
@@ -489,25 +448,30 @@ def fetch_recent_rows(conn, table: str, rows_per_machine: int = 30):
     if dbcols["machine_id"]:
         machine_identifier = sql.Identifier(dbcols["machine_id"])
         query = sql.SQL(
-            "WITH ranked AS ("
-            " SELECT {columns}, row_number() OVER (PARTITION BY {machine} ORDER BY {timestamp} DESC) AS source_rank"
-            " FROM {table}"
-            ") SELECT {columns} FROM ranked WHERE source_rank <= %s "
-            "ORDER BY {timestamp}, {machine}"
+            "SELECT {columns} FROM {table} WHERE {machine} = %s "
+            "ORDER BY {timestamp} DESC LIMIT %s"
         ).format(
             columns=column_identifiers,
             machine=machine_identifier,
             timestamp=timestamp_identifier,
             table=table_identifier,
         )
+        machine_ids = fetch_machine_ids(conn, table, limit=10000)
+        rows = []
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            for machine_id in machine_ids:
+                cur.execute(query, (machine_id, rows_per_machine))
+                rows.extend(cur.fetchall())
+        rows.sort(key=lambda row: (row[dbcols["timestamp"]], str(row[dbcols["machine_id"]])))
+        return rows
     else:
         query = sql.SQL(
             "SELECT {columns} FROM (SELECT {columns} FROM {table} "
             "ORDER BY {timestamp} DESC LIMIT %s) recent ORDER BY {timestamp}"
         ).format(columns=column_identifiers, table=table_identifier, timestamp=timestamp_identifier)
 
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute(query, (rows_per_machine,))
-        return cur.fetchall()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(query, (rows_per_machine,))
+            return cur.fetchall()
 
 # End of database helpers.

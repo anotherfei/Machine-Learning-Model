@@ -23,24 +23,33 @@ Usage:
     python train_isolation_forest.py --full
     python train_isolation_forest.py --source live --start 2026-01-05T00:00:00Z --end 2026-01-07T00:00:00Z
     python train_isolation_forest.py --source live --all-machines --start 2026-01-05T00:00:00Z --end 2026-01-07T00:00:00Z
+    python train_isolation_forest.py --source live --all-machines --machine-workers 2 --start 2026-01-05T00:00:00Z --end 2026-01-07T00:00:00Z
     python train_isolation_forest.py --source live --machine-id MACHINE-001 --machine-id MACHINE-002 --start 2026-01-05T00:00:00Z --end 2026-01-07T00:00:00Z
     python train_isolation_forest.py --source csv
 """
 
 import argparse
+import json
+import multiprocessing
+import shutil
 import time
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 import config
 import db
+import db_schema
 import preprocessing
 import feature_engineering
 import artifact_utils
 import operating_state
 import machine_normalization
 import streaming_training
+import model_registry
+import runtime_config
+import simulation_jobs
 from isolation_forest import AnomalyScorer
 
 
@@ -97,10 +106,22 @@ def parse_args():
              "how many engineered rows are retained in memory."
     )
     parser.add_argument(
+        "--machine-workers", type=int, default=2,
+        help="Number of machines to scan concurrently in separate processes "
+             "for live training (default: 2). Use 2 first; higher values add "
+             "PostgreSQL, CPU, and memory pressure."
+    )
+    parser.add_argument(
         "--preview-reference", action="store_true",
         help="Load, normalize, feature-engineer, operating-state filter, and "
              "balance the live reference selection, then stop before fitting "
              "or writing model artifacts."
+    )
+    parser.add_argument(
+        "--model-name", default=None,
+        help="Optional operator-facing name shown in the website. The stable "
+             "technical version ID and artifact directory are generated "
+             "independently and do not change when this label is renamed."
     )
     return parser.parse_args()
 
@@ -116,10 +137,12 @@ def _fit_and_save(
     reference_rows=None,
     machine_reference_frames=None,
     machine_health_frames=None,
+    machine_validation_frames=None,
     machine_feature_normalizers=None,
     reference_features=None,
     validation_features=None,
     metadata_extra=None,
+    model_name=None,
 ):
     scorer = AnomalyScorer()
     scorer.fit(reference_df[feature_cols])
@@ -153,17 +176,116 @@ def _fit_and_save(
                   f"min: {local_health.min():.1f}, max: {local_health.max():.1f}, "
                   f"mean: {local_health.mean():.1f}")
 
-    artifact_utils.save_artifacts(
-        scorer,
-        feature_cols,
-        reference_timestamps=reference_df[config.COL_TIMESTAMP],
-        reference_rows=reference_rows,
-        reference_features=reference_features,
-        validation_features=validation_features,
-        machine_calibrations=machine_calibrations,
-        machine_feature_normalizers=machine_feature_normalizers,
-        metadata_extra=metadata_extra,
+    if not machine_validation_frames:
+        raise ValueError("Initial training requires independent per-machine validation holdouts.")
+    health_cut = float(runtime_config.get("MAINTENANCE_HEALTH_INSPECT"))
+    maximum_fp = artifact_utils.COMMISSIONING_MAX_HOLDOUT_FP_RATE
+    fp_by_machine = {}
+    all_passed = True
+    for machine_id, holdout in machine_validation_frames.items():
+        normalized_holdout = machine_normalization.transform(
+            holdout,
+            feature_cols,
+            machine_feature_normalizers[machine_id],
+            machine_id,
+        )
+        local_scorer = AnomalyScorer.from_calibration(
+            scorer.model, machine_calibrations[machine_id]["calibration"]
+        )
+        holdout_scores = local_scorer.score(normalized_holdout[feature_cols])
+        holdout_health = local_scorer.health_from_score(holdout_scores)
+        finite = np.isfinite(holdout_scores) & np.isfinite(holdout_health)
+        coverage = float(np.mean(finite)) if len(finite) else 0.0
+        fp_rate = (
+            float(np.mean(holdout_health[finite] <= health_cut))
+            if finite.any() else 1.0
+        )
+        passed = coverage == 1.0 and fp_rate <= maximum_fp
+        all_passed = all_passed and passed
+        fp_by_machine[machine_id] = {
+            "holdout_rows": len(holdout),
+            "finite_score_coverage": coverage,
+            "holdout_false_positive_rate": fp_rate,
+            "maximum_allowed_false_positive_rate": maximum_fp,
+            "condition_alert_threshold": health_cut,
+            "pass": passed,
+        }
+
+    validation_report = {
+        "validation_type": "initial_commissioning_forward_holdout",
+        "passed": all_passed,
+        "holdout_fraction": artifact_utils.VALIDATION_HOLDOUT_FRACTION,
+        "holdout_lineage": "commissioning_forward_holdout",
+        "holdout_rows": sum(len(frame) for frame in machine_validation_frames.values()),
+        "machines": sorted(machine_validation_frames),
+        "false_positive_evaluation": "independent_per_machine_absolute_gate",
+        "maximum_holdout_false_positive_rate": maximum_fp,
+        "reference_fp_by_machine": fp_by_machine,
+    }
+    version_id = model_registry.new_version_id()
+    target = Path(model_registry.bundle_path(version_id))
+    bundle_metadata = dict(metadata_extra or {})
+    bundle_metadata.update({
+        "version_id": version_id,
+        "validation_report": validation_report,
+    })
+    try:
+        artifact_utils.save_artifacts(
+            scorer,
+            feature_cols,
+            reference_timestamps=reference_df[config.COL_TIMESTAMP],
+            reference_rows=reference_rows,
+            reference_features=reference_features,
+            validation_features=validation_features,
+            machine_calibrations=machine_calibrations,
+            machine_feature_normalizers=machine_feature_normalizers,
+            metadata_extra=bundle_metadata,
+            directory=target,
+        )
+        connection = db.get_connection()
+        try:
+            db_schema.migrate(connection)
+            simulation_gate = simulation_jobs.evaluate_validation_suite(
+                connection, version_id
+            )
+            validation_report["labelled_simulation_evaluation"] = simulation_gate
+            validation_report["labelled_simulation_is_advisory"] = True
+            validation_report["passed"] = all_passed
+            metadata_path = target / "metadata.json"
+            stored_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            stored_metadata["validation_report"] = validation_report
+            metadata_path.write_text(
+                json.dumps(
+                    artifact_utils.to_json_safe(stored_metadata),
+                    indent=2,
+                    allow_nan=False,
+                ),
+                encoding="utf-8",
+            )
+            registered = model_registry.register_initial_bundle(
+                connection,
+                version_id,
+                validation_report,
+                display_name=model_name,
+            )
+        finally:
+            connection.close()
+    except Exception:
+        # Remove only an incomplete write. A complete immutable bundle is
+        # deliberately preserved when the later database registration fails;
+        # multi-hour training output must not be destroyed by a transient
+        # control-plane connection error.
+        if any(
+            not (target / filename).is_file()
+            for filename in model_registry.REQUIRED_BUNDLE_FILES
+        ):
+            shutil.rmtree(target, ignore_errors=True)
+        raise
+    print(
+        f"[train] Initial model {version_id} registered as {registered['status']} "
+        f"at {target}. Validation passed={validation_report['passed']}."
     )
+    return registered
 
 
 # ---------------------------------------------------------------------------
@@ -267,11 +389,17 @@ def _learn_streaming_operating_state(start, end, machine_id):
     for score in profile_frame["activity_score"].to_numpy(dtype=float):
         detector.observe_activity_score(score)
     if not detector.fit_history(require_sustained_low=False):
+        print(
+            f"[train] Machine {machine_id!r}: motion-regime diagnostics: "
+            f"{detector.last_fit_diagnostics}",
+            flush=True,
+        )
         raise ValueError(
             f"Machine {machine_id!r} has no clearly separable stationary and "
             "rotating vibration regimes in the selected window. Choose a "
             "window containing both regimes, or use --include-non-running "
-            "only when the entire range is independently confirmed running."
+            "only when the entire range is independently confirmed running. "
+            "The diagnostic line above identifies the rejected cluster rule."
         )
     _progress(machine_id, "motion profile complete", scanned, clean, started, force=True)
     print(
@@ -284,6 +412,7 @@ def _learn_streaming_operating_state(start, end, machine_id):
         "motion_profile_source_rows": scanned,
         "motion_profile_clean_rows": clean,
         "motion_profile_retained_rows": len(profile_frame),
+        "motion_profile_diagnostics": detector.last_fit_diagnostics,
     }
 
 
@@ -449,6 +578,36 @@ def _stream_live_machine(
     return retained, feature_cols, stats
 
 
+def _prepare_live_machine_task(task):
+    """Top-level, spawn-safe worker for one machine's complete two-pass scan."""
+    machine_id = task["machine_id"]
+    start = pd.Timestamp(task["start"])
+    end = pd.Timestamp(task["end"])
+    include_non_running = bool(task["include_non_running"])
+    if include_non_running:
+        detector = None
+        profile_stats = {
+            "motion_profile_source_rows": 0,
+            "motion_profile_clean_rows": 0,
+            "motion_profile_retained_rows": 0,
+            "motion_profile_bypassed": True,
+        }
+    else:
+        detector, profile_stats = _learn_streaming_operating_state(
+            start, end, machine_id
+        )
+    retained, feature_cols, machine_stats = _stream_live_machine(
+        start,
+        end,
+        machine_id,
+        detector=detector,
+        include_non_running=include_non_running,
+        use_full=bool(task["use_full"]),
+        retained_capacity=int(task["retained_capacity"]),
+    )
+    return machine_id, retained, feature_cols, {**profile_stats, **machine_stats}
+
+
 def _balanced_reference_pool(machine_reference_frames, max_rows_per_machine=None):
     counts = {machine_id: len(frame) for machine_id, frame in machine_reference_frames.items()}
     rows_per_machine = min(counts.values())
@@ -522,36 +681,60 @@ def _train_from_live(args):
             "forward validation both retain enough evidence."
         )
 
-    # Each machine is scanned independently so rolling windows, operating
-    # state, normalization, and validation can never cross asset boundaries.
-    for machine_id in machine_ids:
-        if args.include_non_running:
-            detector = None
-            profile_stats = {
-                "motion_profile_source_rows": 0,
-                "motion_profile_clean_rows": 0,
-                "motion_profile_retained_rows": 0,
-                "motion_profile_bypassed": True,
-            }
-        else:
-            detector, profile_stats = _learn_streaming_operating_state(
-                start, end, machine_id
-            )
-        retained, current_feature_cols, machine_stats = _stream_live_machine(
-            start,
-            end,
-            machine_id,
-            detector=detector,
-            include_non_running=args.include_non_running,
-            use_full=args.full,
-            retained_capacity=retained_capacity,
+    requested_workers = int(args.machine_workers)
+    if requested_workers < 1:
+        raise ValueError("--machine-workers must be at least 1.")
+    machine_workers = min(requested_workers, len(machine_ids))
+    tasks = [
+        {
+            "machine_id": machine_id,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "include_non_running": args.include_non_running,
+            "use_full": args.full,
+            "retained_capacity": retained_capacity,
+        }
+        for machine_id in machine_ids
+    ]
+
+    # Each task owns one machine's two passes, DB connections, operating state,
+    # and reservoir. Separate spawned processes provide actual CPU concurrency
+    # on Windows. Results are assembled in source-machine order afterward so
+    # parallel completion order cannot change the deterministic shared model.
+    results_by_machine = {}
+    if machine_workers == 1:
+        print("[train] Machine scan concurrency: 1 (sequential).", flush=True)
+        for task in tasks:
+            result = _prepare_live_machine_task(task)
+            results_by_machine[result[0]] = result
+    else:
+        print(
+            f"[train] Machine scan concurrency: {machine_workers} processes. "
+            "Progress lines will be interleaved by machine.",
+            flush=True,
         )
+        context = multiprocessing.get_context("spawn")
+        pool = context.Pool(processes=machine_workers)
+        try:
+            for result in pool.imap_unordered(_prepare_live_machine_task, tasks):
+                results_by_machine[result[0]] = result
+            pool.close()
+        except BaseException:
+            # Public Pool termination stops active child scans as well as queued
+            # tasks, avoiding orphaned PostgreSQL reads after Ctrl+C or failure.
+            pool.terminate()
+            raise
+        finally:
+            pool.join()
+
+    for machine_id in machine_ids:
+        _, retained, current_feature_cols, machine_stats = results_by_machine[machine_id]
         if feature_cols is None:
             feature_cols = current_feature_cols
         elif current_feature_cols != feature_cols:
             raise ValueError(f"Feature columns differ for machine {machine_id!r}.")
         machine_reference_frames[machine_id] = retained
-        streaming_stats[machine_id] = {**profile_stats, **machine_stats}
+        streaming_stats[machine_id] = machine_stats
 
     balanced_frames, retained_counts, rows_per_machine = _balanced_reference_pool(
         machine_reference_frames, retained_capacity
@@ -607,7 +790,9 @@ def _train_from_live(args):
         validation_features=validation_features,
         machine_reference_frames=normalized_training_frames,
         machine_health_frames=normalized_health_frames,
+        machine_validation_frames=validation_frames,
         machine_feature_normalizers=machine_feature_normalizers,
+        model_name=args.model_name,
         metadata_extra={
             "training_mode": "balanced_pooled" if len(machine_ids) > 1 else "single_machine",
             "training_machine_ids": machine_ids,
@@ -631,6 +816,7 @@ def _train_from_live(args):
             "training_db_slice_hours": config.TRAINING_DB_SLICE_HOURS,
             "training_reservoir_capacity_per_machine": retained_capacity,
             "training_reservoir_seed": config.TRAINING_RESERVOIR_SEED,
+            "machine_scan_workers": machine_workers,
             "isolation_forest_params": config.ISOLATION_FOREST_PARAMS,
             "model_feature_space": machine_normalization.METHOD,
             "reference_window_start": start.isoformat(),
@@ -719,7 +905,9 @@ def _train_from_csv(args):
         validation_features=validation_features,
         machine_reference_frames={machine_id: normalized_reference},
         machine_health_frames={machine_id: normalized_full},
+        machine_validation_frames={machine_id: validation_reference},
         machine_feature_normalizers=machine_feature_normalizers,
+        model_name=args.model_name,
         metadata_extra={
             "training_mode": "single_machine_csv",
             "training_machine_ids": [machine_id],
@@ -742,6 +930,18 @@ def main():
         raise ValueError(
             "--include-non-running and --preview-reference are live-source options."
         )
+    if source != "live" and args.machine_workers != 1:
+        raise ValueError("--machine-workers is available only for live-source training.")
+
+    # Load the same persisted policy used by the worker before calculating
+    # commissioning holdout outcomes. Registration later reuses this schema;
+    # doing it up front prevents a web override from being silently replaced
+    # by config.py defaults during initial validation.
+    policy_connection = db.get_connection()
+    try:
+        db_schema.migrate(policy_connection)
+    finally:
+        policy_connection.close()
 
     if source == "live":
         _train_from_live(args)

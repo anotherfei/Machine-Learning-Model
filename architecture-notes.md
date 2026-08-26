@@ -19,7 +19,13 @@ commissioning window. Where that window comes from is `config.REFERENCE_SOURCE`:
   Use `--all-machines` to discover all source machine IDs, or repeat
   `--machine-id` to select an explicit subset. Large ranges use two bounded
   streaming passes per machine. The first considers every clean source row
-  while learning a bounded motion profile. The second preserves the previous
+  while learning a bounded motion profile. Rare low-motion initializations and
+  robust within-regime spread allow short genuine shutdown periods to remain
+  detectable. Long commissioning ranges use a separate robust separation-
+  quality floor because normal RUNNING speed/load variation is much broader
+  over months than in the short live detector history; minimum center-ratio
+  and chronological STOPPED confirmation rules remain unchanged.
+  The second preserves the previous
   `WINDOW_SIZE-1` clean rows across database chunks, so rolling features are
   identical to full-trajectory feature construction, then automatically gates
   invalid/non-running/spec-ineligible rows. Every eligible row receives a
@@ -27,11 +33,21 @@ commissioning window. Where that window comes from is `config.REFERENCE_SOURCE`:
   remains representative without loading the source range into memory. The
   retained pools are balanced to the same count before they are combined,
   preventing the highest-volume machine from dominating the shared forest.
+  Initial scans run sequentially by default; `--machine-workers N` can execute
+  independent machine tasks in spawned processes. Results are reassembled in
+  source-machine order before normalization/fitting, and a failed or cancelled
+  task terminates the complete process pool so no DB scan is orphaned.
   The newest balanced 20% (at least 20 rows per machine) is reserved as a
   forward validation holdout before normalizer, tree, or condition-anchor
-  fitting. `artifact_utils.save_artifacts()` records the fit and validation
-  feature tables separately, plus machine counts and row identities, for
-  auditability.
+  fitting. The completed model is tested independently on that holdout for
+  finite score coverage and per-machine false-alert rate. If a labelled
+  simulation suite is configured, that suite is replayed as a separate
+  advisory score.
+  `artifact_utils.save_artifacts()` records the fit and validation feature
+  tables separately, plus machine counts and row identities, directly in a
+  new immutable `artifacts/versions/<version_id>` bundle. The completed bundle
+  is registered and selected through `active.json`; validation remains
+  advisory and the artifact root is not a temporary duplicate.
 - **`"csv"`** — the original offline-file behavior, reading
   `config.RAW_DATA_PATH`. Kept for offline experimentation and for CI/test
   fixtures that shouldn't need a reachable database.
@@ -70,8 +86,8 @@ retrain; newly commissioned bundles have it from initial training.
 
 Only alerts that an operator marks `confirmed_normal` become retraining
 candidates. The scheduler evaluates the batch and age thresholds per machine.
-Its evaluation interval and the regression-test window created from a flagged
-near miss are runtime policy stored in PostgreSQL and editable by an admin.
+Its evaluation interval is runtime policy stored in PostgreSQL and editable by
+an admin.
 Candidates are cosine-deduplicated only against candidates from the same
 machine, then merged into that machine's reference. Rebalancing gives every
 machine the same row count and prioritizes new confirmed-normal rows when old
@@ -80,32 +96,98 @@ samples because those are a biased slice of its operating distribution. Add a
 new machine by rerunning balanced initial training with a confirmed-healthy
 commissioning window.
 
-Each shadow model must pass the confirmed-normal false-positive gate for every
-machine independently. Permanent false-negative regression windows are rebuilt
-from the matching machine's live raw rows, transformed with that machine's
-proposed normalizer, and scored with its proposed automatic anchor. A shadow
-is promotable only if every machine-level holdout gate and every regression test
-passes. Promotion switches the shared tree, machine normalizers, and condition
-anchors together.
+Each shadow model receives a confirmed-normal false-positive score for every
+machine independently. When an Accuracy Simulation draft is designated as the
+validation suite, the shadow also replays every labelled range and records
+accuracy, coverage, lead-time checks, unscored/error ranges, false alerts, and
+premature CRITICAL results. Both evaluations are advisory and do not block
+promotion. Promotion switches the shared tree, machine normalizers, and
+condition anchors together; the administrator uses the displayed evidence to
+decide.
 
 The scheduler and manual web action enqueue `retrain_jobs`; training does not
 run inside the HTTP request. A PostgreSQL advisory lock plus the active-job
-index enforce one fleet training process at a time. A passed shadow stages the
-candidate IDs in `model_version_candidates`. They remain pending until an
+index enforce one fleet training process at a time. A completed shadow stages the
+candidate prediction IDs through `spindle_predictions.candidate_model_version`.
+They remain pending until an
 administrator promotes that exact shadow, when they are consumed in the same
 database transaction as activation. Deleting the shadow releases them. Only
 one shadow can await a decision, so multiple proposals cannot reserve disjoint
 candidate sets. Automatic retries suppress an unchanged validation rejection;
 unexpected failures use the configured cooldown. Candidate IDs, active model,
-material policy, pipeline hash, retraining-protocol source hash, and active
-regression tests form the attempt fingerprint, so genuinely new evidence or
-deployed validation logic is not blocked by an older result.
+material policy, pipeline hash, and retraining-protocol source hash form the
+attempt fingerprint, so genuinely new evidence or deployed validation logic is
+not blocked by an older result.
+
+## Historical accuracy simulation
+
+`"ML".simulation_runs` stores reusable model-independent event-list drafts, the
+single optional model-validation-suite designation, queued work, progress, the
+explicitly selected model version and runtime-policy snapshot, event evidence,
+and the final report. One row owns the complete lifecycle so no separate case,
+template, or result table is required. The scheduler runs only one replay at a
+time. API restart requeues an interrupted run and clears its partial case
+results before replaying it deterministically. A version with saved non-draft
+simulation runs cannot be deleted, so the pinned report never loses its model
+identity or immutable artifact bundle.
+
+The replay reads the production PostgreSQL sensor source without modifying it;
+only simulation lifecycle state is written to `"ML".simulation_runs`. Each case builds
+the same per-machine motion gate and `SpindleMonitor` used by the worker, using
+context before a seven-day causal lead window for motion profiling and warm-up.
+The replay continues through the end of the labelled event. Pure rolling-feature,
+normalization, and Isolation Forest phases use the shared bounded inference
+batch size; stateful motion, condition, trend, and policy phases retain original
+timestamp order. No source rows are sampled. Event accuracy
+compares the human label with the time-weighted dominant production state
+inside the range and requires at least 50% labelled-state duration coverage;
+mean coverage is reported separately. Lead-time compliance uses event onset to check planning WARN timing,
+urgent CRITICAL timing, premature escalation, and false alarms. This is
+evaluation evidence only and cannot promote a model.
+
+The active case publishes a throttled heartbeat into its existing JSON payload,
+including phase, timeline progress, row count, throughput, elapsed time, ETA,
+and the newest reached source timestamp. This makes slow model scoring visibly
+different from a job that stopped reporting without adding another table.
 
 ## Production
 
 `React/Vite -> FastAPI -> PostgreSQL` for control-plane requests and history.
 
-The production worker runs separately and owns `SpindleMonitor`, feature engineering, anomaly scoring, health estimation, forecasting, and maintenance recommendation. Results are written to `spindle_predictions` and streamed to the UI.
+The production control plane owns only six tables in the dedicated `"ML"`
+schema: `spindle_predictions`, `model_versions`, `retrain_jobs`,
+`simulation_runs`, `app_users`, and `state`. Prediction review/candidate lifecycle is one-to-one with its
+originating prediction and therefore stays on that row. Machine calibrations
+remain inside each immutable artifact bundle. The keyed `state` table
+holds runtime policy, latest per-machine operating state, environment audit
+records, bounded operator motion confirmations, and one replaceable sequential-catch-up progress document. The raw
+sensor source remains in its existing schema.
+
+The production worker runs separately and owns `SpindleMonitor`, feature engineering, anomaly scoring, health estimation, forecasting, and maintenance recommendation. Results are written to `"ML".spindle_predictions` and streamed to the UI.
+
+An optional startup catch-up runs sequentially inside the production worker. It
+captures a fixed source watermark, pins the active model, inserts only missing
+`(machine, timestamp, model version)` predictions, and retains every bounded
+per-machine runtime object created by the replay. Those exact rolling, Kalman,
+trend, operating-state, and debounce objects continue into incremental polling,
+so there is no second warm-up or state discontinuity at handoff. Larger bounded
+source chunks, vectorized feature/model scoring, incremental trend statistics,
+and batched inserts improve throughput without sampling readings or creating a
+second inference implementation. Realtime calls the same batch-capable monitor
+with a batch of one. An indexed bounded count supplies the historical total;
+newer rows that arrive after the fixed watermark are reported and drained as a
+separate open-ended phase.
+The supervisor publishes `launching` before the worker starts. The job then
+atomically publishes live progress to `artifacts/runtime/backfill_status.json`;
+FastAPI reads that authoritative local document for the global frontend
+notification so a busy PostgreSQL source cannot block observability. A legacy
+`state` value is only a compatibility fallback when the document does not yet
+exist. Worker connection attempts and preparation queries are bounded, so the
+notification reaches `failed` with evidence rather than waiting indefinitely.
+Model switches restart the replay. Mutable
+inference/environment policy is locked by the API until handoff, and a compact
+database/file revision fingerprint closes the startup race and restarts the
+replay if that context changes.
 
 ## Temporary mock mode
 

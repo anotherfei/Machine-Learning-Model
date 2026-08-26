@@ -31,16 +31,10 @@ ARTIFACTS_DIR = os.path.join(ROOT_DIR, "artifacts")
 # Generated outputs for a human to look at (realtime prediction log,
 # validation report) — distinct from ARTIFACTS_DIR, which is what the
 # model needs to run, not what running it produced.
-RESULTS_DIR = os.path.join(ROOT_DIR, "results")
 
 RAW_DATA_PATH = os.path.join(RAW_DATA_DIR, "spindle_train.csv")
 PROCESSED_DATA_PATH = os.path.join(PROCESSED_DATA_DIR, "processed.csv")
 FEATURES_DATA_PATH = os.path.join(PROCESSED_DATA_DIR, "features.csv")
-REALTIME_PREDICTIONS_PATH = os.path.join(RESULTS_DIR, "realtime_predictions.csv")
-VALIDATION_REPORT_PATH = os.path.join(RESULTS_DIR, "validation_report.png")
-
-PREDICT_DATA_PATH = os.path.join(RAW_DATA_DIR, "spindle_given.csv")
-
 # ---------------------------------------------------------------------------
 # Raw column names
 # ---------------------------------------------------------------------------
@@ -205,6 +199,22 @@ TRAINING_MAX_ROWS_PER_MACHINE = 100_000
 TRAINING_RESERVOIR_SEED = 42
 
 # ---------------------------------------------------------------------------
+# Web-editable review and shared-model retraining defaults
+# ---------------------------------------------------------------------------
+# runtime_config.py persists operator overrides, but the defaults live here so
+# production, Demo, schedulers, and validators cannot acquire different values.
+NEAR_MISS_TREND_WINDOW_HOURS = 6
+RETRAIN_BATCH_SIZE = 50
+RETRAIN_TIME_CAP_DAYS = 30
+REFERENCE_WINDOW_MONTHS = 6
+REFERENCE_DEDUP_WINDOW_HOURS = 24
+REFERENCE_COSINE_SIMILARITY = 0.98
+RETRAIN_CHECK_INTERVAL_MINUTES = 60
+RETRAIN_RETRY_COOLDOWN_HOURS = 24
+RETRAIN_MAX_FP_RATE_INCREASE = 0.02
+AUTO_RETRAIN_ENABLED = True
+
+# ---------------------------------------------------------------------------
 # Isolation Forest
 # ---------------------------------------------------------------------------
 ISOLATION_FOREST_PARAMS = {
@@ -232,7 +242,7 @@ HEALTH_SENSITIVITY_STD = 4.0
 
 # How often the production worker checks PostgreSQL for newly ingested rows.
 # This is independent of the sensor's own sample cadence.
-WORKER_POLL_SECONDS = 60
+WORKER_POLL_SECONDS = 1
 
 # ---------------------------------------------------------------------------
 # Kalman filter — denoises the raw health-percentage signal into a
@@ -333,18 +343,18 @@ REMAINING_DAYS_CAP = 90
 # consecutive condition innovations using their real timestamp intervals; the
 # regression residual level is deliberately not reused as per-step noise.
 #
-# Horizons remain conservatively restricted to <=1 day. The current
-# first-passage forecast replaced an older terminal-state calculation, so
-# historical calibration claims from that old formulation do not transfer.
-# Do not extend the horizon or interpret these values as empirical failure
-# frequencies until they are validated against timestamped maintenance/failure
-# outcomes from the real fleet.
-FAILURE_PROB_HORIZONS_DAYS = [0.25, 0.5, 0.75, 1]
+# Short horizons drive urgent decisions; broader horizons provide planning
+# visibility up to one week. These are model-based first-passage risks, not
+# empirical failure frequencies. Validate the longer horizons against labelled
+# fleet outcomes with Accuracy simulation before relying on their numeric value.
+FAILURE_PROB_HORIZONS_DAYS = [0.25, 0.5, 0.75, 1, 7]
 
 # ---------------------------------------------------------------------------
 # Maintenance recommendation rules
 # ---------------------------------------------------------------------------
-MAINTENANCE_HORIZON_DAYS = 1          # "how soon" horizon the rules check against — kept within the conservative <=1 day range above
+MAINTENANCE_HORIZON_DAYS = 7          # planned-maintenance WARN look-ahead
+MAINTENANCE_URGENT_HORIZON_DAYS = 1   # CRITICAL remains a near-term decision
+MAINTENANCE_URGENT_HORIZON_MAX_DAYS = 1
 MAINTENANCE_PROB_URGENT = 0.80       # model-estimated boundary-crossing risk -> urgent
 MAINTENANCE_PROB_PLAN = 0.60         # -> plan maintenance
 # MAINTENANCE_REMAINING_DAYS_URGENT removed as an independent CRITICAL
@@ -376,6 +386,11 @@ OPERATING_STATE_MIN_CLUSTER_ROWS = 10
 OPERATING_STATE_MIN_CLUSTER_FRACTION = 0.005
 OPERATING_STATE_MIN_LOG_SEPARATION = 0.45
 OPERATING_STATE_MIN_SEPARATION_QUALITY = 2.5
+# Months-long commissioning profiles contain far more legitimate within-RUNNING
+# speed/load variation than the short live history. A lower robust-MAD quality
+# floor is allowed only for that offline profile; the center ratio and
+# chronological STOPPED/STARTING confirmation rules still apply unchanged.
+OPERATING_STATE_COMMISSIONING_MIN_SEPARATION_QUALITY = 1.5
 OPERATING_STATE_REFIT_TICKS = 5
 OPERATING_STATE_STOP_CONFIRM_TICKS = 5
 OPERATING_STATE_START_CONFIRM_TICKS = 3
@@ -384,17 +399,10 @@ OPERATING_STATE_START_CONFIRM_TICKS = 3
 # The API reports NO_DATA when the newest source row is older than this.
 SOURCE_STALE_SECONDS = 3 * 60
 
-# Hysteresis on the trend/failure-probability trigger only — NOT on
-# health_percent-based triggers (FAILURE_HEALTH_THRESHOLD,
-# MAINTENANCE_HEALTH_INSPECT), which stay instant because they're already
-# the Kalman-smoothed signal and don't need a second smoothing pass (see
-# maintenance.MaintenanceDebouncer). Escalation needs
-# MAINTENANCE_TREND_DEBOUNCE_TICKS consecutive confirming ticks;
-# de-escalation needs the longer MAINTENANCE_TREND_RECOVERY_TICKS —
-# standard fast-to-alarm, slow-to-clear alarm-management practice, so a
-# genuine escalation isn't reported late but a momentary dip doesn't
-# report "all clear" prematurely. Starting points, not fit to data beyond
-# the spindle_train.csv sanity check above — same caveat as every other
-# *_TICKS constant in this file.
-MAINTENANCE_TREND_DEBOUNCE_TICKS = 5
-MAINTENANCE_TREND_RECOVERY_TICKS = 15
+# Timestamp-based confirmation applies to direct condition and forecast rules.
+# Sustained critical evidence first raises WARN, then advances to CRITICAL if it
+# continues. Recovery is longest to prevent state flapping. Durations use
+# sensor timestamps, not row counts.
+MAINTENANCE_WARN_CONFIRM_MINUTES = 5
+MAINTENANCE_CRITICAL_CONFIRM_MINUTES = 10
+MAINTENANCE_RECOVERY_MINUTES = 10

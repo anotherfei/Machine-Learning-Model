@@ -1,7 +1,10 @@
 param(
     [switch]$Mock,
     [switch]$NoFrontend,
-    [int]$ApiPort = 8000
+    [int]$ApiPort = 8000,
+    [Alias("Days")]
+    [ValidateRange(0, 3650)]
+    [int]$BackfillDays = 0
 )
 
 $ErrorActionPreference = "Stop"
@@ -19,6 +22,12 @@ if (-not $Mock -and -not (Test-Path ".env")) {
 $launcherArgs = @("local_launcher.py", "--api-port", "$ApiPort")
 if ($Mock) { $launcherArgs += "--mock" }
 if ($NoFrontend) { $launcherArgs += "--no-frontend" }
+if ($BackfillDays -gt 0) {
+    if ($Mock) {
+        throw "-BackfillDays is available only in production mode. Demo history is already seeded."
+    }
+    $launcherArgs += @("--backfill-days", "$BackfillDays")
+}
 
 & $python @launcherArgs
 exit $LASTEXITCODE

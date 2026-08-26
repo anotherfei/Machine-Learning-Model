@@ -22,6 +22,7 @@ import json
 import hashlib
 import datetime
 import math
+from pathlib import Path
 import joblib
 import pandas as pd
 
@@ -33,9 +34,23 @@ import config
 # than an in-place website setting change.
 VALIDATION_HOLDOUT_FRACTION = 0.20
 VALIDATION_HOLDOUT_MIN_ROWS = 20
+COMMISSIONING_MAX_HOLDOUT_FP_RATE = 0.10
 
 FEATURE_ENGINEERING_SOURCE_PATH = os.path.join(config.ROOT_DIR, "feature_engineering.py")
 MACHINE_NORMALIZATION_SOURCE_PATH = os.path.join(config.ROOT_DIR, "machine_normalization.py")
+
+
+def active_artifacts_dir() -> str:
+    """Resolve the immutable bundle selected by ``artifacts/active.json``.
+
+    The root artifact directory remains a narrow pre-registration staging
+    fallback so a freshly completed manual training can be registered by the
+    API. Once a pointer exists, every production reader uses its version folder.
+    """
+    import model_registry  # local import keeps registry utilities lightweight
+
+    selected = model_registry.active_bundle_path(required=False)
+    return str(selected) if selected is not None else config.ARTIFACTS_DIR
 
 
 def _pipeline_source_hash() -> str:
@@ -66,27 +81,71 @@ def to_json_safe(value):
     return value
 
 
-def _write_optional_json(filename: str, payload) -> bool:
+def finite_float(value):
+    """Return one finite native float, or ``None`` for invalid JSON/DB input."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _write_optional_json(directory, filename: str, payload) -> bool:
     """Write an optional artifact, removing an older stale copy if absent."""
-    path = os.path.join(config.ARTIFACTS_DIR, filename)
+    path = Path(directory) / filename
     if payload is None:
-        if os.path.exists(path):
-            os.remove(path)
+        path.unlink(missing_ok=True)
         return False
-    with open(path, "w") as f:
+    with path.open("w", encoding="utf-8") as f:
         json.dump(to_json_safe(payload), f, indent=2, allow_nan=False)
     return True
 
 
-def _write_optional_csv(filename: str, frame) -> bool:
+def _write_optional_csv(directory, filename: str, frame) -> bool:
     """Write an optional table artifact, removing an older stale copy if absent."""
-    path = os.path.join(config.ARTIFACTS_DIR, filename)
+    path = Path(directory) / filename
     if frame is None:
-        if os.path.exists(path):
-            os.remove(path)
+        path.unlink(missing_ok=True)
         return False
     frame.to_csv(path, index=False)
     return True
+
+
+def _validate_machine_context(machine_calibrations, machine_feature_normalizers) -> None:
+    if not machine_calibrations or not machine_feature_normalizers:
+        raise ValueError("A model bundle requires machine calibrations and feature normalizers.")
+    if set(machine_calibrations) != set(machine_feature_normalizers):
+        raise ValueError(
+            "Machine condition anchors and feature normalizers must cover "
+            "the same commissioned machines."
+        )
+
+
+def write_core_bundle(
+    directory,
+    scorer,
+    feature_columns,
+    metadata,
+    machine_calibrations,
+    machine_feature_normalizers,
+) -> None:
+    """Write the required files shared by manual training and retraining."""
+    _validate_machine_context(machine_calibrations, machine_feature_normalizers)
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    joblib.dump(scorer.model, directory / "isolation_forest.pkl")
+    payloads = {
+        "feature_columns.json": feature_columns,
+        "calibration.json": scorer.calibration(),
+        "metadata.json": metadata,
+        "machine_calibrations.json": machine_calibrations,
+        "machine_feature_normalizers.json": machine_feature_normalizers,
+    }
+    for filename, payload in payloads.items():
+        (directory / filename).write_text(
+            json.dumps(to_json_safe(payload), indent=2, allow_nan=False),
+            encoding="utf-8",
+        )
 
 
 def save_artifacts(
@@ -99,6 +158,7 @@ def save_artifacts(
     machine_calibrations=None,
     machine_feature_normalizers=None,
     metadata_extra: dict | None = None,
+    directory=None,
 ):
     """
     scorer: a fitted isolation_forest.AnomalyScorer.
@@ -120,35 +180,19 @@ def save_artifacts(
     machine_feature_normalizers: required per-machine robust feature-space
         transforms used before every fit/score call.
     metadata_extra: training-strategy provenance added to metadata.json.
+    directory: immutable bundle destination. Initial training passes a
+        directory under artifacts/versions; the artifact root is retained
+        only as a backwards-compatible default for older callers.
     """
-    if not machine_calibrations:
-        raise ValueError(
-            "At least one automatic machine condition anchor is required."
-        )
-    if not machine_feature_normalizers:
-        raise ValueError(
-            "At least one machine feature normalizer is required."
-        )
-    if set(machine_calibrations) != set(machine_feature_normalizers):
-        raise ValueError(
-            "Machine condition anchors and feature normalizers must cover "
-            "the same commissioned machines."
-        )
+    _validate_machine_context(machine_calibrations, machine_feature_normalizers)
 
-    os.makedirs(config.ARTIFACTS_DIR, exist_ok=True)
-
-    joblib.dump(scorer.model, os.path.join(config.ARTIFACTS_DIR, "isolation_forest.pkl"))
-
-    with open(os.path.join(config.ARTIFACTS_DIR, "feature_columns.json"), "w") as f:
-        json.dump(feature_columns, f, indent=2)
-
-    with open(os.path.join(config.ARTIFACTS_DIR, "calibration.json"), "w") as f:
-        json.dump(to_json_safe(scorer.calibration()), f, indent=2, allow_nan=False)
+    directory = Path(directory or config.ARTIFACTS_DIR)
+    directory.mkdir(parents=True, exist_ok=True)
 
     ts_list = None
     if reference_timestamps is not None:
         ts_list = [pd.Timestamp(t).isoformat() for t in reference_timestamps]
-    _write_optional_json("reference_timestamps.json", ts_list)
+    _write_optional_json(directory, "reference_timestamps.json", ts_list)
 
     normalized_reference_rows = None
     if reference_rows is not None:
@@ -159,14 +203,9 @@ def save_artifacts(
             }
             for row in reference_rows
         ]
-    wrote_reference_rows = _write_optional_json("reference_rows.json", normalized_reference_rows)
-    wrote_reference_features = _write_optional_csv("reference_features.csv", reference_features)
-    wrote_validation_features = _write_optional_csv("validation_features.csv", validation_features)
-    wrote_machine_calibrations = _write_optional_json("machine_calibrations.json", machine_calibrations)
-    wrote_machine_normalizers = _write_optional_json(
-        "machine_feature_normalizers.json", machine_feature_normalizers
-    )
-
+    wrote_reference_rows = _write_optional_json(directory, "reference_rows.json", normalized_reference_rows)
+    wrote_reference_features = _write_optional_csv(directory, "reference_features.csv", reference_features)
+    wrote_validation_features = _write_optional_csv(directory, "validation_features.csv", validation_features)
     metadata = {
         "trained_at": datetime.datetime.utcnow().isoformat(),
         "n_features": len(feature_columns),
@@ -180,8 +219,14 @@ def save_artifacts(
         "has_reference_timestamps": reference_timestamps is not None,
     }
     metadata.update(metadata_extra or {})
-    with open(os.path.join(config.ARTIFACTS_DIR, "metadata.json"), "w") as f:
-        json.dump(metadata, f, indent=2)
+    write_core_bundle(
+        directory,
+        scorer,
+        feature_columns,
+        metadata,
+        machine_calibrations,
+        machine_feature_normalizers,
+    )
 
     extras = []
     if reference_timestamps is not None:
@@ -192,33 +237,34 @@ def save_artifacts(
         extras.append("reference_features.csv")
     if wrote_validation_features:
         extras.append("validation_features.csv")
-    if wrote_machine_calibrations:
-        extras.append("machine_calibrations.json")
-    if wrote_machine_normalizers:
-        extras.append("machine_feature_normalizers.json")
+    extras.extend(("machine_calibrations.json", "machine_feature_normalizers.json"))
     extra = f", {', '.join(extras)}" if extras else ""
     print(f"[save_artifacts] Saved isolation_forest.pkl, calibration.json, "
-          f"feature_columns.json, metadata.json{extra} -> {config.ARTIFACTS_DIR}")
+          f"feature_columns.json, metadata.json{extra} -> {directory}")
+    return metadata
 
 
-def load_artifacts():
+def load_artifacts(base_dir: str | None = None):
     """Load the shared model and its bundled automatic pooled anchor.
 
     Production applies the bundled automatic per-machine anchor separately in
     worker.py. Manual/local calibration overrides are deliberately unsupported.
+    ``base_dir`` lets a historical simulation pin a versioned bundle without
+    installing it over the live model files.
     """
     from isolation_forest import AnomalyScorer  # local import avoids a circular import
 
-    model_path = os.path.join(config.ARTIFACTS_DIR, "isolation_forest.pkl")
+    base_dir = base_dir or active_artifacts_dir()
+    model_path = os.path.join(base_dir, "isolation_forest.pkl")
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"No trained model found at {model_path}. Run train_isolation_forest.py first.")
 
     model = joblib.load(model_path)
 
-    with open(os.path.join(config.ARTIFACTS_DIR, "feature_columns.json")) as f:
+    with open(os.path.join(base_dir, "feature_columns.json")) as f:
         feature_columns = json.load(f)
 
-    with open(os.path.join(config.ARTIFACTS_DIR, "metadata.json")) as f:
+    with open(os.path.join(base_dir, "metadata.json")) as f:
         metadata = json.load(f)
 
     stored_hash = metadata.get("pipeline_hash", metadata.get("feature_config_hash"))
@@ -234,7 +280,7 @@ def load_artifacts():
             f"model was trained. Retrain the model or revert the change before predicting."
         )
 
-    with open(os.path.join(config.ARTIFACTS_DIR, "calibration.json")) as f:
+    with open(os.path.join(base_dir, "calibration.json")) as f:
         calibration = json.load(f)
     print("[load_artifacts] Calibration source: bundled automatic anchor")
 
@@ -242,7 +288,7 @@ def load_artifacts():
     return scorer, feature_columns, metadata
 
 
-def load_reference_timestamps():
+def load_reference_timestamps(base_dir: str | None = None):
     """
     Returns the pd.Timestamp index of rows actually used to train the
     currently-saved model — whatever selection method produced them —
@@ -251,7 +297,7 @@ def load_reference_timestamps():
     not silently, since a stale/reconstructed window is exactly the bug
     this function exists to avoid).
     """
-    path = os.path.join(config.ARTIFACTS_DIR, "reference_timestamps.json")
+    path = os.path.join(base_dir or active_artifacts_dir(), "reference_timestamps.json")
     if not os.path.exists(path):
         return None
     with open(path) as f:
@@ -259,18 +305,18 @@ def load_reference_timestamps():
     return pd.to_datetime(pd.Series(ts_list))
 
 
-def load_reference_rows():
+def load_reference_rows(base_dir: str | None = None):
     """Return machine-aware training-row identities, or None for old bundles."""
-    path = os.path.join(config.ARTIFACTS_DIR, "reference_rows.json")
+    path = os.path.join(base_dir or active_artifacts_dir(), "reference_rows.json")
     if not os.path.exists(path):
         return None
     with open(path) as f:
         return json.load(f)
 
 
-def load_machine_calibrations(required: bool = True):
+def load_machine_calibrations(required: bool = True, base_dir: str | None = None):
     """Load automatic per-machine condition anchors bundled with the model."""
-    path = os.path.join(config.ARTIFACTS_DIR, "machine_calibrations.json")
+    path = os.path.join(base_dir or active_artifacts_dir(), "machine_calibrations.json")
     if not os.path.exists(path):
         if required:
             raise FileNotFoundError(
@@ -282,9 +328,9 @@ def load_machine_calibrations(required: bool = True):
         return json.load(f)
 
 
-def load_machine_feature_normalizers(required: bool = True):
+def load_machine_feature_normalizers(required: bool = True, base_dir: str | None = None):
     """Load the per-machine feature transforms bundled with the model."""
-    path = os.path.join(config.ARTIFACTS_DIR, "machine_feature_normalizers.json")
+    path = os.path.join(base_dir or active_artifacts_dir(), "machine_feature_normalizers.json")
     if not os.path.exists(path):
         if required:
             raise FileNotFoundError(
@@ -296,9 +342,9 @@ def load_machine_feature_normalizers(required: bool = True):
         return json.load(f)
 
 
-def load_reference_features():
+def load_reference_features(base_dir: str | None = None):
     """Load the exact machine-aware feature corpus used to fit the model."""
-    path = os.path.join(config.ARTIFACTS_DIR, "reference_features.csv")
+    path = os.path.join(base_dir or active_artifacts_dir(), "reference_features.csv")
     if not os.path.exists(path):
         return None
     return pd.read_csv(
@@ -308,9 +354,9 @@ def load_reference_features():
     )
 
 
-def load_validation_features():
+def load_validation_features(base_dir: str | None = None):
     """Load confirmed-normal rows deliberately excluded from model fitting."""
-    path = os.path.join(config.ARTIFACTS_DIR, "validation_features.csv")
+    path = os.path.join(base_dir or active_artifacts_dir(), "validation_features.csv")
     if not os.path.exists(path):
         return None
     return pd.read_csv(
